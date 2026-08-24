@@ -1,0 +1,140 @@
+11.1.15 +GTCCINFO, Get Current Cell Information
+
+Description
+
+This command acquires the current cell information.
+
+
+
+
+Syntax
+
+
+
+                                    Copyright © Fibocom Wireless Inc.                      179
+                                                                           11 Network
+
+
+
+Command       Possible Response
+
+              +GTCCINFO:
+
+              1.UMTS（a maximum of ten UMTS cells are supported）
+
+              UMTS service cell:
+
+              <IsServiceCell>,<rat>,<mcc>,<mnc>,<lac>,<cellid>,<uarfcn>,<psc>,<ban
+              d>,
+
+              <ecno>,<rscp>,<rac>,<rxlev>,<reserved>,<Ec/Io_lev>
+
+
+
+              UMTS neighbor cell:
+
+              <IsServiceCell>,<rat>,<mcc>,<mnc>,<lac>,<cellid>,<uarfcn>,<psc>,<cell
+              _
+
+              type>,<rank_pos>,<ranking_status>,<ecno>,<pathloss>,<rxlev>,<rscp>
+
+              2.LTE/eMTC/NB-IoT（a maximum of ten LTE cells are supported）
+AT+GTCCINFO
+              LTE/eMTC/NB-IoT service cell:
+?
+              <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<earfcn>,<physicalc
+              ell
+
+              Id>,<band>,<bandwidth>,<rssnr_value>,<rxlev>,<rsrp>,<rsrq>
+
+
+
+              LTE/eMTC/NB-IoT neighbor cell:
+
+              <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<earfcn>,<physicalc
+              ell
+
+              Id>,<bandwidth>,<rxlev>,<rsrp>,<rsrq>
+
+              OK
+
+
+
+              3.NR Cell（a maximum of ten NR cells are supported）
+
+              NR service cell:
+
+
+                                 Copyright © Fibocom Wireless Inc.               180
+                                                                          11 Network
+
+
+
+             <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<narfcn>,<physicalc
+             ell
+
+             Id>,<band>,<bandwidth>,<ss_sinr>,<rxlev>,<ss_rsrp>,<ss_rsrq>
+
+
+
+             NR neighbor cell:
+
+             <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<narfcn>,<physicalc
+             ell
+
+             Id>,<ss_sinr>,<rxlev>,<ss_rsrp>,<ss_rsrq>
+
+             OK
+
+
+
+             4.LTE-NR ENDC（a maximum of ten LTE cells are supported）
+
+             LTE-NR EN-DC service cell:
+
+             <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<earfcn>,<physicalc
+             ell
+
+             Id>,<band>,<bandwidth>,<rssnr_value>,<rxlev>,<rsrp>,<rsrq>
+
+             <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<narfcn>,<physicalc
+             ell
+
+             Id>,<band>,<bandwidth>,<ss_sinr>,<rxlev>,<ss_rsrp>,<ss_rsrq>
+
+
+
+             LTE neighbor cell:
+
+             <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<earfcn>,<physicalc
+             ell
+
+             Id>,<bandwidth>,<rxlev>,<rsrp>,<rsrq>
+
+             OK
+
+
+
+Attributes
+
+
+                              Copyright © Fibocom Wireless Inc.                 181
+                                                                                   11 Network
+
+
+
+Pin Restricted       Persistent   Sync Mode         Effect Immediately   Time of Duration
+
+No                   No           Yes               Yes                  < 3s
+
+
+
+
+Defined Values
+
+<IsServiceCell>: integer type
+
+1 Service Cell
+
+2 Not Service Cell
+

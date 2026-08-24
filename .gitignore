@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+# 執行期產物：狀態快照與日誌，不進版本控制
+state.json
+*.log

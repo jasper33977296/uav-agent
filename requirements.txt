@@ -1,0 +1,5 @@
+# pymavlink 帶完整的 CRC_EXTRA 表。自己切訊框不驗 CRC 的版本實測會解出大量
+# 幽靈訊框（見 README「為什麼依賴 pymavlink」），飛行資料不能這樣賭。
+pymavlink>=2.4.49
+# pymavlink 的序列埠支援需要它（mavutil 開 serial 時才 import）
+pyserial>=3.5

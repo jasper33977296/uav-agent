@@ -1,0 +1,256 @@
+............................................... 140
+11 Network .................................................................................................... 144
+  11.1 Network Commands .................................................................................. 144
+    11.1.1 +CSQ, Signal Strength .........................................................................144
+    11.1.2 +CESQ, Extended Signal Quality ........................................................ 145
+    11.1.3 +CREG, Network Registration Status .................................................. 150
+    11.1.4 +CGREG, GPRS Network Registration ............................................... 153
+    11.1.5 +CEREG, EPS Network Registration status ........................................157
+    11.1.6 +COPS, Operator Selection .................................................................160
+    11.1.7 +CPOL, Preferred Operators ............................................................... 163
+    11.1.8 +COPN, Read Operator Names .......................................................... 166
+    11.1.9 +CEMODE, UE modes of operation for EPS .......................................167
+    11.1.10 +PACSP, PLMN Auto mode in CSP ................................................... 168
+    11.1.11 +ERAT, RAT mode and GPRS/EDGE status ..................................... 169
+    11.1.12 +EPBSEH, Band Selection ................................................................ 171
+    11.1.13 +EPRATL, Set the Prefer RAT mode list ............................................174
+    11.1.14 +GTACT, Select RAT and BAND ....................................................... 175
+    11.1.15 +GTCCINFO, Get Current Cell Information ....................................... 179
+
+
+                                               Copyright © Fibocom Wireless Inc.                                               4
+                                                                                                                       Contents
+
+
+
+    11.1.16 +GTCAINFO, Display of CA information ............................................187
+12 GPRS .......................................................................................................192
+  12.1 GPRS Functionality ................................................................................... 192
+  12.2 GPRS Commands ..................................................................................... 192
+    12.2.1 +CGDCONT, Define PDP Context .......................................................193
+    12.2.2 +CGATT, Packet Domain Attach or Detach ......................................... 198
+    12.2.3 D*99, Request GPRS Service "D" ....................................................... 199
+    12.2.4 +CGACT, PDP Context Activate or Deactivate ....................................202
+    12.2.5 +CGPADDR, GPRS Addr
+
+===== 下一段 =====
+
+           Change History
+
+V2.10 (2023-07-04)   Updated the Defined Values description <rat> and
+                     <ant_bitmap> in AT+BODYSARCFG and AT+GTTASCFG
+
+V2.9 (2023-06-13)    Modify AT+GTTASSTATE Defined Values
+
+V2.8 (2022-05-23)    Add +GTLOCKCAR
+
+                     Add +GTESIMCFG
+
+                     Add +GTSAR3DBFB
+
+                     Add Carrier ID
+
+V2.7 (2022-02-24)    Change +CESQ
+
+                     Add +CEMODE description
+
+                     Add +GTTASPLMN
+
+                     Modify +GTCAINFO/+GTTASEN/+GTTASRULE/
+
+                     +GTTASON
+
+V2.6 (2021-07-23)    Update +CPBS
+
+V2.5(2021-06-28)     Add SAR Debugging Note
+
+V2.4 (2021-06-11)    Change TA-SAR commands
+
+V2.3 (2021-05-26)    Change AT+GTSENRDTEMP
+
+V2.2 (2021-02-22)    Change the version to V2.2.
+
+V2.1 (2021-02-03)    Update at+cops=3,3 for mantis:0069249
+
+V2.0 (2021-01-26)    CSCON add <state> 0xff as Unknown
+
+V1.9 (2021-01-18)    Add at commands for new function TA-SAR .
+
+V1.8 (2021-01-13)    Add ss_rsrq/ss_rsrp/ss_sinr for 5G in +CESQ
+
+V1.7 (2020-12-24)    ADD FCC lock commands, Tunable Antenna commands,
+
+                       Copyright © Fibocom Wireless Inc.                     9
+                                                                Change History
+
+
+
+                    thermal commands and TX power command
+
+V1.6 (2020-12-08)   Update +CSCON as latest 27007
+
+V1.5 (2020-11-20)   Modify +GTFMODE and ADD +GTTHERMAL
+
+V1.4 (2020-11-19)   Add +GTACT/ +GTCCINFO/ +GTCAINFO/ +GTDNS
+
+V1.3 (2020-09-24)   Modify as the reviewer’s suggestion
+
+V1.2 (2020-09-24)   Add the hardware and platform AT commands
+
+V1.1 (2020-09-15)   Modify as the reviewer’s suggestion
+
+V1.0 (2020-09-10)   Initial version
+
+
+
+
+                       Copyright © Fibocom Wireless Inc.                  10
+                                                                              1 Preface
+
+
+
+
+                                                                      1 Preface
+1.1 Manual Scope
+
+This manual introduces the AT commands set of Fibocom family products, and describes
+how the users can communicate with the devices using these commands. It describes the
+specification of syntax and parameters of the listed AT commands.
+
+
+1.2 Target Audience
+
+This manual is intended for the developers who need to communicate with the Fibocom
+family devices using the AT commands.
+
+
+
+
+                                  Copyright © Fibocom Wireless Inc.                11
+                                                                       2 Introduction to AT Commands
+
+
+
+
+                           2 Introduction to AT Commands
+2.1 AT Commands Overview
+
+AT commands are sets of commands used for communication with the cellular modem. AT
+commands are comprised of assemblies of ASCII characters which start with the "AT" prefix
+(except the commands A/ and +++). The AT prefix is derived from the word 
+
+===== 下一段 =====
+
+                                                              11 Network
+
+
+
+0          -113 dBm or less
+
+1          -111 dBm
+
+2...30    -109... 53 dBm
+
+31        -51 dBm or greater
+
+99       not known or not detectable
+
+<ber>: integer type; channel bit error rate (in percent)
+
+0...7    as RXQUAL values in the table in 3GPP TS 45.008 subclause 8.2.4
+
+99       not known or not detectable
+
+
+
+
+11.1.2 +CESQ, Extended Signal Quality
+
+Description
+
+Execution command returns received signal quality parameters.
+
+<ber> always return 99.
+
+If the current serving cell is in GSM/UMTS/LTE/C2K/ENDC/NR cell ， <rxlev> will return
+normal ,else return 99.
+
+If the current serving cell is in UMTS cell, <rscp>, <ecno> will return normal, else return 255.
+
+If the current serving cell is in /LTE/C2K/ENDC cell, <rsrq>, <rsrp> will return normal, else
+return 255.
+
+Only the current serving cell in ENDC/NR cell, <ss_rsrq>, <ss_rsrp>and<ss_sinr> will return
+normal, else return 255
+
+Syntax
+
+Command                             Possible Response
+
+                                     Copyright © Fibocom Wireless Inc.                       145
+                                                                                    11 Network
+
+
+
+                                  +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>,
+                                  <ss_rsrq>,<ss_rsrp>,<ss_sinr>
+
+AT+CESQ                           OK
+
+                                  or
+
+                                  +CME ERROR: <error>
+
+                                  +CESQ: (list of supported <rxlev>s),(list of supported
+                                  <ber>s),(list of supported <rscp>s),(list of supported
+                                  <ecno>s),(list of supported <rsrq>s),(list of supported
+AT+CESQ=?
+                                  <rsrp>s),(list of supported <ss_rsrq>s),(list of supported
+                                  <ss_rsrp>s), (list of supported <ss_sinr>s)
+
+                                  OK
+
+
+
+Attributes
+
+Pin Restricted     Persistent   Sync Mode          Effect Immediately   Time of Duration
+
+No                 No           Yes                Yes                  < 1s
+
+
+
+
+Defined Values
+
+<rxlev>: integer type, received signal strength level (see 3GPP TS 45.008 subclause 8.1.4).
+
+0 rssi< -110 dBm
+
+1 -110 dBm ≤rssi < -109 dBm
+
+2 -109 dBm≤ rssi < -108 dBm
+
+…
+
+61 -50 dBm ≤rssi < -49 dBm
+
+62 -49 dBm ≤rssi < -48 dBm
+
+
+                                   Copyright © Fibocom Wireless Inc.                        146
+                                                                                 11 Network
+
+
+
+63 -48 dBm ≤rssi
+
+99 not known or not detectable
+
+<ber>: integer type; channel bit error rate (in percent)
+
+0...7 as RXQUAL values in the table in 3GPP TS 45.008 subclause 8.2.4
+
+99    not known or not detectable
+
+<rscp>: integer type, received signal code power (see 3GPP TS 25.133 su

@@ -1,0 +1,38 @@
+[Unit]
+Description=機上智能代理：飛控 ←→ 地面站 橋接與監控
+# 飛控可能比 Pi 晚上電、5G 模組也要時間註冊網路；兩者都靠 Restart 處理，
+# 這裡只要求網路堆疊就緒即可，不要 Requires 任何會讓它拒絕啟動的東西。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=dialout
+WorkingDirectory=/home/pi/uav-agent
+
+# ── 部署參數（改這裡，不要改程式碼）──────────────────────────
+Environment=GS_HOST=10.141.2.21
+Environment=FC_DEV=/dev/ttyAMA0
+Environment=FC_BAUD=57600
+Environment=RATE=4
+Environment=MODEM_PORT=/dev/ttyUSB1
+# ── 地面失聯處置（飛安相關）────────────────────────────────
+# LINK_ACTION=none 可停用自動處置，只保留告警
+Environment=LINK_WARN_S=5
+Environment=LINK_ACTION_S=30
+Environment=LINK_ACTION=rtl
+
+ExecStart=/home/pi/uav-agent/venv/bin/python /home/pi/uav-agent/agent.py
+Restart=always
+RestartSec=3
+
+# 這條鏈路是飛控與地面站之間的唯一通道，掛掉等於雙向失聯 —— 提高優先權
+Nice=-5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uav-agent
+
+[Install]
+WantedBy=multi-user.target
