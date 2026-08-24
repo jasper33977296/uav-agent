@@ -26,17 +26,15 @@
 * 對飛控我們的身分是 **sysid 255 / comp 190**（GCS 慣用值）。地面站的 command
   服務用 254，刻意錯開——在飛控眼中是兩個不同的 GCS，不會互相蓋掉。
 
-* **手動控制由本代理具名重送**。ArduPilot 對 `MANUAL_CONTROL` 與
-  `RC_CHANNELS_OVERRIDE` 有身分檢查：來源 sysid 不等於機上參數 `SYSID_MYGCS`
-  就**靜默丟棄，不回任何錯誤**。機上目前 `SYSID_MYGCS=255`＝本代理，所以地面站
-  以 254 送來的搖桿封包會被無聲吃掉。地面站自己的診斷也標了這件事。
-  作法是把這兩種訊息**以本代理的身分重新編碼後送出**——代理是真正的下達者，
-  地面站是意圖來源。其餘訊息（arm/模式/任務等 COMMAND_LONG）**原封轉發**，
-  因為那些不受 SYSID_MYGCS 管制，改寫身分只會讓 ACK 的歸屬變糊。
+* **地面站的封包一律原封轉發**。地面站已於 2026-08-24 移除虛擬搖桿
+  （uav-system issue 035），系統範圍收斂為航路管理，不再有連續操縱封包。
+  先前為了繞過 ArduPilot 的 `SYSID_MYGCS` 檢查而做的「以代理身分重新編碼
+  MANUAL_CONTROL／RC_CHANNELS_OVERRIDE」已隨之移除——沒有來源，就沒有轉譯。
 
-  副作用要記住：飛控的 GCS failsafe（`FS_GCS_ENABLE`）盯的是 `SYSID_MYGCS`
-  的心跳，也就是**本代理**——代理在機上，5G 斷了它照樣心跳，所以飛控不會因為
-  地面失聯而觸發 failsafe。這條防線因此落在代理身上，見 `_check_gs_link`。
+  但那件事留下的前提仍然成立且**更重要**：飛控的 GCS failsafe
+  （`FS_GCS_ENABLE`）盯的是 `SYSID_MYGCS` 的心跳，也就是**本代理**——代理在
+  機上，5G 斷了它照樣心跳，所以飛控不會因為地面失聯而觸發 failsafe。
+  這條防線因此完全落在代理身上，見 `_check_gs_link`。
 """
 import argparse
 import json
@@ -185,7 +183,6 @@ class Agent:
         self.last_telem_rx = 0.0
         self.last_report = 0.0
         self.fwd_to_fc = 0
-        self.reissued = 0
         # 地面站方向的解析器：要認出搖桿封包才能改寫身分。
         # robust_parsing＝壞封包不拋例外，只跳過（這條迴圈不准死）。
         self.gs_parser = apm.MAVLink(None)
@@ -295,36 +292,22 @@ class Agent:
             self.report()
 
     def to_fc(self, fd, data):
-        """地面站來的封包 → 飛控。搖桿類具名重送，其餘原封轉發。"""
+        """地面站來的封包 → 飛控。
+
+        **仍然先解析再轉發，而不是直接把 datagram 倒進序列埠**：解析等於驗 CRC，
+        擋掉壞封包不讓它進飛控的解析器；解不出來時才整包原封送（寧可送出去讓
+        飛控自己判斷，也不要自作主張丟掉可能合法的指令）。
+        """
         try:
             msgs = self.gs_parser.parse_buffer(data) or []
         except Exception:
             msgs = []
-        if not msgs:                       # 解不出來就原封送，不要自作主張丟掉
+        if not msgs:
             self._write(fd, data)
             return
         for m in msgs:
-            t = m.get_type()
-            if t in ("MANUAL_CONTROL", "RC_CHANNELS_OVERRIDE"):
-                self._reissue(m, t)
-            elif t != "BAD_DATA":
+            if m.get_type() != "BAD_DATA":
                 self._write(fd, m.get_msgbuf())
-
-    def _reissue(self, m, t):
-        """以本代理的身分重新編碼送出（否則機上 SYSID_MYGCS 檢查會靜默丟棄）。"""
-        tgt = self.mon.state.get("sysid", 1)
-        try:
-            if t == "MANUAL_CONTROL":
-                self.serial.mav.manual_control_send(tgt, m.x, m.y, m.z, m.r,
-                                                    m.buttons)
-            else:
-                self.serial.mav.rc_channels_override_send(
-                    tgt, 1, m.chan1_raw, m.chan2_raw, m.chan3_raw, m.chan4_raw,
-                    m.chan5_raw, m.chan6_raw, m.chan7_raw, m.chan8_raw)
-            self.reissued += 1
-            self.fwd_to_fc += 1
-        except Exception as e:
-            log.warning("重送 %s 失敗：%s", t, e)
 
     def _write(self, fd, data):
         try:
@@ -456,7 +439,6 @@ class Agent:
             "rx_from_gs": self.telem.rx + self.cmd.rx,
             "fwd_to_fc": self.fwd_to_fc,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
-            "reissued_manual": self.reissued,
             "gs_link_ok": self.gs_link_ok,
             "modem": self.modem.stats() if self.modem else None,
         }
