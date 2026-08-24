@@ -225,6 +225,15 @@ class Agent:
                     tgt, 1, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                     msgid, int(1e6 / self.a.rate), 0, 0, 0, 0, 0)
                 time.sleep(0.02)
+            # 板子身分（uav-system issues/038）：AUTOPILOT_VERSION 帶飛控板的
+            # 唯一 ID（uid2）。**要開口問才有**——ArduPilot 不主動送（實測 28 種
+            # 訊息裡沒有它）。這件事由代理做而不是地面站：請求要送 COMMAND_LONG，
+            # 而 backend 的 read-only 邊界不收那個通用信封（同一型別可以裝 arm）。
+            # 回應會隨遙測一起轉發回去，地面站照收即可。
+            # **一次性請求**（不設間隔）：板子身分不會變，訂成串流只是浪費 57600。
+            self.serial.mav.command_long_send(
+                tgt, 1, mavutil.mavlink.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES,
+                0, 1, 0, 0, 0, 0, 0, 0)
             log.info("已請求串流 %d Hz（目標 sysid=%d）", self.a.rate, tgt)
         except Exception as e:
             log.warning("請求串流失敗：%s", e)
