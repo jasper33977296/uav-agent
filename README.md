@@ -37,10 +37,10 @@
    會切到完全不同的模式，而且**不會有任何錯誤訊息**。
    （這個坑本專案在地面站端踩過：issue 030，承諾 Hold 實送 GUIDED。）
 
-2. **手動控制的重送依賴 ArduPilot 的 `SYSID_MYGCS` 行為**。
-   ArduPilot 只接受來源 sysid 等於 `SYSID_MYGCS` 的 `MANUAL_CONTROL` /
-   `RC_CHANNELS_OVERRIDE`，其餘**靜默丟棄**。本代理因此以自己的身分重新編碼
-   後送出。PX4 沒有這個機制，該段邏輯在 PX4 上是多餘的。
+2. **`SYSID_MYGCS` 決定飛控把誰當成「它的地面站」**（ArduPilot 專屬）。
+   本代理以 sysid 255 發心跳，機端 `SYSID_MYGCS` 也是 255——所以飛控的
+   GCS failsafe 盯的是**代理**，不是真正的地面站。這是安全模型的關鍵前提，
+   見下方「為什麼第二層只能由代理做」。PX4 沒有這個機制，移植時該段前提要重想。
 
 3. **串流請求走 `REQUEST_DATA_STREAM`（舊式）＋ `SET_MESSAGE_INTERVAL`（新式）**
    兩條路。ArduPilot 兩者都吃；PX4 已棄用前者。
