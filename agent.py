@@ -1053,7 +1053,7 @@ def main():
                    default=float(os.environ.get("LINK_WARN_S", 5.0)),
                    help="多久沒收到地面站封包就視為失聯並告警")
     p.add_argument("--link-action-s", type=float,
-                   default=float(os.environ.get("LINK_ACTION_S", 30.0)),
+                   default=float(os.environ.get("LINK_ACTION_S", 10.0)),
                    help="失聯持續多久後執行處置（僅在 armed 時）")
     p.add_argument("--link-action",
                    default=os.environ.get("LINK_ACTION", "rtl"),
