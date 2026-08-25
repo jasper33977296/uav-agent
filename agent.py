@@ -52,6 +52,7 @@ from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import guard
+import route
 from intent import IntentLink
 from modem import ModemSampler
 
@@ -190,6 +191,9 @@ class Monitor:
             s["alt_rel_m"] = round(msg.relative_alt / 1000, 2)
         elif t == "VFR_HUD":
             s["groundspeed_ms"] = round(msg.groundspeed, 2)
+            # 航向給改航線提案用：「續飛航點在你後方 N 度，機體會先掉頭」
+            # 沒有它那句警告永遠不會出現——**而不是不會發生**
+            s["heading"] = round(msg.heading % 360, 1)
         elif t == "EXTENDED_SYS_STATE":
             # landed_state 是狀態機分辨「在地上／爬升中／降落中」的第一手依據。
             # UNDEFINED（0）＝**這台韌體沒回報**，不是「不在地上」——那時才退回
@@ -557,6 +561,8 @@ class Agent:
             self.mon.events.append(
                 (time.time(), "guard", f"擋下 {action}：{why}"))
             return {**base, "event": "guard_refused", "reason": why}
+        if action == "change_route":
+            return self._change_route_proposal(msg, base)
         if guard.executor(action) == "ground":
             # **放行不等於做完**：地面站有完整的廠牌方言，由它執行；
             # 代理只負責說「現在這件事可以做」
@@ -564,6 +570,43 @@ class Agent:
             return {**base, "event": "cleared",
                     "reason": "守門通過，由地面站執行"}
         return self._do_agent_action(action, base)
+
+    def _change_route_proposal(self, msg, base):
+        """改航線的提案由**機上**算（狀態機文件 §0.1、§6.2）。
+
+        **為什麼權威在這裡**：地面站看到的位置經 5G 回來已經是過期資料——
+        10 m/s 巡航下一次鏈路抖動就是數十公尺誤差，而「離當前位置最近的航點」
+        正是對位置最敏感的判斷。今天這條 5G 一次斷 98 秒，那不是理論值。
+
+        帶 `prior`（人看過的那份提案）進來時順便做過期檢查（協定 §5.1）：
+        **這件事也該在機上做**，因為它問的是「機體從你確認到現在飄了多少」。
+        """
+        p = msg.get("params") or {}
+        wps = p.get("wps") or []
+        if not wps:
+            return {**base, "event": "failed",
+                    "reason": "改航線的意圖沒有帶航點，算不出提案"}
+        s = self.mon.state
+        cur = dict(self._position(), heading=s.get("heading"))
+        prop = route.build_proposal(
+            wps=wps, cur=cur, hold_alt=p.get("hold_alt"),
+            mission_name=p.get("mission_name") or "（未命名）",
+            mission_id=p.get("mission_id"),
+            cur_seq=s.get("mission_seq"))
+        prior = p.get("prior")
+        if prior:
+            drift = route.drift_reason(prior, prop)
+            if drift:
+                # **不照過期的提案做，也不自作主張用新的執行。**
+                # 人確認的是那一份提案，不是「授權之後隨便怎麼飛」
+                log.warning("改航線提案已過期：%s", drift)
+                return {**base, "event": "guard_refused",
+                        "reason": f"提案已經過期：{drift}。請重看新的提案再決定",
+                        "proposal": prop}
+            return {**base, "event": "cleared", "proposal": prop,
+                    "reason": "提案仍然成立，由地面站執行三步序列"}
+        return {**base, "event": "proposal", "proposal": prop,
+                "reason": "提案由機上算（位置最新）"}
 
     #: 代理自己執行的意圖 → 飛控模式。只要 DO_SET_MODE，不碰任務協定
     _INTENT_MODE = {"rtl": "RTL", "land": "LAND", "abort": "LOITER"}
