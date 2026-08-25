@@ -55,6 +55,8 @@ class IntentLink(threading.Thread):
         self.connected = False
         self.sent = 0
         self.rejected = 0
+        self.drops = 0                # 連上之後又斷掉的次數（＝鏈路品質指標）
+        self._backoff = 1.0
 
     def publish(self, snapshot: dict) -> None:
         with self._lock:
@@ -63,19 +65,23 @@ class IntentLink(threading.Thread):
     def stop(self):
         self._stop.set()
 
+    def stats(self) -> dict:
+        """給代理的定期狀態列。**通道健康度要跟其他數字放在一起**——
+        分開放就要兩邊對時間戳才看得出「那次遙測掉包時意圖通道在不在」。"""
+        return {"up": self.connected, "sent": self.sent,
+                "drops": self.drops, "rejected": self.rejected}
+
     # ── 執行緒本體 ─────────────────────────────────────────────
     def run(self):
-        backoff = 1.0
         while not self._stop.is_set():
             try:
                 self._session()
-                backoff = 1.0            # 連上過就重置退避
             except Exception as e:
-                log.warning("意圖通道中斷（%s），%.0f 秒後重連", e, backoff)
+                log.warning("意圖通道中斷（%s），%.0f 秒後重連", e, self._backoff)
             finally:
                 self.connected = False
-            self._stop.wait(backoff)
-            backoff = min(backoff * 2, 30.0)   # 上限 30s：地面站可能整晚不在
+            self._stop.wait(self._backoff)
+            self._backoff = min(self._backoff * 2, 30.0)  # 上限 30s
 
     def _session(self):
         ws = websocket.create_connection(self.url, timeout=10,
@@ -87,6 +93,12 @@ class IntentLink(threading.Thread):
             ws.settimeout(min(0.2, self.interval / 4))
             self._send(ws, dict(self.hello, type="hello"))
             self.connected = True
+            # **退避在「連上」時重置，不是在 session 結束時**：session 結束的
+            # 唯一方式是拋例外，所以原本寫在 try 之後的重置永遠不會執行。
+            # 2026-08-25 實測後果：跑了 2 分半的連線被 peer reset 之後，
+            # 退避已經爬到 30 秒，於是每斷一次就白白失聯半分鐘——而本場域的
+            # 5G 抖動是常態，正是這條通道最需要立刻回來的時候
+            self._backoff = 1.0
             log.info("意圖通道已連上 %s", self.url)
             last_sent = 0.0
             last_state = None
@@ -107,6 +119,8 @@ class IntentLink(threading.Thread):
                     last_sent = now
                     self.sent += 1
         finally:
+            if self.connected:
+                self.drops += 1       # 連上過才算「掉線」，連不上不算
             try:
                 ws.close()
             except Exception:

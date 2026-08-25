@@ -56,7 +56,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"          # 0.3：意圖通道（state）＋失聯處置選項 C
 
 
 def agent_uid() -> str | None:
@@ -239,6 +239,7 @@ class Agent:
         self.cmd = Link("command(14541)", a.gs, a.command_port)
         self.serial = None
         self.last_stream_req = 0.0
+        self.streams_requested = False
         self.caps_requested = False
         self.hello_sent = False
         self.drone_id = None
@@ -317,6 +318,22 @@ class Agent:
             log.warning("請求板子身分失敗：%s", e)
             self.caps_requested = False      # 失敗就讓下一拍再試
 
+    def request_streams_once(self):
+        """看到飛控就把串流請求送一次。
+
+        **原本只在「心跳在但遙測停了」時才送**，於是代理重啟後從來不重問——
+        飛控還照著**上一次**被要求的清單在送。2026-08-25 實際踩到：WANTED 加了
+        EXTENDED_SYS_STATE（245），代理重啟後 landed_state 永遠是 None，看起來
+        像「這台韌體不支援」，其實是我們根本沒開口要。
+
+        與 request_board_id 同一個教訓：**「只在出問題時才做」的初始化，在
+        沒出問題的那條路上就等於沒做。**
+        """
+        if self.streams_requested or not self.mon.state.get("sysid"):
+            return
+        self.streams_requested = True
+        self.request_streams()
+
     def request_streams(self):
         """請求／重新請求遙測串流。舊式與新式兩條路都走。"""
         tgt = self.mon.state.get("sysid", 1)
@@ -380,6 +397,7 @@ class Agent:
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
         self.request_board_id()
+        self.request_streams_once()
         self.say_hello()
         self._track_mode_owner()
         self._publish_state()
@@ -536,8 +554,11 @@ class Agent:
                 "armed": bool(s.get("armed")),
                 "landed": s.get("landed_state"),
                 "mode": s.get("mode"),
-                "alt_rel": s.get("alt_rel_m"),
-                "lat": s.get("lat"), "lon": s.get("lon"),
+                # **位置走 _position()**：0,0 是自駕儀「不知道」的哨兵，
+                # 不是幾內亞灣外海。直接讀 s["lat"] 會把它照實推上去，
+                # 地圖上就長出一個假的點——地面站早就有這條規則
+                # （mavlink_rx.py GLOBAL_POSITION_INT），機端不能自己破例
+                **self._position(),
                 "battery_pct": s.get("battery_pct"),
                 "gps_fix": s.get("gps_fix"),
                 # 地面站失聯是**代理這一側看到的事實**，與地面站自己看到的
@@ -786,6 +807,8 @@ class Agent:
             "fwd_to_fc": self.fwd_to_fc,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
             "gs_link_ok": self.gs_link_ok,
+            "state": self.flight_state(),
+            "intent": self.intent.stats() if self.intent else None,
             "modem": self.modem.stats() if self.modem else None,
         }
         log.info("狀態 %s", json.dumps(line, ensure_ascii=False))
