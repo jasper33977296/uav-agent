@@ -51,6 +51,7 @@ from collections import defaultdict
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
+from intent import IntentLink
 from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
@@ -76,7 +77,8 @@ def agent_uid() -> str | None:
 
 
 # 要飛控持續送的重點訊息（逐一設間隔，比舊式 ALL 串流精準）
-WANTED = [1, 24, 27, 29, 30, 33, 36, 42, 62, 65, 74, 116, 125, 147, 193, 241]
+WANTED = [1, 24, 27, 29, 30, 33, 36, 42, 62, 65, 74, 116, 125, 147, 193,
+          241, 245]   # 245＝EXTENDED_SYS_STATE（landed_state）
 
 COPTER_MODE_ID = {v: k for k, v in {
     6: "RTL", 9: "LAND", 21: "SMART_RTL", 5: "LOITER"}.items()}
@@ -94,6 +96,8 @@ COPTER_MODE = {0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
                27: "AUTO_RTL"}
 GPS_FIX = {0: "NO_GPS", 1: "NO_FIX", 2: "2D", 3: "3D", 4: "DGPS",
            5: "RTK_FLOAT", 6: "RTK_FIXED"}
+#: MAV_LANDED_STATE。0＝UNDEFINED 是「這台韌體不回報」，不是「不在地上」
+LANDED = {1: "on_ground", 2: "in_air", 3: "takeoff", 4: "landing"}
 
 
 class Link:
@@ -185,6 +189,11 @@ class Monitor:
             s["alt_rel_m"] = round(msg.relative_alt / 1000, 2)
         elif t == "VFR_HUD":
             s["groundspeed_ms"] = round(msg.groundspeed, 2)
+        elif t == "EXTENDED_SYS_STATE":
+            # landed_state 是狀態機分辨「在地上／爬升中／降落中」的第一手依據。
+            # UNDEFINED（0）＝**這台韌體沒回報**，不是「不在地上」——那時才退回
+            # 用高度與地速猜，而且要讓人知道用的是猜的（見 Agent.flight_state）
+            s["landed_state"] = LANDED.get(msg.landed_state)
         elif t == "MISSION_CURRENT":
             # 失聯處置的「跑完再 RTL」要知道任務**什麼時候算跑完**。
             # mission_state 是後來才加進 MAVLink 的欄位：舊韌體不填（0＝UNKNOWN），
@@ -233,6 +242,7 @@ class Agent:
         self.caps_requested = False
         self.hello_sent = False
         self.drone_id = None
+        self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
         # 模式溯源（失聯處置選項 C）：LOITER 既可能是地面站按的「暫停」，
         # 也可能是飛手用遙控器切過去手飛的。兩者的處置完全相反——前者要 RTL，
         # 後者**永不介入**。分辨的唯一辦法是記住是誰要求的。
@@ -372,6 +382,7 @@ class Agent:
         self.request_board_id()
         self.say_hello()
         self._track_mode_owner()
+        self._publish_state()
 
         self._check_gs_link(now)
 
@@ -488,9 +499,52 @@ class Agent:
             self.drone_id = res.get("drone_id")
             log.info("已向地面站自報：%s（%s，board_uid=%s）", res.get("name"),
                      "**新建檔**" if res.get("created") else "既有記錄", uid)
+            self._start_intent_link(uid, body)
         except Exception as e:
             # 失敗不設旗標＝下一拍重試。地面站可能還沒起來，或 5G 正好在抖。
             log.warning("自報身分失敗（%s），稍後重試", e)
+
+    def _start_intent_link(self, uid, ident):
+        """意圖通道（協定 §2）。**等註冊完才起**：地面站以 board_uid 認機，
+        沒註冊過就連上去，那頭只能記成一條無主的連線。"""
+        if self.intent is not None:
+            return
+        self.intent = IntentLink(
+            f"ws://{self.a.gs}:{self.a.backend_port}/ws/agent",
+            {"agent_version": AGENT_VERSION, "board_uid": uid,
+             "autopilot": ident.get("autopilot"), "fw": ident.get("fw"),
+             # inputs＝判斷依據的清單（協定 §4.1）。目前只有遙測；機上加裝
+             # 相機後會多一項，地面站據此知道這台機的判斷是基於什麼
+             "inputs": ["telemetry"], "protocol": [1]})
+        self.intent.start()
+
+    def _publish_state(self):
+        """把當下狀態交給意圖通道。**狀態的定義只有 flight_state() 一份**——
+        失聯處置與這裡送出去的是同一個值，不會出現「代理自己做一套、
+        報上去另一套」。"""
+        if self.intent is None:
+            return
+        s = self.mon.state
+        self.intent.publish({
+            "state": self.flight_state(),
+            "sysid": s.get("sysid"),
+            "intent_id": None,          # intent 尚未實作，據實留 null
+            "seq_step": None,
+            "mission_seq": s.get("mission_seq"),
+            "mission_total": s.get("mission_total"),
+            "derived": {
+                "armed": bool(s.get("armed")),
+                "landed": s.get("landed_state"),
+                "mode": s.get("mode"),
+                "alt_rel": s.get("alt_rel_m"),
+                "lat": s.get("lat"), "lon": s.get("lon"),
+                "battery_pct": s.get("battery_pct"),
+                "gps_fix": s.get("gps_fix"),
+                # 地面站失聯是**代理這一側看到的事實**，與地面站自己看到的
+                # 不一定同時發生——兩邊不一致本身就是要報警的事（狀態機 §6.4）
+                "gs_link_ok": self.gs_link_ok,
+            },
+        })
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
@@ -555,7 +609,7 @@ class Agent:
             self.loss_warned = True
             log.warning("⚠ 地面站失聯 %.0f 秒（armed=%s mode=%s 狀態=%s）；"
                         "%.0f 秒後依狀態處置%s",
-                        age, armed, mode, self._loss_state(),
+                        age, armed, mode, self.flight_state(),
                         self.a.link_action_s,
                         "" if self.a.link_action != "none"
                         else "（設定為 none＝只告警不動作）")
@@ -567,7 +621,7 @@ class Agent:
             self.loss_acted = True
             return
 
-        state = self._loss_state()
+        state = self.flight_state()
         reason = self._loss_verdict(state, now)
         if reason is None:
             return                          # 續飛觀察中：下一拍再評估
@@ -579,27 +633,52 @@ class Agent:
             return
         self._do_link_loss_action(now, age, mode, f"{state}／{reason}")
 
-    def _loss_state(self):
-        """把觀察得到的東西收斂成失聯處置要分辨的幾種狀態。
+    def flight_state(self):
+        """當下的飛行狀態——**全系統只有這一個定義**。
 
-        **這不是意圖協定裡那台狀態機**——協定還沒接上，代理現在只有 MAVLink
-        看得到的東西（模式、armed、高度、任務進度）。所以這裡是**用觀察量做的
-        近似**，而且每一格都往「不要亂動」的方向偏：分不出來就當飛手拿著。
-        接上協定之後，這個函式改成讀權威狀態即可，處置規則不用動。
+        失聯處置用它決定要不要介入，意圖協定的 `state` 訊息也送它。兩處各寫
+        一份的話，日後一定會漂移成「代理說 HOLDING、畫面說 FLYING_MISSION」，
+        而那正是狀態機文件 §0.1 說「只能有一個事實來源」要防的事。
+
+        **這還不是協定裡那台權威狀態機**：協定的狀態帶著「當前 intent 走到
+        第幾步」，那要等 intent 實作。這裡是純粹從飛控遙測導出的觀察值，名稱
+        與狀態機文件 §1 對齊，接上 intent 後由它補上序列步驟資訊。
+
+        每一格都往「不要亂動」的方向偏——分不出來就當飛手拿著。
         """
         s = self.mon.state
+        if time.time() - self.mon.last_hb > 5.0:
+            return "DISCONNECTED"          # 沒有心跳就不得下任何指令
+        # MAV_STATE 5/6＝CRITICAL/EMERGENCY：飛控自己的 failsafe 正在跑
+        if s.get("system_status") in (5, 6):
+            return "EMERGENCY"
         if not s.get("armed"):
-            return "DISARMED"
+            # 完整判定要 prearm_ok 與 ekf_ok（狀態機文件 §1），代理目前只解到
+            # GPS。**所以這兩格是近似的**——地面狀態不影響飛行中的處置，
+            # 接上 intent 前不值得為它多解一批訊息
+            fix = s.get("gps_fix")
+            return "READY" if fix in ("3D", "DGPS", "RTK_FLOAT", "RTK_FIXED") \
+                else "NOT_READY"
+
+        landed = s.get("landed_state")
+        if landed is None:
+            # 韌體不回報 landed_state：退回用高度與地速判「在地上」。
+            # **寧可判成飛行中**——判錯成「在地上」會漏掉該做的處置，
+            # 判錯成「飛行中」最多是多做一次
+            alt, spd = s.get("alt_rel_m"), s.get("groundspeed_ms")
+            landed = ("on_ground" if (alt is not None and alt < 1.0
+                                      and spd is not None and spd < 0.5)
+                      else "in_air")
+
         mode = s.get("mode")
         if mode in SELF_RECOVERING:
-            return "RETURNING"
-        # 貼地且幾乎不動＝還在地上（TAKING_OFF 之前）。**寧可判成飛行中**：
-        # 判錯成「在地上」會漏掉該做的 RTL，判錯成「飛行中」最多是多做一次
-        alt = s.get("alt_rel_m")
-        spd = s.get("groundspeed_ms")
-        if (alt is not None and alt < 1.0
-                and spd is not None and spd < 0.5):
+            return "LANDING" if mode == "LAND" else "RETURNING"
+        if landed == "landing":
+            return "LANDING"
+        if landed == "on_ground":
             return "ARMED_GROUND"
+        if landed == "takeoff":
+            return "TAKING_OFF"
         if mode in AUTOMATED_MODES:
             if mode == "AUTO" and s.get("mission_state") != 5:
                 return "FLYING_MISSION"     # 5＝MISSION_STATE_COMPLETE
@@ -610,7 +689,10 @@ class Agent:
 
     def _loss_verdict(self, state, now):
         """回傳：字串＝立刻 RTL 的理由；False＝這個狀態永不介入；None＝再等一拍。"""
-        if state in ("RETURNING", "PILOT_CONTROL", "DISARMED"):
+        # 不介入的四類：已經在自己回家／降落、飛手拿著、飛控 failsafe 正在跑、
+        # 還沒起飛（含連不上——連不上時下任何指令都是對著空氣喊）
+        if state in ("RETURNING", "LANDING", "PILOT_CONTROL", "EMERGENCY",
+                     "DISCONNECTED", "NOT_READY", "READY"):
             return False
         if state == "ARMED_GROUND":
             # **規格說 ARMED_GROUND 立刻 RTL，這裡刻意不照做**（2026-08-25）：
@@ -619,9 +701,15 @@ class Agent:
             # （這是本系統的操作前提），人處理比飛機自己起飛安全得多。
             # 所以這格只告警留痕。要改回規格行為必須是明確裁定，不是預設值。
             return False
-        if state == "HOLDING":
+        if state in ("HOLDING", "TAKING_OFF"):
             # 沒有任務可以跑完，停在空中等一個回不來的確認毫無意義
-            return "無任務可續飛（暫停中或任務已結束）"
+            return "無任務可續飛（暫停中、爬升中或任務已結束）"
+        if state != "FLYING_MISSION":
+            # **不對著看不懂的狀態下指令。** 走到這裡代表有人新增了狀態卻沒有
+            # 補這張表；此時飛控自己的 RC failsafe 與待命的飛手仍在，
+            # 亂送模式指令比不送危險
+            log.error("失聯處置遇到未列入的狀態 %s → 不動作", state)
+            return False
         # ── FLYING_MISSION：跑完再 RTL，但有兩個上限 ──────────────
         batt = self.mon.state.get("battery_pct")
         if batt is not None and batt < self.a.link_loss_min_batt:

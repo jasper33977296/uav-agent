@@ -13,6 +13,7 @@
 用法：python3 tools/link-loss-table.py
 """
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -34,8 +35,13 @@ class Fake(A.Agent):
     """只借判定方法，不跑 __init__（那會開序列埠與 UDP socket）。"""
 
     def __init__(self, **st):
-        self.mon = types.SimpleNamespace(state=st, events=[])
-        self.mode_owner = st.pop("_owner", None)
+        owner = st.pop("_owner", None)
+        st.setdefault("armed", True)
+        # 心跳新鮮＝不是 DISCONNECTED。要測 DISCONNECTED 就傳 _hb_age
+        hb_age = st.pop("_hb_age", 0.0)
+        self.mon = types.SimpleNamespace(state=st, events=[],
+                                         last_hb=time.time() - hb_age)
+        self.mode_owner = owner
         self.loss_started = 0.0
         self._solo_logged = True            # 靜音，測的是判定不是播報
         self.a = types.SimpleNamespace(
@@ -44,7 +50,7 @@ class Fake(A.Agent):
 
 def case(label, want_state, want_verdict, *, solo=10.0, **st):
     g = Fake(**st)
-    state = g._loss_state()
+    state = g.flight_state()
     verdict = g._loss_verdict(state, solo)
     got = ("RTL：" + verdict) if isinstance(verdict, str) else \
           ("不介入" if verdict is False else "續飛觀察")
@@ -53,52 +59,68 @@ def case(label, want_state, want_verdict, *, solo=10.0, **st):
     return ok
 
 
+AIR = dict(landed_state="in_air")
+
 ok = True
-print("── 狀態判定與處置 ─────────────────────────────────────────")
-ok &= case("未 armed", "DISARMED", "不介入", armed=False, mode="STABILIZE")
-ok &= case("已在 RTL", "RETURNING", "不介入", armed=True, mode="RTL")
-ok &= case("已在 LAND", "RETURNING", "不介入", armed=True, mode="LAND")
-ok &= case("armed 但還在地上", "ARMED_GROUND", "不介入",
-           armed=True, mode="GUIDED", alt_rel_m=0.2, groundspeed_ms=0.0)
+print("── 連不上／未起飛 ─────────────────────────────────────────")
+ok &= case("飛控沒心跳", "DISCONNECTED", "不介入", _hb_age=30.0, mode="AUTO")
+ok &= case("未 armed、GPS 未定位", "NOT_READY", "不介入",
+           armed=False, mode="STABILIZE", gps_fix="NO_FIX")
+ok &= case("未 armed、GPS 已定位", "READY", "不介入",
+           armed=False, mode="STABILIZE", gps_fix="3D")
+ok &= case("飛控 failsafe 中（CRITICAL）", "EMERGENCY", "不介入",
+           mode="AUTO", system_status=5, **AIR)
+
+print("\n── 已在自己處理／人拿著 ───────────────────────────────")
+ok &= case("已在 RTL", "RETURNING", "不介入", mode="RTL", **AIR)
+ok &= case("已在 LAND", "LANDING", "不介入", mode="LAND", **AIR)
+ok &= case("landed_state=landing", "LANDING", "不介入",
+           mode="GUIDED", landed_state="landing")
 ok &= case("飛手手飛 STABILIZE", "PILOT_CONTROL", "不介入",
-           armed=True, mode="STABILIZE", alt_rel_m=30, groundspeed_ms=3)
+           mode="STABILIZE", **AIR)
 ok &= case("飛手切的 LOITER（溯源＝pilot）", "PILOT_CONTROL", "不介入",
-           armed=True, mode="LOITER", alt_rel_m=30, groundspeed_ms=1,
-           _owner="pilot")
+           mode="LOITER", _owner="pilot", **AIR)
 ok &= case("溯源不明的 LOITER", "PILOT_CONTROL", "不介入",
-           armed=True, mode="LOITER", alt_rel_m=30, groundspeed_ms=1,
-           _owner=None)
+           mode="LOITER", _owner=None, **AIR)
+
+print("\n── 地面與起飛 ─────────────────────────────────────────")
+ok &= case("armed 在地上（landed_state）", "ARMED_GROUND", "不介入",
+           mode="GUIDED", landed_state="on_ground")
+ok &= case("armed 在地上（韌體不回報，靠高度）", "ARMED_GROUND", "不介入",
+           mode="GUIDED", alt_rel_m=0.2, groundspeed_ms=0.0)
+ok &= case("爬升中", "TAKING_OFF", "RTL",
+           mode="GUIDED", landed_state="takeoff")
+
+print("\n── 表沒列到的狀態不得下指令 ───────────────────────────")
+g = Fake(mode="AUTO", landed_state="in_air")
+unknown = g._loss_verdict("SOME_NEW_STATE", 10.0) is False
+print(f"{'✓' if unknown else '✗'} 未列入的狀態 → 不動作（而不是掉進續飛分支）")
+ok &= unknown
+
+print("\n── 空中 ───────────────────────────────────────────────")
 ok &= case("地面站按的暫停（LOITER）", "HOLDING", "RTL",
-           armed=True, mode="LOITER", alt_rel_m=30, groundspeed_ms=1,
-           _owner="us")
-ok &= case("GUIDED 停在空中", "HOLDING", "RTL",
-           armed=True, mode="GUIDED", alt_rel_m=30, groundspeed_ms=0.2)
+           mode="LOITER", _owner="us", **AIR)
+ok &= case("GUIDED 停在空中", "HOLDING", "RTL", mode="GUIDED", **AIR)
 ok &= case("任務進行中（上限內）", "FLYING_MISSION", "續飛觀察",
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=8,
-           mission_seq=3, mission_total=9, mission_state=3, battery_pct=80)
+           mode="AUTO", mission_seq=3, mission_total=9, mission_state=3,
+           battery_pct=80, **AIR)
 ok &= case("任務進行中但電量 35%", "FLYING_MISSION", "RTL",
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=8,
-           mission_state=3, battery_pct=35)
+           mode="AUTO", mission_state=3, battery_pct=35, **AIR)
 ok &= case("任務進行中但單飛超時", "FLYING_MISSION", "RTL", solo=200.0,
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=8,
-           mission_state=3, battery_pct=80)
+           mode="AUTO", mission_state=3, battery_pct=80, **AIR)
 ok &= case("任務跑完（mission_state=5）", "HOLDING", "RTL",
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=0.3,
-           mission_state=5, battery_pct=80)
+           mode="AUTO", mission_state=5, battery_pct=80, **AIR)
 ok &= case("舊韌體不回報 mission_state", "FLYING_MISSION", "續飛觀察",
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=8,
-           mission_state=0, battery_pct=80)
+           mode="AUTO", mission_state=0, battery_pct=80, **AIR)
 ok &= case("電量未知不當成低電量", "FLYING_MISSION", "續飛觀察",
-           armed=True, mode="AUTO", alt_rel_m=40, groundspeed_ms=8,
-           mission_state=3, battery_pct=None)
+           mode="AUTO", mission_state=3, battery_pct=None, **AIR)
 
 print("\n── 反向驗證：斷言真的分得出來 ──────────────────────────")
 # 同一個 LOITER，只改溯源，處置必須相反——這是整套規則最容易寫錯的一格
-a = Fake(armed=True, mode="LOITER", alt_rel_m=30, groundspeed_ms=1, _owner="us")
-b = Fake(armed=True, mode="LOITER", alt_rel_m=30, groundspeed_ms=1,
-         _owner="pilot")
-flip = (isinstance(a._loss_verdict(a._loss_state(), 10.0), str)
-        and b._loss_verdict(b._loss_state(), 10.0) is False)
+a = Fake(mode="LOITER", landed_state="in_air", _owner="us")
+b = Fake(mode="LOITER", landed_state="in_air", _owner="pilot")
+flip = (isinstance(a._loss_verdict(a.flight_state(), 10.0), str)
+        and b._loss_verdict(b.flight_state(), 10.0) is False)
 print(f"{'✓' if flip else '✗'} 只改模式歸屬，LOITER 的處置由 RTL 翻成不介入")
 ok &= flip
 
