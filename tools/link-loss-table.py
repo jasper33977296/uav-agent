@@ -43,6 +43,7 @@ class Fake(A.Agent):
                                          last_hb=time.time() - hb_age)
         self.mode_owner = owner
         self.loss_started = 0.0
+        self.seq = st.pop("_seq", None)   # 改航線序列進行中？
         self._solo_logged = True            # 靜音，測的是判定不是播報
         self.a = types.SimpleNamespace(
             link_loss_max_solo_s=30.0, link_loss_min_batt=15)
@@ -90,6 +91,24 @@ ok &= case("armed 在地上（韌體不回報，靠高度）", "ARMED_GROUND", "
            mode="GUIDED", alt_rel_m=0.2, groundspeed_ms=0.0)
 ok &= case("爬升中", "TAKING_OFF", "RTL",
            mode="GUIDED", landed_state="takeoff")
+
+print("\n── 改航線序列中失聯（§7）───────────────────────────────")
+# 序列跑到一半失聯＝飛機停在一個沒有人確認過的中間狀態，而接下來每一步都需要
+# 地面站——它已經不在了。所以不管當下是哪個狀態，都立刻 RTL
+ok &= case("序列進行中（在飛任務）→ 不續飛，立刻 RTL", "FLYING_MISSION", "RTL",
+           solo=5.0, mode="AUTO", mission_state=3, battery_pct=90,
+           _seq={"intent_id": "x", "step": "upload"}, **AIR)
+ok &= case("序列進行中（暫停中）→ 立刻 RTL", "HOLDING", "RTL", solo=5.0,
+           mode="GUIDED", battery_pct=90,
+           _seq={"intent_id": "x", "step": "hold"}, **AIR)
+# **反向驗證**：序列不在時，同樣的狀態要回到正常的續飛判斷
+ok &= case("**反向驗證**：沒有序列時同一格是續飛觀察", "FLYING_MISSION",
+           "續飛觀察", solo=5.0, mode="AUTO", mission_state=3, battery_pct=90,
+           **AIR)
+# 飛手拿著的時候，序列旗標不得讓我們去動飛機
+ok &= case("序列進行中但飛手接管 → 仍然不介入", "PILOT_CONTROL", "不介入",
+           solo=5.0, mode="STABILIZE",
+           _seq={"intent_id": "x", "step": "hold"}, **AIR)
 
 print("\n── 表沒列到的狀態不得下指令 ───────────────────────────")
 g = Fake(mode="AUTO", landed_state="in_air")

@@ -249,6 +249,13 @@ class Agent:
         self.hello_sent = False
         self.drone_id = None
         self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
+        #: intent_id → 送出去給人看的提案。**留在機上**：確認的時候不必讓
+        #: 地面站把提案送回來，也就沒有「送回來的那份跟人看到的不一樣」的空間
+        self.proposals = {}
+        #: 改航線序列進行中（地面站在執行）。失聯處置要看它——§7 規定
+        #: 「改航線序列中 → 立刻 RTL」，因為序列跑到一半失聯＝飛機停在一個
+        #: 沒有人確認過的中間狀態
+        self.seq = None
         # 模式溯源（失聯處置選項 C）：LOITER 既可能是地面站按的「暫停」，
         # 也可能是飛手用遙控器切過去手飛的。兩者的處置完全相反——前者要 RTL，
         # 後者**永不介入**。分辨的唯一辦法是記住是誰要求的。
@@ -405,6 +412,7 @@ class Agent:
         self.request_streams_once()
         self.say_hello()
         self._track_mode_owner()
+        self._expire_seq(now)
         self._publish_state()
 
         self._check_gs_link(now)
@@ -542,7 +550,8 @@ class Agent:
              # 地面站據此知道哪些意圖要自己執行、哪些丟給代理（丙案分工）
              "executes": sorted(guard.AGENT_ACTIONS),
              "vets": sorted(guard.ACTIONS)},
-            on_intent=self.on_intent)
+            on_intent=self.on_intent, on_decision=self.on_decision,
+            on_progress=self.on_progress)
         self.intent.start()
 
     def on_intent(self, msg) -> dict:
@@ -593,20 +602,103 @@ class Agent:
             mission_name=p.get("mission_name") or "（未命名）",
             mission_id=p.get("mission_id"),
             cur_seq=s.get("mission_seq"))
-        prior = p.get("prior")
-        if prior:
-            drift = route.drift_reason(prior, prop)
-            if drift:
-                # **不照過期的提案做，也不自作主張用新的執行。**
-                # 人確認的是那一份提案，不是「授權之後隨便怎麼飛」
-                log.warning("改航線提案已過期：%s", drift)
-                return {**base, "event": "guard_refused",
-                        "reason": f"提案已經過期：{drift}。請重看新的提案再決定",
-                        "proposal": prop}
-            return {**base, "event": "cleared", "proposal": prop,
-                    "reason": "提案仍然成立，由地面站執行三步序列"}
+        prop["_wps"] = wps          # 確認時要用同一份航點重算
+        # 提案留在機上等確認。**不必讓地面站送回來**——送回來的那份與人真正
+        # 看到的那份是不是同一個，沒有辦法驗證；留在這裡就沒有這個空間
+        iid = base.get("intent_id")
+        if iid:
+            self.proposals[iid] = prop
+            if len(self.proposals) > 16:
+                self.proposals.pop(next(iter(self.proposals)))
         return {**base, "event": "proposal", "proposal": prop,
                 "reason": "提案由機上算（位置最新）"}
+
+    def on_decision(self, msg) -> dict:
+        """人的確認（協定 §4.5）。**確認不是授權，是對那一份提案的確認。**
+
+        所以這裡一定重算並比對（§5.1）：人是在看提案的那一刻按的，而飛機在
+        那段時間裡一直在動。續飛航點換了、或距離變化超過門檻，就中止重提。
+
+        **守門在這裡再過一次**：狀態可能在人看提案的時候變了——例如飛手拿起
+        遙控器接管。人確認的位階低於守門（§5.2）。
+        """
+        iid = msg.get("intent_id")
+        base = {"intent_id": iid, "action": "change_route",
+                "state": self.flight_state(), "executor": "ground"}
+        prior = self.proposals.get(iid)
+        if prior is None:
+            return {**base, "event": "failed",
+                    "reason": "沒有這個 intent_id 的提案（過久沒確認被汰換，"
+                              "或代理重啟過）——請重新取得提案"}
+        if not msg.get("approved"):
+            self.proposals.pop(iid, None)
+            log.info("人取消了改航線（%s）", iid)
+            return {**base, "event": "cancelled", "reason": "人取消"}
+        ok, why = guard.check(base["state"], "change_route")
+        if not ok:
+            self.proposals.pop(iid, None)
+            log.warning("確認之後守門仍擋下：%s", why)
+            return {**base, "event": "guard_refused", "reason": why}
+        s = self.mon.state
+        cur = dict(self._position(), heading=s.get("heading"))
+        now_prop = route.build_proposal(
+            wps=prior.get("_wps") or self._wps_of(iid), cur=cur,
+            hold_alt=(prior.get("hold") or {}).get("alt"),
+            mission_name=prior.get("mission_name"),
+            mission_id=prior.get("mission_id"),
+            cur_seq=s.get("mission_seq"))
+        drift = route.drift_reason(prior, now_prop)
+        if drift:
+            self.proposals[iid] = now_prop      # 換成新的，等人重看
+            log.warning("確認到達時提案已過期：%s", drift)
+            return {**base, "event": "guard_refused", "proposal": now_prop,
+                    "reason": f"提案已經過期：{drift}。請重看新的提案再決定"}
+        # 序列開始。**設一個死線**：地面站中途掛掉的話，這個旗標不能永遠留著
+        # ——它會讓失聯處置一直以為序列在跑
+        self.seq = {"intent_id": iid, "step": "approved", "since": time.time(),
+                    "deadline": time.time() + self.a.seq_timeout_s}
+        log.info("改航線已確認（%s）→ 由地面站執行三步", iid)
+        self.mon.events.append((time.time(), "intent", "改航線已確認，序列開始"))
+        return {**base, "event": "cleared", "proposal": now_prop,
+                "reason": "確認成立，由地面站執行三步序列"}
+
+    def _wps_of(self, iid):
+        """提案裡沒有存航點時的退路——回空表，讓 build_proposal 說算不出來。"""
+        return (self.proposals.get(iid) or {}).get("_wps") or []
+
+    def on_progress(self, msg) -> dict:
+        """地面站執行序列的逐步回報（協定 §4.6）。
+
+        **代理需要知道序列跑到哪一步**，不是為了記帳，是因為失聯處置的規則
+        依賴它：§7 規定「改航線序列中 → 立刻 RTL」，因為序列跑到一半失聯＝
+        飛機停在一個沒有人確認過的中間狀態。
+        """
+        iid, step = msg.get("intent_id"), msg.get("step")
+        ok = bool(msg.get("ok", True))
+        base = {"intent_id": iid, "action": "change_route", "step": step,
+                "state": self.flight_state(), "executor": "ground"}
+        if self.seq and self.seq.get("intent_id") == iid:
+            self.seq["step"] = step
+            self.seq["deadline"] = time.time() + self.a.seq_timeout_s
+            if step in ("resume", "done") or not ok:
+                self.seq = None
+                self.proposals.pop(iid, None)
+        log.info("改航線序列 %s：%s%s", step, "完成" if ok else "**失敗**",
+                 f"（{msg.get('detail')}）" if msg.get("detail") else "")
+        self.mon.events.append(
+            (time.time(), "intent",
+             f"改航線 {step} {'完成' if ok else '失敗'}"))
+        return {**base, "event": "noted", "ok": ok}
+
+    def _expire_seq(self, now):
+        """序列旗標的死線。地面站中途掛掉時，這個旗標留著會讓失聯處置一直
+        以為序列在跑——而**旗標卡住造成的誤判，比沒有旗標更難查**。"""
+        if self.seq and now > self.seq["deadline"]:
+            log.warning("改航線序列逾時未完成（%.0f 秒），清掉序列旗標",
+                        now - self.seq["since"])
+            self.mon.events.append(
+                (now, "intent", "改航線序列逾時，旗標已清除"))
+            self.seq = None
 
     #: 代理自己執行的意圖 → 飛控模式。只要 DO_SET_MODE，不碰任務協定
     _INTENT_MODE = {"rtl": "RTL", "land": "LAND", "abort": "LOITER"}
@@ -647,8 +739,8 @@ class Agent:
         self.intent.publish({
             "state": self.flight_state(),
             "sysid": s.get("sysid"),
-            "intent_id": None,          # intent 尚未實作，據實留 null
-            "seq_step": None,
+            "intent_id": (self.seq or {}).get("intent_id"),
+            "seq_step": (self.seq or {}).get("step"),
             "mission_seq": s.get("mission_seq"),
             "mission_total": s.get("mission_total"),
             "derived": {
@@ -823,6 +915,11 @@ class Agent:
             # （這是本系統的操作前提），人處理比飛機自己起飛安全得多。
             # 所以這格只告警留痕。要改回規格行為必須是明確裁定，不是預設值。
             return False
+        if self.seq:
+            # §7：改航線序列跑到一半失聯 → 立刻 RTL。飛機此刻停在一個**沒有人
+            # 確認過的中間狀態**（可能已經 hold、可能已經上傳但還沒續飛），
+            # 而接下來要下的每一步都需要地面站——它已經不在了
+            return f"改航線序列進行中（{self.seq.get('step')}）且地面站失聯"
         if state in ("HOLDING", "TAKING_OFF"):
             # 沒有任務可以跑完，停在空中等一個回不來的確認毫無意義
             return "無任務可續飛（暫停中、爬升中或任務已結束）"
@@ -961,6 +1058,11 @@ def main():
     p.add_argument("--link-loss-min-batt", type=int,
                    default=int(os.environ.get("LINK_LOSS_MIN_BATT_PCT", 15)),
                    help="失聯續飛的電量下限，低於就立刻 RTL（使用者定案：15%%）")
+    # 改航線序列的死線：地面站中途掛掉時清掉序列旗標。三步序列正常只要幾秒，
+    # 120 秒已經是「顯然出事了」的量級
+    p.add_argument("--seq-timeout-s", type=float,
+                   default=float(os.environ.get("SEQ_TIMEOUT_S", 120.0)),
+                   help="改航線序列多久沒進展就清掉序列旗標")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",

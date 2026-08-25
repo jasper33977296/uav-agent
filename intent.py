@@ -55,13 +55,17 @@ class IntentLink(threading.Thread):
     """
 
     def __init__(self, url, hello, interval=KEEPALIVE_S, silence=SILENCE_S,
-                 on_intent=None):
+                 on_intent=None, on_decision=None, on_progress=None):
         super().__init__(daemon=True)
         self.url = url
         self.hello = hello
         #: 收到 intent 時呼叫，回傳一則 event dict。**在這條執行緒上跑**——
         #: 所以它必須是快的（守門查表＋送幾個 MAVLink 封包），不能等回讀
         self.on_intent = on_intent
+        #: 人的確認（協定 §4.5）與地面站執行序列的逐步回報（§4.6）。
+        #: 兩者都回一則 event，走與 intent 相同的路徑
+        self.on_decision = on_decision
+        self.on_progress = on_progress
         self.interval = interval
         self.silence = silence
         self._snapshot = None
@@ -160,28 +164,32 @@ class IntentLink(threading.Thread):
     def _send(self, ws, msg):
         ws.send(json.dumps(dict(msg, v=PROTOCOL_V, ts=_now_iso())))
 
-    def _handle_intent(self, msg):
-        """意圖進來 → 守門 → （代理的動作就執行）→ 回一則 event。
+    def _dispatch(self, msg, handler):
+        """intent／decision／progress 都走這條：處理 → 回一則 event。
 
         **同一個 intent_id 重送＝冪等**（協定 §4.3）：斷線重連後地面站會安全
         重送，那時候**不能再做一次**——重做一次 rtl 沒差，重做一次 change_route
         會讓飛機再繞一圈。回上次的結果就好。
+
+        冪等鍵是 (intent_id, 型別)：同一個 intent 的 decision 與 progress 是
+        不同的事，用同一個鍵會讓 decision 之後的 progress 被當成重送吞掉。
         """
         iid = msg.get("intent_id")
-        if iid and iid in self._done:
-            self._pending.append(dict(self._done[iid], replayed=True))
+        key = (iid, msg.get("type"), msg.get("step"))
+        if iid and key in self._done:
+            self._pending.append(dict(self._done[key], replayed=True))
             return
         ev = None
         try:
-            if self.on_intent:
-                ev = self.on_intent(msg)
+            if handler:
+                ev = handler(msg)
         except Exception as e:
             log.exception("處理意圖失敗")
             ev = {"event": "failed", "reason": f"代理處理意圖時例外：{e}"}
-        ev = dict(ev or {"event": "failed", "reason": "代理沒有掛意圖處理器"})
+        ev = dict(ev or {"event": "failed", "reason": "代理沒有掛對應的處理器"})
         ev.setdefault("intent_id", iid)
         if iid:
-            self._done[iid] = ev
+            self._done[key] = ev
             # 只留最近的：這是冪等用的短記憶，不是稽核紀錄（那在地面站的
             # command_audit）。無上限地留著＝一個慢慢長大的記憶體洩漏
             if len(self._done) > 64:
@@ -201,8 +209,13 @@ class IntentLink(threading.Thread):
             self.rejected += 1
             log.error("地面站拒絕：%s", msg.get("reason"))
         elif t == "intent":
-            self._handle_intent(msg)
-        elif t in ("proposal", "decision"):
-            log.warning("收到 %s，本版尚未實作 → 丟棄", t)
+            self._dispatch(msg, self.on_intent)
+        elif t == "decision":
+            self._dispatch(msg, self.on_decision)
+        elif t == "progress":
+            self._dispatch(msg, self.on_progress)
+        elif t == "proposal":
+            log.warning("收到 proposal——那是**我方**送出去的型別，"
+                        "地面站不該送回來 → 丟棄")
         elif t != "ack":
             log.warning("收到未知型別 %s，丟棄（協定 §3：不半懂地解讀）", t)
