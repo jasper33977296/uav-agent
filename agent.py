@@ -51,6 +51,7 @@ from collections import defaultdict
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
+import guard
 from intent import IntentLink
 from modem import ModemSampler
 
@@ -533,8 +534,65 @@ class Agent:
              "autopilot": ident.get("autopilot"), "fw": ident.get("fw"),
              # inputs＝判斷依據的清單（協定 §4.1）。目前只有遙測；機上加裝
              # 相機後會多一項，地面站據此知道這台機的判斷是基於什麼
-             "inputs": ["telemetry"], "protocol": [1]})
+             "inputs": ["telemetry"], "protocol": [1],
+             # 地面站據此知道哪些意圖要自己執行、哪些丟給代理（丙案分工）
+             "executes": sorted(guard.AGENT_ACTIONS),
+             "vets": sorted(guard.ACTIONS)},
+            on_intent=self.on_intent)
         self.intent.start()
+
+    def on_intent(self, msg) -> dict:
+        """收到意圖：**先守門，再看誰執行**（協定 §5.2、丙案分工）。
+
+        守門一律先過這裡，因為它檢查的是**執行當下**的事實——人是在看提案時
+        確認的，兩者之間飛機一直在動。所以守門的位階高於 `approved`。
+        """
+        action = msg.get("action")
+        state = self.flight_state()
+        ok, why = guard.check(state, action)
+        base = {"intent_id": msg.get("intent_id"), "action": action,
+                "state": state, "executor": guard.executor(action or "")}
+        if not ok:
+            log.warning("守門擋下意圖 %s（狀態 %s）：%s", action, state, why)
+            self.mon.events.append(
+                (time.time(), "guard", f"擋下 {action}：{why}"))
+            return {**base, "event": "guard_refused", "reason": why}
+        if guard.executor(action) == "ground":
+            # **放行不等於做完**：地面站有完整的廠牌方言，由它執行；
+            # 代理只負責說「現在這件事可以做」
+            log.info("守門放行 %s（狀態 %s）→ 由地面站執行", action, state)
+            return {**base, "event": "cleared",
+                    "reason": "守門通過，由地面站執行"}
+        return self._do_agent_action(action, base)
+
+    #: 代理自己執行的意圖 → 飛控模式。只要 DO_SET_MODE，不碰任務協定
+    _INTENT_MODE = {"rtl": "RTL", "land": "LAND", "abort": "LOITER"}
+
+    def _do_agent_action(self, action, base) -> dict:
+        mode = self._INTENT_MODE[action]
+        tgt = self.mon.state.get("sysid", 1)
+        code = COPTER_MODE_ID.get(mode)
+        if code is None:
+            return {**base, "event": "failed", "reason": f"不認得模式 {mode}"}
+        try:
+            # 送三次：57600 上單一封包丟失是真實風險，而這是保命指令。
+            # DO_SET_MODE 冪等，重複下達沒有副作用（與失聯處置同一套理由）
+            self.mode_req = (mode, time.time())
+            for _ in range(3):
+                self.serial.mav.command_long_send(
+                    tgt, 1, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    code, 0, 0, 0, 0, 0)
+                time.sleep(0.1)
+        except Exception as e:
+            log.exception("意圖 %s 送出失敗", action)
+            return {**base, "event": "failed", "reason": f"送出失敗：{e}"}
+        log.info("意圖 %s → 已下達 %s（狀態 %s）", action, mode, base["state"])
+        self.mon.events.append((time.time(), "intent", f"{action} → {mode}"))
+        # **回 sent 而不是 done**：ACK 是「我收到了」，不是「我做到了」。
+        # 真的進了哪個模式由下一則 state 說（那是讀回來的事實）
+        return {**base, "event": "sent", "mode": mode,
+                "reason": f"已下達 {mode}，實際模式看下一則 state"}
 
     def _publish_state(self):
         """把當下狀態交給意圖通道。**狀態的定義只有 flight_state() 一份**——

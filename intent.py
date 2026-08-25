@@ -54,10 +54,14 @@ class IntentLink(threading.Thread):
     這條通道要的是「現在是什麼狀態」，不是狀態的歷史。
     """
 
-    def __init__(self, url, hello, interval=KEEPALIVE_S, silence=SILENCE_S):
+    def __init__(self, url, hello, interval=KEEPALIVE_S, silence=SILENCE_S,
+                 on_intent=None):
         super().__init__(daemon=True)
         self.url = url
         self.hello = hello
+        #: 收到 intent 時呼叫，回傳一則 event dict。**在這條執行緒上跑**——
+        #: 所以它必須是快的（守門查表＋送幾個 MAVLink 封包），不能等回讀
+        self.on_intent = on_intent
         self.interval = interval
         self.silence = silence
         self._snapshot = None
@@ -67,6 +71,8 @@ class IntentLink(threading.Thread):
         self.sent = 0
         self.rejected = 0
         self.drops = 0                # 連上之後又斷掉的次數（＝鏈路品質指標）
+        self._pending = []            # 待送的 event（在收訊迴圈裡產生，送在同一圈）
+        self._done = {}               # intent_id → 上次的結果（冪等用的短記憶）
         self.silent_drops = 0         # 其中「對面不回話」被我方主動掐掉的次數
         self._backoff = 1.0
 
@@ -124,6 +130,8 @@ class IntentLink(threading.Thread):
                     last_rx = time.time()
                 except websocket.WebSocketTimeoutException:
                     pass
+                while self._pending:
+                    self._send(ws, dict(self._pending.pop(0), type="event"))
                 with self._lock:
                     snap = self._snapshot
                 now = time.time()
@@ -152,6 +160,34 @@ class IntentLink(threading.Thread):
     def _send(self, ws, msg):
         ws.send(json.dumps(dict(msg, v=PROTOCOL_V, ts=_now_iso())))
 
+    def _handle_intent(self, msg):
+        """意圖進來 → 守門 → （代理的動作就執行）→ 回一則 event。
+
+        **同一個 intent_id 重送＝冪等**（協定 §4.3）：斷線重連後地面站會安全
+        重送，那時候**不能再做一次**——重做一次 rtl 沒差，重做一次 change_route
+        會讓飛機再繞一圈。回上次的結果就好。
+        """
+        iid = msg.get("intent_id")
+        if iid and iid in self._done:
+            self._pending.append(dict(self._done[iid], replayed=True))
+            return
+        ev = None
+        try:
+            if self.on_intent:
+                ev = self.on_intent(msg)
+        except Exception as e:
+            log.exception("處理意圖失敗")
+            ev = {"event": "failed", "reason": f"代理處理意圖時例外：{e}"}
+        ev = dict(ev or {"event": "failed", "reason": "代理沒有掛意圖處理器"})
+        ev.setdefault("intent_id", iid)
+        if iid:
+            self._done[iid] = ev
+            # 只留最近的：這是冪等用的短記憶，不是稽核紀錄（那在地面站的
+            # command_audit）。無上限地留著＝一個慢慢長大的記憶體洩漏
+            if len(self._done) > 64:
+                self._done.pop(next(iter(self._done)))
+        self._pending.append(ev)
+
     def _on_message(self, raw):
         try:
             msg = json.loads(raw)
@@ -164,7 +200,9 @@ class IntentLink(threading.Thread):
             # 靜靜地被丟掉，機上會以為狀態一直有推上去，而畫面其實是空的
             self.rejected += 1
             log.error("地面站拒絕：%s", msg.get("reason"))
-        elif t in ("intent", "proposal", "decision"):
-            log.warning("收到 %s，但本版只做到 state，尚未實作 → 丟棄", t)
+        elif t == "intent":
+            self._handle_intent(msg)
+        elif t in ("proposal", "decision"):
+            log.warning("收到 %s，本版尚未實作 → 丟棄", t)
         elif t != "ack":
             log.warning("收到未知型別 %s，丟棄（協定 §3：不半懂地解讀）", t)
