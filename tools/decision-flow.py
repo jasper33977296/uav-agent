@@ -135,6 +135,19 @@ ev = g.on_decision({"intent_id": "沒看過的 id", "approved": True})
 chk("找不到提案 → failed 並說得出怎麼辦",
     ev["event"] == "failed" and "重新取得" in ev["reason"], ev.get("reason"))
 
+print("\n── 乾跑：問判決但不動飛機 ─────────────────────────────")
+g = Fake()
+g.serial = None            # 真的送指令會在這裡爆 → 證明乾跑沒有走到送出那條路
+ev = g.on_intent({"intent_id": "d1", "action": "rtl",
+                  "params": {"dry_run": True}})
+chk("放行但不執行", ev["event"] == "would_execute", ev.get("reason"))
+chk("說得出本來會下什麼模式", ev.get("mode") == "RTL", ev.get("mode"))
+g._state = "READY"
+ev = g.on_intent({"intent_id": "d2", "action": "rtl",
+                  "params": {"dry_run": True}})
+chk("**乾跑不會繞過守門**：地上仍然拒絕",
+    ev["event"] == "guard_refused", ev.get("reason"))
+
 print("\n── 沒帶航點的意圖 ─────────────────────────────────────")
 g = Fake()
 ev = g.on_intent({"intent_id": "i9", "action": "change_route", "params": {}})

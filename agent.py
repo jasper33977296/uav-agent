@@ -578,6 +578,17 @@ class Agent:
             log.info("守門放行 %s（狀態 %s）→ 由地面站執行", action, state)
             return {**base, "event": "cleared",
                     "reason": "守門通過，由地面站執行"}
+        if (msg.get("params") or {}).get("dry_run"):
+            # **乾跑：問判決但不動飛機。**
+            # 沒有這個模式的話，要驗證守門「放行」那幾格就一定得真的下指令——
+            # 2026-08-25 我就對一台停在地上的真機送出了 RTL／LAND／LOITER，
+            # 只為了確認守門會放行。機是上鎖的所以無害，但**驗證不該需要
+            # 動到飛機**，而且下次可能就不是上鎖狀態了
+            log.info("守門放行 %s（狀態 %s）→ 乾跑，不下指令", action, state)
+            return {**base, "event": "would_execute",
+                    "mode": self._INTENT_MODE.get(action),
+                    "reason": f"守門通過；乾跑模式，沒有下達 "
+                              f"{self._INTENT_MODE.get(action)}"}
         return self._do_agent_action(action, base)
 
     def _change_route_proposal(self, msg, base):
