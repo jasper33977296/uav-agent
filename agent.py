@@ -43,6 +43,8 @@ import os
 import select
 import socket
 import sys
+import urllib.error
+import urllib.request
 import time
 from collections import defaultdict
 
@@ -52,6 +54,26 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
+
+AGENT_VERSION = "0.2.0"
+
+
+def agent_uid() -> str | None:
+    """這台**伴飛電腦**的唯一序號（樹莓派燒在 SoC 上的那個）。
+
+    **與 board_uid 回答不同的問題**：board_uid＝這是哪一架飛機（飛控板），
+    agent_uid＝這是哪一台伴飛電腦。5G 模組、Wi-Fi 卡、代理版本屬於後者——
+    混成一個欄位，換件時就說不清是哪一邊變了。
+
+    把 Pi 拆到另一台飛機上，它回報的會是**那台**飛控的 board_uid，
+    所以身分不會被代理帶著走。
+    """
+    try:
+        with open("/proc/device-tree/serial-number", "rb") as f:
+            return f.read().rstrip(b"\x00").decode().strip() or None
+    except OSError:
+        return None
+
 
 # 要飛控持續送的重點訊息（逐一設間隔，比舊式 ALL 串流精準）
 WANTED = [1, 24, 27, 29, 30, 33, 36, 42, 62, 65, 74, 116, 125, 147, 193, 241]
@@ -132,6 +154,8 @@ class Monitor:
             self._change("mode", mode, f"飛行模式 → {mode}")
             s["sysid"] = msg.get_srcSystem()
             s["system_status"] = msg.system_status
+            s["autopilot_raw"] = msg.autopilot
+            s["vehicle_type"] = msg.type
         elif t == "SYS_STATUS":
             v = msg.voltage_battery
             s["voltage"] = None if v == 0xFFFF else round(v / 1000, 3)
@@ -156,6 +180,19 @@ class Monitor:
             s["alt_rel_m"] = round(msg.relative_alt / 1000, 2)
         elif t == "VFR_HUD":
             s["groundspeed_ms"] = round(msg.groundspeed, 2)
+        elif t == "AUTOPILOT_VERSION":
+            # 板子身分（uav-system issues/038）。**代理原本只轉發不解**——
+            # 但註冊要以 board_uid 為鍵，所以自己也得看得懂。
+            uid2 = bytes(getattr(msg, "uid2", b"") or b"").rstrip(b"\x00")
+            s["board_uid"] = uid2.hex() if uid2 else (
+                f"{msg.uid:016x}" if getattr(msg, "uid", 0) else None)
+            v = getattr(msg, "flight_sw_version", 0) or 0
+            if v:
+                kind = {255: "official", 128: "rc", 64: "beta",
+                        192: "dev"}.get(v & 0xFF)
+                s["fw"] = (f"{(v >> 24) & 0xFF}.{(v >> 16) & 0xFF}."
+                           f"{(v >> 8) & 0xFF}"
+                           + (f" ({kind})" if kind else f" (type {v & 0xFF})"))
         elif t == "STATUSTEXT":
             txt = msg.text.strip()
             if txt:
@@ -181,6 +218,8 @@ class Agent:
         self.serial = None
         self.last_stream_req = 0.0
         self.caps_requested = False
+        self.hello_sent = False
+        self.drone_id = None
         self.last_telem_rx = 0.0
         self.last_report = 0.0
         self.fwd_to_fc = 0
@@ -311,6 +350,7 @@ class Agent:
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
         self.request_board_id()
+        self.say_hello()
 
         self._check_gs_link(now)
 
@@ -353,6 +393,48 @@ class Agent:
             self.fwd_to_fc += 1
         except OSError as e:
             log.warning("寫入飛控失敗：%s", e)
+
+    def say_hello(self):
+        """向地面站自報身分——**註冊是它的副作用**（uav-system issues/038）。
+
+        為什麼由代理發起而不是人在前端註冊：代理知道的（板子 UID、廠牌、韌體、
+        機型）**全部是機器問得到的，讓人打字只會打錯**；而人該維護的（機架序號、
+        型號、名稱）代理問不到。所以前端只需要編輯，不需要註冊表單。
+
+        鍵是 **board_uid 不是 sysid**：sysid 是機上可以隨時改的參數，
+        2026-08-24 就發生過舊記錄佔著 sysid、新機被認領進去的事。
+
+        **等拿到 board_uid 才送**：沒有它就沒有穩定的身分，寧可晚一點註冊，
+        也不要先用一個會變的鍵建檔。
+        """
+        if self.hello_sent:
+            return
+        uid = self.mon.state.get("board_uid")
+        if not uid:
+            return                          # 還沒問到板子身分，下一拍再說
+        body = {
+            "board_uid": uid,
+            "agent_uid": agent_uid(),
+            "autopilot": {3: "ardupilot", 12: "px4"}.get(
+                self.mon.state.get("autopilot_raw")),
+            "fw": self.mon.state.get("fw"),
+            "vehicle_type": self.mon.state.get("vehicle_type"),
+            "agent_version": AGENT_VERSION,
+        }
+        try:
+            req = urllib.request.Request(
+                f"http://{self.a.gs}:{self.a.backend_port}/api/agent/hello",
+                data=json.dumps(body).encode(), method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                res = json.loads(r.read() or b"{}")
+            self.hello_sent = True
+            self.drone_id = res.get("drone_id")
+            log.info("已向地面站自報：%s（%s，board_uid=%s）", res.get("name"),
+                     "**新建檔**" if res.get("created") else "既有記錄", uid)
+        except Exception as e:
+            # 失敗不設旗標＝下一拍重試。地面站可能還沒起來，或 5G 正好在抖。
+            log.warning("自報身分失敗（%s），稍後重試", e)
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
