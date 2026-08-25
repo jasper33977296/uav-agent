@@ -82,6 +82,11 @@ COPTER_MODE_ID = {v: k for k, v in {
     6: "RTL", 9: "LAND", 21: "SMART_RTL", 5: "LOITER"}.items()}
 #: 已經在「自己回家／降落」的模式，失聯處置不再介入
 SELF_RECOVERING = {"RTL", "LAND", "SMART_RTL", "AUTO_RTL"}
+#: **人不可能用手把飛機飛在這兩個模式裡**——它們的桿位輸入不控制姿態，
+#: 所以看到它們就確定是自動化在飛（我方或地面站下的），不必再溯源。
+#: LOITER 不在這裡：它既是地面站的「暫停」也是飛手最常用的手飛模式，
+#: 誰下的必須靠溯源分辨（見 Agent._mode_owner）。
+AUTOMATED_MODES = {"AUTO", "GUIDED", "GUIDED_NOGPS"}
 
 COPTER_MODE = {0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
                5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 16: "POSHOLD",
@@ -180,6 +185,14 @@ class Monitor:
             s["alt_rel_m"] = round(msg.relative_alt / 1000, 2)
         elif t == "VFR_HUD":
             s["groundspeed_ms"] = round(msg.groundspeed, 2)
+        elif t == "MISSION_CURRENT":
+            # 失聯處置的「跑完再 RTL」要知道任務**什麼時候算跑完**。
+            # mission_state 是後來才加進 MAVLink 的欄位：舊韌體不填（0＝UNKNOWN），
+            # 那時我們就宣告「測不到完成」，改由單飛時間上限收尾——
+            # **不要用 seq 到底了來猜**，最後一個航點停留多久是任務自己的事。
+            s["mission_seq"] = msg.seq
+            s["mission_total"] = getattr(msg, "total", 0) or 0
+            s["mission_state"] = getattr(msg, "mission_state", 0) or 0
         elif t == "AUTOPILOT_VERSION":
             # 板子身分（uav-system issues/038）。**代理原本只轉發不解**——
             # 但註冊要以 board_uid 為鍵，所以自己也得看得懂。
@@ -220,6 +233,13 @@ class Agent:
         self.caps_requested = False
         self.hello_sent = False
         self.drone_id = None
+        # 模式溯源（失聯處置選項 C）：LOITER 既可能是地面站按的「暫停」，
+        # 也可能是飛手用遙控器切過去手飛的。兩者的處置完全相反——前者要 RTL，
+        # 後者**永不介入**。分辨的唯一辦法是記住是誰要求的。
+        self._solo_logged = False     # 續飛決定只播報一次，不是每拍都喊
+        self.mode_req = None          # (模式名, 要求時間)：我方最近一次的模式指令
+        self.mode_owner = None        # "us" / "pilot"：當下這個模式是誰造成的
+        self._seen_mode = None        # 上一拍觀察到的模式，用來偵測變化
         self.last_telem_rx = 0.0
         self.last_report = 0.0
         self.fwd_to_fc = 0
@@ -351,6 +371,7 @@ class Agent:
         # request_streams()——理由見 request_board_id 的說明。
         self.request_board_id()
         self.say_hello()
+        self._track_mode_owner()
 
         self._check_gs_link(now)
 
@@ -385,7 +406,42 @@ class Agent:
             return
         for m in msgs:
             if m.get_type() != "BAD_DATA":
+                self._note_mode_request(m)
                 self._write(fd, m.get_msgbuf())
+
+    def _note_mode_request(self, m):
+        """記下**我方**（地面站或代理）要求過的飛行模式。
+
+        地面站的指令本來就經過這裡，所以不必另外開通道問它「剛才按了什麼」——
+        我們是那條路徑上的必經之地，順手看一眼就有了。
+        """
+        t = m.get_type()
+        code = None
+        if t == "SET_MODE":
+            code = m.custom_mode
+        elif t == "COMMAND_LONG" and m.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+            code = int(m.param2)
+        if code is not None:
+            self.mode_req = (COPTER_MODE.get(code, code), time.time())
+
+    def _track_mode_owner(self):
+        """每次觀察到模式變化，判定這個模式是我方造成的還是飛手切的。
+
+        **只在變化的當下判定一次**：飛手把 LOITER 切走再切回來，如果每拍都拿
+        「我方曾經要求過 LOITER」來比對，就會把飛手的 LOITER 誤認成我方的暫停，
+        然後在他手上飛的時候送 RTL——那正是這套規則最該避免的操作。
+
+        判不出來（代理剛啟動、飛行中重連）時 owner 留 None，由呼叫端當
+        「不確定」處理，而不是預設成我方。
+        """
+        mode = self.mon.state.get("mode")
+        if mode == self._seen_mode:
+            return
+        self._seen_mode = mode
+        req, ts = self.mode_req or (None, 0)
+        # 10 秒：模式指令送出到心跳回報新模式之間的正常延遲遠小於此；
+        # 放寬到這個量級是為了容忍 57600 上的重送與丟包
+        self.mode_owner = "us" if req == mode and time.time() - ts < 10 else "pilot"
 
     def _write(self, fd, data):
         try:
@@ -445,8 +501,15 @@ class Agent:
 
         三層防線裡這是第二層：
           1. 飛控自己的 RC failsafe（遙控器待命，人隨時可接管）
-          2. **本層**：地面失聯 → 逾時未恢復就自主返航
+          2. **本層**：地面失聯 → 依當下狀態決定處置
           3. 地面站的操作員判斷
+
+        **處置規則＝選項 C（協定 §6，2026-08-25 裁定）**，逐狀態決定：
+        任務進行中續飛到跑完再 RTL；暫停中／起飛中立刻 RTL；已在返航或降落
+        不介入；飛手拿著永不介入。續飛另有兩個上限（單飛時間、電量）。
+        為什麼不是「一律 30 秒 RTL」：5G 抖動在本場域是常態，一次抖動就中斷
+        自動任務等於這套系統不能用；反過來「一律跑完」則會讓沒人看得見的
+        飛機一直飛下去。分狀態是為了讓每一格的代價都說得出口。
 
         設計上的節制：
         * **只在 armed 時處置**。地面上做整合測試時鏈路斷來斷去是常態，
@@ -455,8 +518,8 @@ class Agent:
           打斷它，或覆蓋掉操作員/飛控剛做的決定。
         * **一次失聯只動作一次**。動作後若人用遙控器接管改了模式，我們不再
           搶回來——人優先於自動化。
-        * **鏈路恢復不自動續飛**。恢復只解除警戒並留痕，要不要繼續任務是人的
-          決定（自動續飛等於在無人確認的狀態下重新起飛）。
+        * **鏈路恢復不改變當下行為**。已經開始的 RTL 不會被取消；恢復只解除
+          警戒並留痕，要不要繼續是人的決定。
         """
         if not self.last_gs_rx:
             return                        # 還沒建立過鏈路，沒有「失去」可言
@@ -477,6 +540,7 @@ class Agent:
                     self.mon.events.append(
                         (now, "gs_link", f"地面站鏈路恢復（中斷 {dur:.0f}s）"))
                 self.loss_warned = self.loss_acted = False   # 解除警戒
+                self._solo_logged = False
                 self.loss_started = None
             else:
                 self.loss_started = self.last_gs_rx
@@ -489,10 +553,12 @@ class Agent:
         mode = self.mon.state.get("mode")
         if not self.loss_warned:
             self.loss_warned = True
-            log.warning("⚠ 地面站失聯 %.0f 秒（armed=%s mode=%s）；%.0f 秒後%s",
-                        age, armed, mode, self.a.link_action_s,
-                        f"執行 {self.a.link_action.upper()}"
-                        if self.a.link_action != "none" else "不動作（設定為 none）")
+            log.warning("⚠ 地面站失聯 %.0f 秒（armed=%s mode=%s 狀態=%s）；"
+                        "%.0f 秒後依狀態處置%s",
+                        age, armed, mode, self._loss_state(),
+                        self.a.link_action_s,
+                        "" if self.a.link_action != "none"
+                        else "（設定為 none＝只告警不動作）")
             self.mon.events.append((now, "gs_link", f"⚠ 地面站失聯（{age:.0f}s）"))
 
         if self.loss_acted or age < self.a.link_action_s:
@@ -500,18 +566,88 @@ class Agent:
         if self.a.link_action == "none":
             self.loss_acted = True
             return
-        if not armed:
-            self.loss_acted = True          # 地面測試：只留痕，絕不送指令
-            log.warning("地面站失聯逾時，但機體未 armed → 不送任何指令")
+
+        state = self._loss_state()
+        reason = self._loss_verdict(state, now)
+        if reason is None:
+            return                          # 續飛觀察中：下一拍再評估
+        if reason is False:
+            self.loss_acted = True          # 這個狀態下永遠不介入，不必再看
+            log.warning("地面站失聯逾時，狀態 %s → 不介入", state)
+            self.mon.events.append(
+                (now, "gs_link", f"地面失聯但不介入（{state}）"))
             return
+        self._do_link_loss_action(now, age, mode, f"{state}／{reason}")
+
+    def _loss_state(self):
+        """把觀察得到的東西收斂成失聯處置要分辨的幾種狀態。
+
+        **這不是意圖協定裡那台狀態機**——協定還沒接上，代理現在只有 MAVLink
+        看得到的東西（模式、armed、高度、任務進度）。所以這裡是**用觀察量做的
+        近似**，而且每一格都往「不要亂動」的方向偏：分不出來就當飛手拿著。
+        接上協定之後，這個函式改成讀權威狀態即可，處置規則不用動。
+        """
+        s = self.mon.state
+        if not s.get("armed"):
+            return "DISARMED"
+        mode = s.get("mode")
         if mode in SELF_RECOVERING:
-            self.loss_acted = True
-            log.warning("地面站失聯逾時，但已在 %s → 不介入", mode)
-            return
+            return "RETURNING"
+        # 貼地且幾乎不動＝還在地上（TAKING_OFF 之前）。**寧可判成飛行中**：
+        # 判錯成「在地上」會漏掉該做的 RTL，判錯成「飛行中」最多是多做一次
+        alt = s.get("alt_rel_m")
+        spd = s.get("groundspeed_ms")
+        if (alt is not None and alt < 1.0
+                and spd is not None and spd < 0.5):
+            return "ARMED_GROUND"
+        if mode in AUTOMATED_MODES:
+            if mode == "AUTO" and s.get("mission_state") != 5:
+                return "FLYING_MISSION"     # 5＝MISSION_STATE_COMPLETE
+            return "HOLDING"
+        if mode == "LOITER" and self.mode_owner == "us":
+            return "HOLDING"                # 地面站按的暫停
+        return "PILOT_CONTROL"              # 含溯源不明的 LOITER 與所有手飛模式
 
-        self._do_link_loss_action(now, age, mode)
+    def _loss_verdict(self, state, now):
+        """回傳：字串＝立刻 RTL 的理由；False＝這個狀態永不介入；None＝再等一拍。"""
+        if state in ("RETURNING", "PILOT_CONTROL", "DISARMED"):
+            return False
+        if state == "ARMED_GROUND":
+            # **規格說 ARMED_GROUND 立刻 RTL，這裡刻意不照做**（2026-08-25）：
+            # 機在地上時 RTL 會先爬到 RTL_ALT——那是一次沒有人按下的起飛，
+            # 而且發生在「地面站看不到」的當下。同一時間遙控器就在旁邊待命
+            # （這是本系統的操作前提），人處理比飛機自己起飛安全得多。
+            # 所以這格只告警留痕。要改回規格行為必須是明確裁定，不是預設值。
+            return False
+        if state == "HOLDING":
+            # 沒有任務可以跑完，停在空中等一個回不來的確認毫無意義
+            return "無任務可續飛（暫停中或任務已結束）"
+        # ── FLYING_MISSION：跑完再 RTL，但有兩個上限 ──────────────
+        batt = self.mon.state.get("battery_pct")
+        if batt is not None and batt < self.a.link_loss_min_batt:
+            return f"電量 {batt}% 低於 {self.a.link_loss_min_batt}%"
+        # 用 is None 而不是 `or`：loss_started 是 epoch 秒數，`or` 會把
+        # 合法的 0.0 當成未設定——測試就是這樣抓到的（單飛上限永不觸發）
+        base = now if self.loss_started is None else self.loss_started
+        solo = now - base
+        if solo > self.a.link_loss_max_solo_s:
+            return f"無人監看已 {solo:.0f} 秒（上限 {self.a.link_loss_max_solo_s:.0f}）"
+        if self.mon.state.get("mission_state") == 5:
+            return "任務已完成"
+        if not self._solo_logged:
+            self._solo_logged = True
+            ms = self.mon.state.get("mission_state")
+            log.warning("地面失聯但任務進行中（%s/%s）→ 續飛，%.0f 秒或電量 %d%% "
+                        "為止%s", self.mon.state.get("mission_seq"),
+                        self.mon.state.get("mission_total") or "?",
+                        self.a.link_loss_max_solo_s, self.a.link_loss_min_batt,
+                        "" if ms else "（韌體不回報 mission_state＝測不到"
+                                      "「跑完」，只能靠時間上限收尾）")
+            self.mon.events.append(
+                (now, "gs_link", "地面失聯，任務續飛中（上限內）"))
+        return None
 
-    def _do_link_loss_action(self, now, age, mode):
+    def _do_link_loss_action(self, now, age, mode, why):
         self.loss_acted = True
         want = self.a.link_action.upper()
         code = COPTER_MODE_ID.get(want)
@@ -519,8 +655,10 @@ class Agent:
             log.error("未知的失聯處置 %s，不動作", want)
             return
         tgt = self.mon.state.get("sysid", 1)
-        log.error("⚠⚠ 地面站失聯 %.0f 秒且機體 armed（模式 %s）→ 下達 %s",
-                  age, mode, want)
+        # 這是我方要求的模式：記進溯源，免得等一下把自己下的 RTL 當成飛手切的
+        self.mode_req = (want, time.time())
+        log.error("⚠⚠ 地面站失聯 %.0f 秒且機體 armed（模式 %s，%s）→ 下達 %s",
+                  age, mode, why, want)
         try:
             # 送三次：57600 的鏈路上單一封包丟失是真實風險，而這是保命指令。
             # DO_SET_MODE 是冪等的，重複下達沒有副作用。
@@ -531,7 +669,7 @@ class Agent:
                     code, 0, 0, 0, 0, 0)
                 time.sleep(0.1)
             self.mon.events.append((now, "gs_link_action",
-                                    f"⚠ 地面失聯 {age:.0f}s → 下達 {want}"))
+                                    f"⚠ 地面失聯 {age:.0f}s（{why}）→ 下達 {want}"))
         except Exception:
             log.exception("失聯處置送出失敗")
 
@@ -601,6 +739,16 @@ def main():
                    default=os.environ.get("LINK_ACTION", "rtl"),
                    choices=["rtl", "land", "smart_rtl", "none"],
                    help="失聯處置動作；none＝只告警不動作")
+    # ── 選項 C 的兩個上限（協定 §6）─────────────────────────────
+    # **兩個預設值都是暫定的**，要由實機續航測試定案：續航多久、返航要留多少
+    # 電量餘裕，是這台機的物理性質，不是可以在鍵盤上想出來的數字。
+    # 在有實測之前取保守值——保守的代價是任務被打斷，不保守的代價是掉機。
+    p.add_argument("--link-loss-max-solo-s", type=float,
+                   default=float(os.environ.get("LINK_LOSS_MAX_SOLO_S", 120.0)),
+                   help="失聯後任務最多再自己飛多久（暫定 120s，待實機續航測試）")
+    p.add_argument("--link-loss-min-batt", type=int,
+                   default=int(os.environ.get("LINK_LOSS_MIN_BATT_PCT", 40)),
+                   help="失聯續飛的電量下限，低於就立刻 RTL（暫定 40%%，待實測）")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",
@@ -611,9 +759,11 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s")
     log.info("uav-agent 啟動：%s@%d → %s", a.dev, a.baud, a.gs)
-    log.info("地面失聯處置：%.0fs 告警／%.0fs 執行 %s（僅在 armed 時；"
-             "已在 RTL/LAND 則不介入）",
-             a.link_warn_s, a.link_action_s, a.link_action.upper())
+    log.info("地面失聯處置（選項 C／逐狀態）：%.0fs 告警／%.0fs 起算；"
+             "任務中續飛（上限 %.0fs 或電量 %d%%）、暫停中立刻 %s、"
+             "已在 RTL/LAND 或飛手手上則不介入",
+             a.link_warn_s, a.link_action_s, a.link_loss_max_solo_s,
+             a.link_loss_min_batt, a.link_action.upper())
     log.info("訊號採樣：%s", a.modem_port or "停用")
     Agent(a).run()
 
