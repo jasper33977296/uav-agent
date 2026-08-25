@@ -34,10 +34,13 @@ _ALLOW: dict[str, set[str]] = {
     # 飛控自己的 failsafe 正在跑。允許把它往「停下來」的方向推，
     # 但不准開始新的任務——那會跟 failsafe 搶飛機
     "EMERGENCY": {"rtl", "land", "abort"},
-    # 地面：可以開始任務，不能對著一台沒在飛的機下飛行中指令
-    "NOT_READY": {"start_mission", "abort"},
-    "READY": {"start_mission", "abort"},
-    "ARMED_GROUND": {"start_mission", "abort"},
+    # 地面：可以開始任務，不能對著一台沒在飛的機下飛行中指令。
+    # **abort 也不行**——地上沒有東西可以中止，而它仍然會送出一個模式指令。
+    # 2026-08-25 實測：對著停在地上的真機打 abort，守門放行、LOITER 真的送出去了。
+    # 無害，但「無害的多餘指令」不該由守門放行——守門的工作就是只放行有意義的
+    "NOT_READY": {"start_mission"},
+    "READY": {"start_mission"},
+    "ARMED_GROUND": {"start_mission"},
     # 爬升中：可以中止，不能改航線（還沒開始飛任務，沒有東西可改）
     "TAKING_OFF": {"pause", "rtl", "land", "abort"},
     # 飛任務中：可以暫停、改航線、返航、降落
@@ -62,6 +65,10 @@ _WHY: dict[tuple[str, str], str] = {
     ("FLYING_MISSION", "resume"): "已經在飛了，不需要續飛",
     ("HOLDING", "pause"): "已經在暫停懸停中",
     ("READY", "pause"): "機還在地上，沒有東西可以暫停",
+    ("NOT_READY", "abort"): "機還在地上，沒有東西可以中止",
+    ("READY", "abort"): "機還在地上，沒有東西可以中止",
+    ("ARMED_GROUND", "abort"): "機還在地上；要停下來請上鎖（disarm），"
+                               "不是切懸停模式",
     ("READY", "rtl"): "機還在地上——返航會先爬升到返航高度，那是一次沒有人"
                       "按下的起飛",
     ("ARMED_GROUND", "rtl"): "機還在地上——返航會先爬升到返航高度，那是一次"

@@ -59,6 +59,15 @@ chk("已在返航／降落時不准再下 rtl／land 以外的東西",
 chk("飛任務中可以改航線", guard.check("FLYING_MISSION", "change_route")[0])
 chk("暫停中可以續飛", guard.check("HOLDING", "resume")[0])
 chk("暫停中不准再暫停", not guard.check("HOLDING", "pause")[0])
+# 地上 abort＝送一個沒有意義的模式指令。守門的工作是只放行有意義的
+chk("地面（NOT_READY／READY／ARMED_GROUND）不准 abort",
+    not guard.check("NOT_READY", "abort")[0]
+    and not guard.check("READY", "abort")[0]
+    and not guard.check("ARMED_GROUND", "abort")[0])
+chk("**反向驗證**：空中還是要能 abort（不是把 abort 一律關掉）",
+    guard.check("FLYING_MISSION", "abort")[0]
+    and guard.check("HOLDING", "abort")[0]
+    and guard.check("RETURNING", "abort")[0])
 
 print("\n── 白名單而不是黑名單 ─────────────────────────────────")
 allowed, why = guard.check("SOME_NEW_STATE", "rtl")
