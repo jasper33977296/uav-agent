@@ -45,7 +45,7 @@ class Fake(A.Agent):
         self.loss_started = 0.0
         self._solo_logged = True            # 靜音，測的是判定不是播報
         self.a = types.SimpleNamespace(
-            link_loss_max_solo_s=120.0, link_loss_min_batt=40)
+            link_loss_max_solo_s=30.0, link_loss_min_batt=15)
 
 
 def case(label, want_state, want_verdict, *, solo=10.0, **st):
@@ -101,18 +101,18 @@ print("\n── 空中 ───────────────────
 ok &= case("地面站按的暫停（LOITER）", "HOLDING", "RTL",
            mode="LOITER", _owner="us", **AIR)
 ok &= case("GUIDED 停在空中", "HOLDING", "RTL", mode="GUIDED", **AIR)
-ok &= case("任務進行中（上限內）", "FLYING_MISSION", "續飛觀察",
+ok &= case("任務進行中（上限內）", "FLYING_MISSION", "續飛觀察", solo=20.0,
            mode="AUTO", mission_seq=3, mission_total=9, mission_state=3,
            battery_pct=80, **AIR)
-ok &= case("任務進行中但電量 35%", "FLYING_MISSION", "RTL",
-           mode="AUTO", mission_state=3, battery_pct=35, **AIR)
-ok &= case("任務進行中但單飛超時", "FLYING_MISSION", "RTL", solo=200.0,
+ok &= case("任務進行中但電量 12%", "FLYING_MISSION", "RTL", solo=20.0,
+           mode="AUTO", mission_state=3, battery_pct=12, **AIR)
+ok &= case("任務進行中但單飛超時", "FLYING_MISSION", "RTL", solo=45.0,
            mode="AUTO", mission_state=3, battery_pct=80, **AIR)
 ok &= case("任務跑完（mission_state=5）", "HOLDING", "RTL",
            mode="AUTO", mission_state=5, battery_pct=80, **AIR)
-ok &= case("舊韌體不回報 mission_state", "FLYING_MISSION", "續飛觀察",
+ok &= case("舊韌體不回報 mission_state", "FLYING_MISSION", "續飛觀察", solo=20.0,
            mode="AUTO", mission_state=0, battery_pct=80, **AIR)
-ok &= case("電量未知不當成低電量", "FLYING_MISSION", "續飛觀察",
+ok &= case("電量未知不當成低電量", "FLYING_MISSION", "續飛觀察", solo=20.0,
            mode="AUTO", mission_state=3, battery_pct=None, **AIR)
 
 print("\n── 反向驗證：斷言真的分得出來 ──────────────────────────")

@@ -855,11 +855,11 @@ def main():
     # 電量餘裕，是這台機的物理性質，不是可以在鍵盤上想出來的數字。
     # 在有實測之前取保守值——保守的代價是任務被打斷，不保守的代價是掉機。
     p.add_argument("--link-loss-max-solo-s", type=float,
-                   default=float(os.environ.get("LINK_LOSS_MAX_SOLO_S", 120.0)),
-                   help="失聯後任務最多再自己飛多久（暫定 120s，待實機續航測試）")
+                   default=float(os.environ.get("LINK_LOSS_MAX_SOLO_S", 30.0)),
+                   help="失聯後任務最多再自己飛多久（使用者定案 2026-08-25：30s）")
     p.add_argument("--link-loss-min-batt", type=int,
-                   default=int(os.environ.get("LINK_LOSS_MIN_BATT_PCT", 40)),
-                   help="失聯續飛的電量下限，低於就立刻 RTL（暫定 40%%，待實測）")
+                   default=int(os.environ.get("LINK_LOSS_MIN_BATT_PCT", 15)),
+                   help="失聯續飛的電量下限，低於就立刻 RTL（使用者定案：15%%）")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",
@@ -870,6 +870,17 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s")
     log.info("uav-agent 啟動：%s@%d → %s", a.dev, a.baud, a.gs)
+    # **這兩個值撞在一起的話，選項 C 會退化成 A**：處置要等 link_action_s 才
+    # 開始評估，而單飛時間是從失聯那一刻起算——兩者相等時，第一次評估當下
+    # 單飛時間就已經到上限，「任務中續飛」那條分支永遠走不到。
+    # 不擅自改使用者給的數字，但一定要說出來：安靜地退化成另一種策略，
+    # 比策略本身選錯更難發現
+    if a.link_loss_max_solo_s <= a.link_action_s:
+        log.warning(
+            "⚠ 單飛上限 %.0fs ≤ 處置起算 %.0fs → **選項 C 會退化成「一律 %s」**："
+            "第一次評估時單飛時間就已達上限，任務中續飛那條分支走不到。"
+            "要讓續飛真的發生，把 LINK_ACTION_S 調小或把 LINK_LOSS_MAX_SOLO_S 調大",
+            a.link_loss_max_solo_s, a.link_action_s, a.link_action.upper())
     log.info("地面失聯處置（選項 C／逐狀態）：%.0fs 告警／%.0fs 起算；"
              "任務中續飛（上限 %.0fs 或電量 %d%%）、暫停中立刻 %s、"
              "已在 RTL/LAND 或飛手手上則不介入",
