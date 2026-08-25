@@ -29,6 +29,16 @@ log = logging.getLogger("uav-agent.intent")
 PROTOCOL_V = 1
 #: 狀態沒變化時的保活間隔（協定 §4.2：變化時立即送、另 1 Hz 保活）
 KEEPALIVE_S = 1.0
+#: 多久沒**收到地面站任何一則訊息**就當這條連線死了，主動斷開重連（協定 §2）。
+#:
+#: **為什麼需要這個，而不是等 TCP 自己發現**：5G 路由掉的時候，UDP 立刻回
+#: ENETUNREACH，但 TCP 的 send() 只是把資料塞進 kernel buffer 就回傳成功——
+#: 要等重傳逾時（幾十秒）才會爆。2026-08-25 實測到這個現象：代理的 sent
+#: 從 59 一路數到 79（自認 1Hz 正常），而地面站那頭 30 秒沒收到任何 state。
+#:
+#: 10 秒的取法：實測 RTT 30–180ms，正常抖動遠低於此；而 TCP 自己放棄要幾十秒
+#: 到兩分鐘。夾在中間＝真的斷了幾秒內就發現，正常的塞車不會被誤殺。
+SILENCE_S = 10.0
 
 
 def _now_iso():
@@ -44,11 +54,12 @@ class IntentLink(threading.Thread):
     這條通道要的是「現在是什麼狀態」，不是狀態的歷史。
     """
 
-    def __init__(self, url, hello, interval=KEEPALIVE_S):
+    def __init__(self, url, hello, interval=KEEPALIVE_S, silence=SILENCE_S):
         super().__init__(daemon=True)
         self.url = url
         self.hello = hello
         self.interval = interval
+        self.silence = silence
         self._snapshot = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -56,6 +67,7 @@ class IntentLink(threading.Thread):
         self.sent = 0
         self.rejected = 0
         self.drops = 0                # 連上之後又斷掉的次數（＝鏈路品質指標）
+        self.silent_drops = 0         # 其中「對面不回話」被我方主動掐掉的次數
         self._backoff = 1.0
 
     def publish(self, snapshot: dict) -> None:
@@ -69,7 +81,8 @@ class IntentLink(threading.Thread):
         """給代理的定期狀態列。**通道健康度要跟其他數字放在一起**——
         分開放就要兩邊對時間戳才看得出「那次遙測掉包時意圖通道在不在」。"""
         return {"up": self.connected, "sent": self.sent,
-                "drops": self.drops, "rejected": self.rejected}
+                "drops": self.drops, "silent": self.silent_drops,
+                "rejected": self.rejected}
 
     # ── 執行緒本體 ─────────────────────────────────────────────
     def run(self):
@@ -102,16 +115,26 @@ class IntentLink(threading.Thread):
             log.info("意圖通道已連上 %s", self.url)
             last_sent = 0.0
             last_state = None
+            last_rx = time.time()
             while not self._stop.is_set():
                 # 先收：地面站可能回 error（協定版本不合、型別未支援）。
                 # **不能只顧著送**——被拒絕卻沒讀到，就會一路送到天荒地老
                 try:
                     self._on_message(ws.recv())
+                    last_rx = time.time()
                 except websocket.WebSocketTimeoutException:
                     pass
                 with self._lock:
                     snap = self._snapshot
                 now = time.time()
+                # 靜默逾時：**送得出去不代表送得到**（見 SILENCE_S 的說明）。
+                # 對面每則 state 都會回 ack，所以「一直沒人回話」＝這條連線已經
+                # 沒有用了，主動掐掉重來比等 TCP 自己發現快幾十秒
+                if now - last_rx > self.silence:
+                    self.silent_drops += 1
+                    raise TimeoutError(
+                        f"地面站 {self.silence:.0f} 秒沒回話（送出 {self.sent} 則）"
+                        "——TCP 還沒斷但這條連線已經沒用了")
                 if snap is not None and (snap.get("state") != last_state
                                          or now - last_sent >= self.interval):
                     self._send(ws, dict(snap, type="state"))
