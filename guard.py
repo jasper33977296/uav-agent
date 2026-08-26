@@ -20,7 +20,7 @@
 #: 代理自己執行（只需要模式指令）
 AGENT_ACTIONS = {"rtl", "land", "abort"}
 #: 地面站執行（需要完整的任務方言），代理只守門
-GROUND_ACTIONS = {"pause", "resume", "change_route", "start_mission"}
+GROUND_ACTIONS = {"pause", "resume", "change_route", "start_mission", "disarm"}
 ACTIONS = AGENT_ACTIONS | GROUND_ACTIONS
 
 #: 每個狀態允許哪些意圖。**沒列到的一律拒絕**——白名單而不是黑名單：
@@ -40,7 +40,10 @@ _ALLOW: dict[str, set[str]] = {
     # 無害，但「無害的多餘指令」不該由守門放行——守門的工作就是只放行有意義的
     "NOT_READY": {"start_mission"},
     "READY": {"start_mission"},
-    "ARMED_GROUND": {"start_mission"},
+    # **上鎖只在地上允許。** 空中上鎖＝馬達停轉、飛機直接掉下來，那不是
+    # 「停止」而是墜毀。真的需要緊急停止時用遙控器——那是本系統設計裡
+    # 人接管的那一層，而且它不經過我們
+    "ARMED_GROUND": {"start_mission", "disarm"},
     # 爬升中：可以中止，不能改航線（還沒開始飛任務，沒有東西可改）
     "TAKING_OFF": {"pause", "rtl", "land", "abort"},
     # 飛任務中：可以暫停、改航線、返航、降落
@@ -73,6 +76,12 @@ _WHY: dict[tuple[str, str], str] = {
                       "按下的起飛",
     ("ARMED_GROUND", "rtl"): "機還在地上——返航會先爬升到返航高度，那是一次"
                              "沒有人按下的起飛",
+    ("FLYING_MISSION", "disarm"): "**空中上鎖＝馬達停轉、飛機直接掉下來**。"
+                                  "要讓它停下來請用 abort（原地懸停）或 rtl；"
+                                  "真的要緊急切斷動力，用遙控器",
+    ("HOLDING", "disarm"): "**空中上鎖＝馬達停轉、飛機直接掉下來**。"
+                           "要降落請用 land",
+    ("TAKING_OFF", "disarm"): "**爬升中上鎖＝飛機直接掉下來**",
     ("RETURNING", "*"): "已經在返航了。要停下來請用 abort（改成原地懸停）",
     ("LANDING", "*"): "已經在降落了。要停下來請用 abort（改成原地懸停）",
 }

@@ -18,7 +18,7 @@ STATES = ["DISCONNECTED", "NOT_READY", "READY", "ARMED_GROUND", "TAKING_OFF",
           "FLYING_MISSION", "HOLDING", "RETURNING", "LANDING",
           "PILOT_CONTROL", "EMERGENCY"]
 ACTIONS = ["start_mission", "pause", "resume", "change_route",
-           "rtl", "land", "abort"]
+           "rtl", "land", "abort", "disarm"]
 
 ok = True
 
@@ -64,6 +64,13 @@ chk("地面（NOT_READY／READY／ARMED_GROUND）不准 abort",
     not guard.check("NOT_READY", "abort")[0]
     and not guard.check("READY", "abort")[0]
     and not guard.check("ARMED_GROUND", "abort")[0])
+# **空中上鎖＝馬達停轉、飛機直接掉下來。** 這不是「停止」，是墜毀
+chk("空中一律不准 disarm",
+    not any(guard.check(st, "disarm")[0]
+            for st in ("FLYING_MISSION", "HOLDING", "TAKING_OFF",
+                       "RETURNING", "LANDING", "PILOT_CONTROL", "EMERGENCY")))
+chk("**反向驗證**：地上 armed 時要能 disarm（不是把 disarm 一律關掉）",
+    guard.check("ARMED_GROUND", "disarm")[0])
 chk("**反向驗證**：空中還是要能 abort（不是把 abort 一律關掉）",
     guard.check("FLYING_MISSION", "abort")[0]
     and guard.check("HOLDING", "abort")[0]
@@ -93,7 +100,8 @@ chk("代理執行的只有 rtl／land／abort",
     guard.AGENT_ACTIONS == {"rtl", "land", "abort"}, sorted(guard.AGENT_ACTIONS))
 chk("需要任務方言的都留給地面站",
     all(guard.executor(a) == "ground"
-        for a in ("pause", "resume", "change_route", "start_mission")))
+        for a in ("pause", "resume", "change_route", "start_mission",
+                  "disarm")))
 chk("但守門一律先過代理",
     all(guard.check("FLYING_MISSION", a)[0] is not None for a in ACTIONS))
 
