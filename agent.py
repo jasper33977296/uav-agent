@@ -53,6 +53,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import guard
 import route
+from backfill import Backfill
 from intent import IntentLink
 from modem import ModemSampler
 
@@ -249,6 +250,7 @@ class Agent:
         self.hello_sent = False
         self.drone_id = None
         self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
+        self.backfill = None          # 斷線期間的取樣緩衝（C 層）
         #: intent_id → 送出去給人看的提案。**留在機上**：確認的時候不必讓
         #: 地面站把提案送回來，也就沒有「送回來的那份跟人看到的不一樣」的空間
         self.proposals = {}
@@ -369,6 +371,14 @@ class Agent:
                 self.a.modem_port, self.a.gs, self.a.backend_port,
                 self._position, self.a.modem_interval)
             self.modem.start()
+        # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
+        # 鏈路恢復後補傳（uav-system 的 C 層）
+        self.backfill = Backfill(
+            self.a.gs, self.a.backend_port,
+            lambda: self.mon.state.get("board_uid"),
+            lambda: self.mon.state,
+            lambda: bool(self.gs_link_ok))
+        self.backfill.start()
         fd = self.serial.port.fileno()
         log.info("轉發目標：%s:%d（遙測）／%s:%d（指令）",
                  self.a.gs, self.a.telemetry_port, self.a.gs, self.a.command_port)
@@ -1018,6 +1028,7 @@ class Agent:
             "gs_link_ok": self.gs_link_ok,
             "state": self.flight_state(),
             "intent": self.intent.stats() if self.intent else None,
+            "backfill": self.backfill.stats() if self.backfill else None,
             "modem": self.modem.stats() if self.modem else None,
         }
         log.info("狀態 %s", json.dumps(line, ensure_ascii=False))
