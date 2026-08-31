@@ -173,10 +173,10 @@ chk("被丟掉不影響緩衝彈出（那批確實送出去了）", len(g3.buf) 
 print("\n── 整批被判定不合理：放棄，不要無限重試 ────────────────")
 # 地面站對「整批時間戳都不合理」回 400。留著它就是每 0.2 秒重送一批永遠
 # 不會被接受的資料，一路佔著即時遙測在走的那條 5G 上行
-class Http400(urllib.error.HTTPError):
-    def __init__(self, payload):
+class HttpErr(urllib.error.HTTPError):
+    def __init__(self, code, payload):
         self._payload = json.dumps(payload).encode()
-        super().__init__("http://x", 400, "Bad Request", {}, None)
+        super().__init__("http://x", code, "err", {}, None)
 
     def read(self, *a):
         return self._payload
@@ -188,11 +188,26 @@ b4 = time.monotonic()
 for i in range(3):
     g4._sample(b4 + i)
 LINK["ok"] = True
-g4.fail_next = Http400({"detail": {"code": "implausible_timestamps"}})
+# **狀態碼是 422 不是 400**（uav-system api.py:323）。第一版寫了
+# `if e.code != 400` 就把整個判定關掉了——狀態碼是對方可以換的實作細節，
+# `code` 才是雙方講好的契約
+g4.fail_next = HttpErr(422, {"detail": {"code": "implausible_timestamps"}})
 g4._flush()
-chk("整批不合理 → 丟掉，不留著重試", len(g4.buf) == 0 and g4.dropped == 3,
+chk("整批不合理（422）→ 丟掉，不留著重試",
+    len(g4.buf) == 0 and g4.dropped == 3,
     f"buf={len(g4.buf)} dropped={g4.dropped}")
 chk("放棄不算成功（sent 不動）", g4.sent == 0, g4.sent)
+# 認的是 code 不是狀態碼：對方哪天改回 400 也要一樣認得
+g4b = Fake()
+LINK["ok"] = False
+b4b = time.monotonic()
+for i in range(2):
+    g4b._sample(b4b + i)
+LINK["ok"] = True
+g4b.fail_next = HttpErr(400, {"detail": {"code": "implausible_timestamps"}})
+g4b._flush()
+chk("同一個 code 換成 400 也要認得（不綁狀態碼）",
+    len(g4b.buf) == 0 and g4b.dropped == 2, f"dropped={g4b.dropped}")
 
 # **反向驗證**：其他 4xx 是暫時性的，資料不能丟——猜錯的方向要選對，
 # 把暫時的當永久＝丟掉本來補得回來的資料，那不可逆
@@ -202,9 +217,9 @@ b5 = time.monotonic()
 for i in range(3):
     g5._sample(b5 + i)
 LINK["ok"] = True
-g5.fail_next = Http400({"detail": "資料庫忙碼中"})
+g5.fail_next = HttpErr(422, {"detail": "欄位驗證失敗"})
 g5._flush()
-chk("**反向驗證**：沒有那個 code 的 400 仍然留著重試",
+chk("**反向驗證**：沒有那個 code 的 422 仍然留著重試",
     len(g5.buf) == 3 and g5.dropped == 0 and g5.failed == 1,
     f"buf={len(g5.buf)} dropped={g5.dropped} failed={g5.failed}")
 g5.fail_next = urllib.error.HTTPError("http://x", 503, "busy", {}, None)

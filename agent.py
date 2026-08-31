@@ -32,9 +32,23 @@
   MANUAL_CONTROL／RC_CHANNELS_OVERRIDE」已隨之移除——沒有來源，就沒有轉譯。
 
   但那件事留下的前提仍然成立且**更重要**：飛控的 GCS failsafe
-  （`FS_GCS_ENABLE`）盯的是 `SYSID_MYGCS` 的心跳，也就是**本代理**——代理在
-  機上，5G 斷了它照樣心跳，所以飛控不會因為地面失聯而觸發 failsafe。
-  這條防線因此完全落在代理身上，見 `_check_gs_link`。
+  （`FS_GCS_ENABLE`）盯的是 `SYSID_MYGCS` 的心跳，而 5G 斷掉時飛控看不出
+  地面沒人了——它只看得到序列埠這一側。這條防線因此完全落在代理身上，
+  見 `_check_gs_link`。
+
+  > **這段原本寫的是「代理在機上，5G 斷了它照樣心跳」，那句話不成立**
+  > （2026-08-31 查證）：本代理**從來沒有呼叫過 `heartbeat_send`**，只收
+  > 飛控的心跳、不對它送。所以沒有任何 sysid 255 的心跳存在。
+  >
+  > **這不影響代理這一層的正確性**（`_check_gs_link` 本來就自己判、不依賴
+  > 飛控），但它讓「飛控此刻到底處於什麼 failsafe 狀態」變成一件我們其實
+  > 不知道的事：若 `FS_GCS_ENABLE` 是開的而沒有任何 GCS 心跳，飛控可能
+  > **一直**處在 GCS failsafe；若是關的，就沒事。
+  >
+  > **待真機覆核**：讀 `FS_GCS_ENABLE`、`SYSID_MYGCS` 的實際值，並看飛控有
+  > 沒有回報 GCS failsafe。在覆核之前不要在程式裡假設任何一邊——尤其不要
+  > 「順手補一個 heartbeat_send」：那會改變飛控的 failsafe 行為，而那是
+  > 飛安決策，不是清理工作。
 """
 import argparse
 import json
@@ -302,7 +316,13 @@ class Agent:
         self.last_telem_rx = 0.0
         self.last_report = 0.0
         self.fwd_to_fc = 0
-        # 地面站方向的解析器：要認出搖桿封包才能改寫身分。
+        # 地面站方向的解析器。**它當初存在的理由（認出搖桿封包好改寫身分）
+        # 已經隨 issues/035 消失，但這段程式沒有跟著死**——它現在做兩件仍然
+        # 需要的事：① 解析＝驗 CRC，擋掉壞封包不讓它進飛控的解析器；
+        # ② `_note_mode_request()` 的模式溯源，也就是「這個 LOITER 是地面站
+        # 按的暫停還是飛手切的手飛」——失聯處置選項 C 最關鍵的一格靠它。
+        # 清死碼時要分「為什麼存在」與「做了什麼」：照理由刪會刪掉還在保護
+        # 東西的檢查。
         # robust_parsing＝壞封包不拋例外，只跳過（這條迴圈不准死）。
         self.gs_parser = apm.MAVLink(None)
         self.gs_parser.robust_parsing = True

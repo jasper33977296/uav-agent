@@ -23,7 +23,7 @@
 
 | 自駕儀 | 狀態 | 說明 |
 |---|---|---|
-| **ArduPilot / ArduCopter** | ✅ **實測** | 四旋翼，`MAV_AUTOPILOT_ARDUPILOTMEGA`，MAVLink 2，UART 57600。遙測、指令、ACK、手動控制重送、失聯處置全部驗證過 |
+| **ArduPilot / ArduCopter** | ✅ **實測** | 四旋翼，`MAV_AUTOPILOT_ARDUPILOTMEGA`，MAVLink 2，UART 57600。遙測、指令、ACK、失聯處置全部驗證過 |
 | ArduPilot / Plane・Rover | ⚠️ 未測 | 遙測與轉發應該可用；**失聯處置的模式號是 Copter 的**，見下方警告 |
 | PX4 | ❌ **不可直接用** | 轉發與遙測會動，但**安全路徑會靜默做錯事**，見下方警告 |
 | 其他 MAVLink 2 自駕儀 | ⚠️ 未測 | 純轉發與遙測不綁方言；模式相關功能一律要重做 |
@@ -188,7 +188,14 @@ pymavlink 自己的 `_instances is None` → `TypeError`，每次吃掉一次讀
 traceback。改成自己 `parse_buffer()`，CRC 一樣有驗，少一層不需要的狀態。
 
 **為什麼轉發原始位元組。** `msg.get_msgbuf()` 原封轉出，不重新編碼——重編會換掉
-seq 與簽章，也可能因方言表版本差異而丟欄位。唯一的例外是手動控制，見上。
+seq 與簽章，也可能因方言表版本差異而丟欄位。**現在沒有例外**：先前為了繞過
+ArduPilot 的 `SYSID_MYGCS` 檢查而以代理身分重新編碼搖桿封包的那條路，已隨地面站
+移除虛擬搖桿一併刪掉（`7eb5f4b`，uav-system issues/035）。
+
+> **但 `SYSID_MYGCS` 這個參數本身仍然要緊。** ArduPilot 用它決定誰的心跳算 GCS
+> 心跳，也就是 `FS_GCS` 的判準——而那個身分是本代理、就在機上。5G 斷掉時代理
+> 照樣心跳，飛控完全無感，所以地面失聯這條防線才必須落在代理身上（見上方
+> 「安全模型」）。刪掉重送那條路不影響它。
 
 **為什麼串流要保活而不是設定一次。** ArduPilot 預設不推遙測；序列埠沒有 GCS
 連過時串流速率是 0（實測：不請求就只有 1Hz HEARTBEAT 與 TIMESYNC）。而且飛控
