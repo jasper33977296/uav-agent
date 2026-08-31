@@ -169,6 +169,8 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/rc-link.py` | RC 三態解析；`--live` 可接真飛控做覆核 |
 | `tools/intent-ack.py` | 意圖回執的順序：先 ack 再 event |
 | `tools/decision-flow.py` | 提案→確認→序列、乾跑、RC 前置 |
+| `tools/backfill-flow.py` | 緩衝與補傳的邏輯（HTTP 用假的） |
+| `tools/backfill-live.py` | 補傳端到端：真代理 → 跑著的地面站 → 真入庫 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |

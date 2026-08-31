@@ -13,6 +13,7 @@
 """
 import json
 import sys
+import urllib.error
 import time
 from pathlib import Path
 
@@ -42,12 +43,22 @@ class Fake(B.Backfill):
     def __init__(self):
         super().__init__("x", 1, lambda: "board-1", lambda: STATE,
                          lambda: LINK["ok"])
-        self.fail_next = False
+        self.fail_next = None           # 放一個例外進去＝下次 _post 拋它
+        self.reject_n = 0               # 地面站宣稱丟掉幾筆
 
     def _post(self, body):
         if self.fail_next:
-            raise OSError("模擬送失敗")     # 資料要留在緩衝裡
-        POSTED.extend(json.loads(body)["samples"])
+            raise self.fail_next            # 資料要留在緩衝裡
+        samples = json.loads(body)["samples"]
+        POSTED.extend(samples)
+        # 地面站的真實回話形狀（api.py 的 telemetry_backfill）
+        return {"ok": True, "inserted": len(samples) - self.reject_n,
+                "skipped_duplicate": 0,
+                "rejected_implausible": self.reject_n}
+
+    def retry_now(self):
+        """跳過失敗退避——測的是重送這件事，不是等 2 秒這件事。"""
+        self._next_try = 0.0
 
 
 g = Fake()
@@ -93,11 +104,14 @@ g.buf.clear(); POSTED.clear()
 for i in range(5):
     g._sample(t0 + 200 + i)
 LINK["ok"] = True
-g.fail_next = True
+g.fail_next = OSError("模擬送失敗")
 g._flush()
 chk("送失敗 → 資料留在緩衝裡（不能當成送掉了）",
     len(g.buf) == 5 and g.failed == 1, (len(g.buf), g.failed))
-g.fail_next = False
+chk("失敗後有退避（不是每 0.2 秒對著 5G 上行猛打）",
+    g._next_try > time.monotonic(), f"還要等 {g._next_try - time.monotonic():.1f}s")
+g.fail_next = None
+g.retry_now()
 g._flush()
 chk("重送成功 → 緩衝清空", len(g.buf) == 0 and len(POSTED) == 5,
     (len(g.buf), len(POSTED)))
@@ -139,6 +153,64 @@ chk("跳躍沒有寫進資料：批次內仍然單調且間隔 1 秒",
     all(abs((POSTED[i + 1]["t"] - POSTED[i]["t"]) - 1.0) < 0.01
         for i in range(len(POSTED) - 1)),
     [round(r["t"], 2) for r in POSTED])
+
+print("\n── 地面站丟掉樣本時，機端要自己看得到 ─────────────────")
+# 200 不代表資料被收下：地面站會過濾時間戳不合理的樣本。不讀回話的話
+# 「已補傳 N 筆」就是一句謊話，而唯一的證據在別人的 log 裡
+g3 = Fake()
+LINK["ok"] = False
+b3 = time.monotonic()
+for i in range(4):
+    g3._sample(b3 + i)
+LINK["ok"] = True
+g3.reject_n = 2
+POSTED.clear()
+g3._flush()
+chk("地面站丟掉的筆數計進 stats（不是只有對方看得到）",
+    g3.stats()["rejected"] == 2, g3.stats())
+chk("被丟掉不影響緩衝彈出（那批確實送出去了）", len(g3.buf) == 0)
+
+print("\n── 整批被判定不合理：放棄，不要無限重試 ────────────────")
+# 地面站對「整批時間戳都不合理」回 400。留著它就是每 0.2 秒重送一批永遠
+# 不會被接受的資料，一路佔著即時遙測在走的那條 5G 上行
+class Http400(urllib.error.HTTPError):
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+        super().__init__("http://x", 400, "Bad Request", {}, None)
+
+    def read(self, *a):
+        return self._payload
+
+
+g4 = Fake()
+LINK["ok"] = False
+b4 = time.monotonic()
+for i in range(3):
+    g4._sample(b4 + i)
+LINK["ok"] = True
+g4.fail_next = Http400({"detail": {"code": "implausible_timestamps"}})
+g4._flush()
+chk("整批不合理 → 丟掉，不留著重試", len(g4.buf) == 0 and g4.dropped == 3,
+    f"buf={len(g4.buf)} dropped={g4.dropped}")
+chk("放棄不算成功（sent 不動）", g4.sent == 0, g4.sent)
+
+# **反向驗證**：其他 4xx 是暫時性的，資料不能丟——猜錯的方向要選對，
+# 把暫時的當永久＝丟掉本來補得回來的資料，那不可逆
+g5 = Fake()
+LINK["ok"] = False
+b5 = time.monotonic()
+for i in range(3):
+    g5._sample(b5 + i)
+LINK["ok"] = True
+g5.fail_next = Http400({"detail": "資料庫忙碼中"})
+g5._flush()
+chk("**反向驗證**：沒有那個 code 的 400 仍然留著重試",
+    len(g5.buf) == 3 and g5.dropped == 0 and g5.failed == 1,
+    f"buf={len(g5.buf)} dropped={g5.dropped} failed={g5.failed}")
+g5.fail_next = urllib.error.HTTPError("http://x", 503, "busy", {}, None)
+g5.retry_now()
+g5._flush()
+chk("**反向驗證**：503 也留著重試", len(g5.buf) == 3 and g5.dropped == 0)
 
 print("\n── 節流用單調時鐘：牆鐘往回跳不會讓取樣停擺 ───────────")
 # 舊寫法 `now - _last_sample >= SAMPLE_S` 用牆鐘：往回校正 Δ 秒的話取樣會

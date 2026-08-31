@@ -72,13 +72,19 @@ class Backfill(threading.Thread):
         self.stayed_armed = None
         self._last_sample = 0.0       # 單調時鐘刻度（見 run()）
         self._clock_warned = False
+        #: 地面站收下了、但判定時間戳不合理而丟掉的筆數。**機端要自己看得到**
+        #: ——不然「已補傳 N 筆」會是一句謊話，而唯一的痕跡在別人的 log 裡
+        self.rejected = 0
+        self.dropped = 0              # 我方主動放棄的（送了也不會被接受）
+        self._next_try = 0.0          # 單調刻度：失敗後不要每 0.2 秒重試
 
     def stop(self):
         self._stop.set()
 
     def stats(self) -> dict:
         return {"buffered": len(self.buf), "sampled": self.sampled,
-                "sent": self.sent, "failed": self.failed}
+                "sent": self.sent, "failed": self.failed,
+                "rejected": self.rejected, "dropped": self.dropped}
 
     # ── 取樣 ───────────────────────────────────────────────────
     def _sample(self, mono: float) -> None:
@@ -131,16 +137,29 @@ class Backfill(threading.Thread):
             out.append(row)
         return out
 
-    def _post(self, body: bytes) -> None:
-        """真的送出去。抽成一個方法是為了讓測試擋得住 HTTP 而**不必蓋掉
-        `_flush`**——蓋掉的話批次換算與緩衝彈出這兩段就一格都測不到。"""
+    def _post(self, body: bytes) -> dict:
+        """真的送出去，並**把回話讀回來**。
+
+        抽成一個方法是為了讓測試擋得住 HTTP 而**不必蓋掉 `_flush`**——蓋掉的
+        話批次換算與緩衝彈出這兩段就一格都測不到。
+
+        回話要讀是因為 200 不代表資料被收下：地面站會過濾時間戳不合理的樣本
+        （`rejected_implausible`），而那正是機上時鐘出事的唯一徵兆。不讀的話
+        「已補傳 N 筆」就是一句謊話，證據還只在別人的 log 裡。
+        """
         req = urllib.request.Request(
             self.url, data=body, method="POST",
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            r.read()
+            raw = r.read()
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            return {}
 
     def _flush(self) -> None:
+        if time.monotonic() < self._next_try:
+            return                    # 上次失敗後的退避（見 `_fail`）
         # **時鐘還沒同步就先不送。** 5G 剛通到 timesyncd 真的把時間 step 過去
         # 之間有幾秒空窗，那幾秒送出去的換算基準仍然是 1970。資料留在環形裡
         # 等下一輪——環形有上限，等不到也只是丟最舊的，不會無限長大
@@ -161,17 +180,65 @@ class Backfill(threading.Thread):
                            "samples": batch,
                            "stayed_armed": self.stayed_armed}).encode()
         try:
-            self._post(body)
+            res = self._post(body)
+        except urllib.error.HTTPError as e:
+            if self._unacceptable(e):
+                # **整批的時間戳都被判定不合理＝再送幾次也一樣。** 留著它就是
+                # 每 0.2 秒重送一批永遠不會被接受的資料，一路佔著 5G 上行，
+                # 而那條線正是即時遙測在走的。丟掉並大聲說，不要靜靜地重試
+                self._drop(len(batch))
+                return
+            return self._fail(e)
         except Exception as e:
-            self.failed += 1
-            log.warning("補傳失敗（%s），保留在緩衝裡下次再送", e)
-            return
+            return self._fail(e)
         with self._lock:
             for _ in range(len(batch)):
                 if self.buf:
                     self.buf.popleft()
         self.sent += len(batch)
-        log.info("已補傳 %d 筆（緩衝剩 %d）", len(batch), len(self.buf))
+        rej = res.get("rejected_implausible") or 0
+        if rej:
+            self.rejected += rej
+            log.warning("地面站丟掉 %d/%d 筆時間戳不合理的樣本——**機上時鐘"
+                        "可能還沒與 NTP 同步**，那段缺口沒有真的補回來",
+                        rej, len(batch))
+        log.info("已補傳 %d 筆（入庫 %s、重複 %s、丟棄 %s；緩衝剩 %d）",
+                 len(batch), res.get("inserted", "?"),
+                 res.get("skipped_duplicate", "?"), rej, len(self.buf))
+
+    @staticmethod
+    def _unacceptable(e) -> bool:
+        """這個 HTTP 錯誤是「再送幾次也一樣」嗎？
+
+        只認地面站明講的那一種（整批時間戳不合理）。**其他 4xx 一律當成暫時
+        性**——猜錯的方向要選對：把暫時的當永久＝丟掉本來補得回來的資料，
+        把永久的當暫時＝多重試幾次。前者不可逆，後者只是吵。
+        """
+        if e.code != 400:
+            return False
+        try:
+            detail = json.loads(e.read() or b"{}").get("detail") or {}
+        except ValueError:
+            return False
+        return isinstance(detail, dict) and \
+            detail.get("code") == "implausible_timestamps"
+
+    def _drop(self, n: int) -> None:
+        with self._lock:
+            for _ in range(n):
+                if self.buf:
+                    self.buf.popleft()
+        self.dropped += n
+        log.error("⚠ 放棄 %d 筆補傳：地面站判定整批時間戳都不合理，重送也一樣。"
+                  "**這段缺口補不回來了**——檢查機上時鐘（這台 Pi 的 RTC "
+                  "沒有電池，開機時間從 1970 起算）", n)
+
+    def _fail(self, e) -> None:
+        self.failed += 1
+        # 失敗後退開 2 秒再試。原本每 0.2 秒重送一次，地面站不通的時候
+        # 那是一個對著 5G 上行猛打的迴圈，而即時遙測正在走同一條線
+        self._next_try = time.monotonic() + 2.0
+        log.warning("補傳失敗（%s），保留在緩衝裡 2 秒後再送", e)
 
     def run(self):
         while not self._stop.wait(0.2):
