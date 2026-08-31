@@ -97,7 +97,9 @@ backend 需設 `LINK_SOURCE=modem` 才會收 `/api/link-metrics/*`。
 
 ### 處置行為
 
-預設 `LINK_WARN_S=5` 告警、`LINK_ACTION_S=30` 執行 `LINK_ACTION=rtl`。節制之處：
+預設 `LINK_WARN_S=5` 告警、`LINK_ACTION_S=10` 起算，執行 `LINK_ACTION=rtl`。
+處置**逐狀態決定**（選項 C，協定 §6）：飛任務中跑完再 RTL，暫停中／爬升中／
+改航線序列進行中立刻 RTL，已在返航或飛手手上則不介入。節制之處：
 
 * **只在 armed 時動作**。地面整合測試時鏈路斷來斷去是常態，板凳上絕不送指令。
 * **已在 RTL/LAND/SMART_RTL 就不介入**——飛機已經在自己回家了。
@@ -106,6 +108,36 @@ backend 需設 `LINK_SOURCE=modem` 才會收 `/api/link-metrics/*`。
 * 保命指令送三次（57600 上單包丟失是真實風險，`DO_SET_MODE` 冪等無副作用）。
 
 `LINK_ACTION=none` 可停用自動處置，只保留告警。
+
+**續飛的兩個上限**（`LINK_LOSS_MAX_SOLO_S=30`、`LINK_LOSS_MIN_BATT_PCT=15`），
+任一命中就立刻 RTL 而不是跑完。單飛時間從失聯那一刻起算，所以與
+`LINK_ACTION_S=10` 相減，**續飛實際只有 20 秒可用**——這是已知並接受的
+（2026-08-31 複裁 B），啟動時會印一行說明兩者的關係。
+
+* **讀不到電量＝不准續飛**（複裁 E）。`battery_pct` 是 `None` 時立刻 RTL，
+  不是跳過檢查——這條規則存在的前提就是知道還剩多少電。
+* **「跑完」以 `mission_state` 為準**。韌體不回報時另有 seq 替代判定
+  （`MISSION_COMPLETE_BY_SEQ=1`），**預設關**：`total` 含不含 home、最後一個
+  航點的 seq 停在哪是廠牌與版本的行為，猜錯會在任務還沒飛完時打斷它。
+  真機覆核 ArduPilot 4.7 之後才開。
+
+### RC 未連線不得起飛（複裁 A，2026-08-31）
+
+上面那條「機在地上失聯只告警不 RTL」的**整個理由**是「遙控器就在旁邊待命，
+人處理比飛機自己起飛安全」。那是一個假設，而它從來沒有被驗證過——RC 早就掉線
+的話前提不成立，機在地上失聯就變成沒有任何人能接管。所以守門多一道橫跨狀態的
+前置條件：`rc_link` 為 `false` 時擋下 `start_mission`（地面站把單機起飛、
+群組同時起飛、arm 全部映射到這個意圖）。
+
+RC 狀態讀 `SYS_STATUS` 的 `MAV_SYS_STATUS_SENSOR_RC_RECEIVER` present／health
+兩組位元，**三態**：present 沒這一位＝這台韌體沒回報＝`None`＝**不知道，不擋**。
+把「不知道」當成「沒有 RC」會讓所有還沒驗證過的機都起飛不了。
+
+> **`RC_CHANNELS.rssi` 不能用**：它沒有「不知道」這一態，而 `rssi = 255` 在
+> MAVLink 是**無效值不是滿格**——讀成滿格的後果是 RC 掉線時守門照樣放行起飛。
+>
+> **真機覆核尚未進行**：ArduPilot 4.7 在 RC failsafe 期間是否真的清掉 health
+> 位元，要接飛控跑 `tools/rc-link.py --live /dev/ttyAMA0` 才算數。
 
 ---
 
@@ -126,8 +158,17 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | 檔案 | 用途 |
 |---|---|
 | `agent.py` | 主程式：路由、串流保活、監控、失聯處置 |
+| `guard.py` | 守門：這個意圖在當下這個狀態能不能做（含 RC 前置條件） |
+| `intent.py` | 意圖通道（WebSocket）：state 推送、intent 回執與判決 |
+| `route.py` | 改航線提案：續飛航點、過期重算 |
+| `backfill.py` | 失聯期間的機上緩衝與恢復後補傳 |
 | `modem.py` | 5G 模組 AT 採樣（獨立執行緒，不擋主迴圈） |
 | `uav-test.py` | 一次性診斷：請求串流並把飛控說得出來的東西全部攤開 |
+| `tools/link-loss-table.py` | 失聯處置的判定表（含反向驗證） |
+| `tools/guard-table.py` | 守門全表 88 格 |
+| `tools/rc-link.py` | RC 三態解析；`--live` 可接真飛控做覆核 |
+| `tools/intent-ack.py` | 意圖回執的順序：先 ack 再 event |
+| `tools/decision-flow.py` | 提案→確認→序列、乾跑、RC 前置 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |

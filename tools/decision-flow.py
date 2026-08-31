@@ -148,6 +148,48 @@ ev = g.on_intent({"intent_id": "d2", "action": "rtl",
 chk("**乾跑不會繞過守門**：地上仍然拒絕",
     ev["event"] == "guard_refused", ev.get("reason"))
 
+# **地面站執行的意圖也要吃乾跑**（039 複裁 G）。原本乾跑那道排在執行者分岔
+# 之後，所以 start_mission 走的是「回 cleared」——而 `cleared` 在地面站那端
+# 就是放行。失聯期間壓下來的意圖恢復後補送、每則都帶 dry_run，少了這道，
+# 一個人在四十秒前按下的「開始任務」會在恢復的瞬間真的執行
+g = Fake(state="READY")
+ev = g.on_intent({"intent_id": "d3", "action": "start_mission",
+                  "params": {"dry_run": True}})
+chk("**地面站執行的意圖乾跑時不回 cleared**（cleared＝放行執行）",
+    ev["event"] == "would_execute", f'{ev["event"]}｜{ev.get("reason")}')
+chk("乾跑的回話說得出沒有交出去執行",
+    "沒有" in (ev.get("reason") or ""), ev.get("reason"))
+# **反向驗證**：不是把 start_mission 一律改成不執行
+ev = g.on_intent({"intent_id": "d4", "action": "start_mission", "params": {}})
+chk("**反向驗證**：沒帶 dry_run 時照樣 cleared 交給地面站",
+    ev["event"] == "cleared" and ev["executor"] == "ground", ev.get("reason"))
+# 改航線的乾跑仍然要算提案——補送要的正是「重算提案再要人確認」
+g2 = Fake()
+ev = g2.on_intent({"intent_id": "d5", "action": "change_route",
+                   "params": {"wps": WPS, "hold_alt": 25.0, "dry_run": True}})
+chk("乾跑的 change_route 仍然算提案（算提案不動飛機）",
+    ev["event"] == "proposal", ev.get("reason"))
+
+print("\n── 複裁 A：RC 前置條件走得通整條 on_intent ────────────")
+g = Fake(state="READY")
+g.mon.state["rc_link"] = False
+ev = g.on_intent({"intent_id": "r1", "action": "start_mission", "params": {}})
+chk("RC 掉線 → 守門擋下 start_mission",
+    ev["event"] == "guard_refused" and "遙控器" in ev["reason"],
+    ev.get("reason"))
+# **補送擋得住的關鍵**：地面站的按鈕擋得住人，擋不住四十秒前壓下來的那則
+ev = g.on_intent({"intent_id": "r2", "action": "start_mission",
+                  "params": {"dry_run": True}})
+chk("RC 掉線時補送的 start_mission 也擋得下",
+    ev["event"] == "guard_refused", ev.get("event"))
+g.mon.state["rc_link"] = True
+ev = g.on_intent({"intent_id": "r3", "action": "start_mission", "params": {}})
+chk("**反向驗證**：RC 接回來就放行", ev["event"] == "cleared", ev.get("reason"))
+g.mon.state["rc_link"] = None
+ev = g.on_intent({"intent_id": "r4", "action": "start_mission", "params": {}})
+chk("**rc_link=None（韌體沒回報）不擋**", ev["event"] == "cleared",
+    ev.get("reason"))
+
 print("\n── 沒帶航點的意圖 ─────────────────────────────────────")
 g = Fake()
 ev = g.on_intent({"intent_id": "i9", "action": "change_route", "params": {}})

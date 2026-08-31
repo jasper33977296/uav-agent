@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """守門判定表（狀態機文件 §2、協定 §5.2）。**不連飛機、不送指令。**
 
-**為什麼要全表跑一次**：守門是 11 個狀態 × 7 個意圖＝77 格。讀碼讀不出哪一格
+**為什麼要全表跑一次**：守門是 11 個狀態 × 8 個意圖＝88 格。讀碼讀不出哪一格
 填錯，而填錯的兩個方向代價不對稱——該擋沒擋＝在飛手手上飛的時候被系統搶走
 控制權；不該擋卻擋了＝操作員按了沒反應，然後去找繞道。
 
@@ -75,6 +75,41 @@ chk("**反向驗證**：空中還是要能 abort（不是把 abort 一律關掉�
     guard.check("FLYING_MISSION", "abort")[0]
     and guard.check("HOLDING", "abort")[0]
     and guard.check("RETURNING", "abort")[0])
+
+print("\n── 複裁 A：RC 未連線不得起飛／開始任務 ────────────────")
+# 地面站把 takeoff／mission_fly／arm／群組 upload 全部映射到 start_mission
+# （apps/command/app/guard_client.py），所以擋住這一個意圖就同時擋住了
+# 單機起飛與群組同時起飛——裁定要的正是這兩件事
+GROUND_STATES = ["NOT_READY", "READY", "ARMED_GROUND"]
+chk("RC 掉線時地面三個狀態都不准 start_mission",
+    all(not guard.check(st, "start_mission", False)[0] for st in GROUND_STATES))
+# **三態的分界就是整條規則的地基**：None 是「這台韌體沒回報」＝不知道，
+# 把它當成「沒有 RC」會讓所有還沒升級／還沒驗證過的機都起飛不了（036 的教訓）
+chk("**rc_link=None（不知道）不擋**——不是把沒回報當成沒有 RC",
+    all(guard.check(st, "start_mission", None)[0] for st in ("READY",
+                                                            "ARMED_GROUND")))
+chk("**反向驗證**：RC 在線時照樣放行（不是把起飛一律關掉）",
+    guard.check("READY", "start_mission", True)[0]
+    and guard.check("ARMED_GROUND", "start_mission", True)[0])
+# 兩參數呼叫維持原行為：地面站的 test-intent-guard.py 就是這樣叫的
+chk("省略 rc_link 的舊呼叫不受影響",
+    guard.check("READY", "start_mission")[0])
+# RC 掉線時更需要「把飛機弄回地面」那個方向能用
+chk("RC 掉線不影響 rtl／land／abort（那是把飛機弄回地面的方向）",
+    all(guard.check("FLYING_MISSION", a, False)[0]
+        for a in ("rtl", "land", "abort")))
+chk("RC 掉線不影響 change_route／pause／resume",
+    guard.check("FLYING_MISSION", "change_route", False)[0]
+    and guard.check("FLYING_MISSION", "pause", False)[0]
+    and guard.check("HOLDING", "resume", False)[0])
+# 狀態本來就擋掉的格子，理由要維持原本那句——它比「遙控器未連線」更說得出
+# 當下該做什麼（在飛任務中的人要知道的是「用改航線」，不是遙控器）
+_, why_air = guard.check("FLYING_MISSION", "start_mission", False)
+chk("狀態本來就擋的格子，理由不被 RC 那句蓋掉", "已經在飛任務了" in why_air,
+    why_air)
+_, why_rc = guard.check("READY", "start_mission", False)
+chk("RC 拒絕的理由說得出現在能做什麼", "現在可以做" in why_rc, why_rc)
+chk("RC 拒絕的理由說得出是遙控器的問題", "遙控器" in why_rc)
 
 print("\n── 白名單而不是黑名單 ─────────────────────────────────")
 allowed, why = guard.check("SOME_NEW_STATE", "rtl")

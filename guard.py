@@ -23,6 +23,19 @@ AGENT_ACTIONS = {"rtl", "land", "abort"}
 GROUND_ACTIONS = {"pause", "resume", "change_route", "start_mission", "disarm"}
 ACTIONS = AGENT_ACTIONS | GROUND_ACTIONS
 
+#: **需要遙控器在線才放行的意圖**（039 複裁 A，2026-08-31 使用者裁定）。
+#:
+#: 為什麼是前置條件而不是查表的一格：它**橫跨狀態**。塞進 `_ALLOW` 會讓
+#: `NOT_READY`／`READY`／`ARMED_GROUND` 各分裂成「RC 有」與「RC 無」兩格，
+#: 而分裂出來的那幾格彼此只差這一個條件——表會變大一倍，錯一格卻更難看出來。
+#:
+#: 為什麼只有 `start_mission`：地面站把 `takeoff`／`mission_fly`／`arm`／群組
+#: `upload` 全部映射到這個意圖（`apps/command/app/guard_client.py`），所以擋住
+#: 它就同時擋住了單機起飛與群組同時起飛——裁定要的正是這兩件事。
+#: **rtl／land／abort 不在此列**：那些是「把飛機弄回地面」的方向，RC 掉線時
+#: 更需要它們能用。
+RC_REQUIRED = {"start_mission"}
+
 #: 每個狀態允許哪些意圖。**沒列到的一律拒絕**——白名單而不是黑名單：
 #: 新增一個狀態時，忘了補這張表的後果是「什麼都不准」，不是「什麼都准」。
 _ALLOW: dict[str, set[str]] = {
@@ -87,8 +100,23 @@ _WHY: dict[tuple[str, str], str] = {
 }
 
 
-def check(state: str, action: str) -> tuple[bool, str | None]:
-    """回傳 (可不可以, 不行的理由)。理由一定說得出「那現在能做什麼」。"""
+#: RC 前置條件的拒絕理由。**「只告警不 RTL」那格的前提就是這件事**：機在地上
+#: 失聯時之所以敢不動作，靠的是「遙控器就在旁邊、人隨時可以接管」——RC 早就
+#: 掉線的話這個前提不成立，而它從來沒有被驗證過（協定 §6）
+_RC_WHY = ("遙控器未連線——自動起飛的前提是有人能隨時接管，"
+           "而現在沒有人接得了手（039 複裁 A）"
+           "；現在可以做：確認遙控器開機並與接收機綁定，連上後再開始任務")
+
+
+def check(state: str, action: str,
+          rc_link: bool | None = None) -> tuple[bool, str | None]:
+    """回傳 (可不可以, 不行的理由)。理由一定說得出「那現在能做什麼」。
+
+    `rc_link`：遙控器連上了沒有。**三態，`None` 是「不知道」而不是「沒有」**
+    （039 複裁 A）——測不到 RC 的韌體不該因此什麼都不能做，那會讓所有還沒
+    驗證過這個欄位的機都起飛不了（issues/036 的同一個教訓）。預設 `None`
+    也讓既有的兩參數呼叫（含地面站的 `test-intent-guard.py`）維持原行為。
+    """
     if action not in ACTIONS:
         return False, f"不認得的意圖 {action}（本站支援 {sorted(ACTIONS)}）"
     allowed = _ALLOW.get(state)
@@ -97,6 +125,11 @@ def check(state: str, action: str) -> tuple[bool, str | None]:
         return False, (f"狀態 {state} 不在守門表上——這是程式的疏漏，"
                        "此時不對飛機下任何指令")
     if action in allowed:
+        # **RC 前置條件排在狀態判斷之後**：狀態本來就擋掉的那些格
+        # （例如飛行中重下 start_mission），既有的理由比「遙控器未連線」
+        # 更說得出當下該做什麼。排在後面，這道就只在真的會放行時才發言
+        if action in RC_REQUIRED and rc_link is False:
+            return False, _RC_WHY
         return True, None
     why = (_WHY.get((state, action))
            or _WHY.get((state, "*"))

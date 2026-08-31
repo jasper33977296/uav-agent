@@ -78,6 +78,7 @@ class IntentLink(threading.Thread):
         self._pending = []            # 待送的 event（在收訊迴圈裡產生，送在同一圈）
         self._done = {}               # intent_id → 上次的結果（冪等用的短記憶）
         self.silent_drops = 0         # 其中「對面不回話」被我方主動掐掉的次數
+        self.acked = 0                # 回給地面站的 intent 回執數（複裁 G）
         self._backoff = 1.0
 
     def publish(self, snapshot: dict) -> None:
@@ -92,7 +93,7 @@ class IntentLink(threading.Thread):
         分開放就要兩邊對時間戳才看得出「那次遙測掉包時意圖通道在不在」。"""
         return {"up": self.connected, "sent": self.sent,
                 "drops": self.drops, "silent": self.silent_drops,
-                "rejected": self.rejected}
+                "rejected": self.rejected, "acked": self.acked}
 
     # ── 執行緒本體 ─────────────────────────────────────────────
     def run(self):
@@ -130,7 +131,7 @@ class IntentLink(threading.Thread):
                 # 先收：地面站可能回 error（協定版本不合、型別未支援）。
                 # **不能只顧著送**——被拒絕卻沒讀到，就會一路送到天荒地老
                 try:
-                    self._on_message(ws.recv())
+                    self._on_message(ws.recv(), ws)
                     last_rx = time.time()
                 except websocket.WebSocketTimeoutException:
                     pass
@@ -196,7 +197,28 @@ class IntentLink(threading.Thread):
                 self._done.pop(next(iter(self._done)))
         self._pending.append(ev)
 
-    def _on_message(self, raw):
+    def _ack(self, ws, of, iid):
+        """對一則收到的訊息回執（協定 §2，039 複裁 G）。
+
+        **回執不是判決**：它只說「這則我收到了」，能不能做仍然由後面那則
+        `event` 說。分開送是為了讓地面站的逾時**說得出是哪一段斷的**——
+        「連回執都沒回」＝這則根本沒送達（5G 掉了），「回執收到了但沒有
+        判決」＝代理收到了卻算不出來（守門卡住、飛控沒回應）。兩種都是不行，
+        但要查的地方完全不同，而在這之前它們長得一模一樣。
+
+        **當場送，不排進 `_pending`**：那條路出去的訊息會被統一蓋成
+        `type="event"`，而回執必須是 `ack`。而且順序有意義——回執要排在判決
+        前面，排進同一個佇列反而要多一層型別欄位才分得開。
+
+        送不出去就讓例外往上走：此時這條連線已經沒用了，重連比吞掉好。
+        地面站重連後會補送，冪等由 `_dispatch` 的短記憶擋（協定 §4.3）。
+        """
+        if not iid:
+            return                      # 沒有 intent_id 就沒有東西可以回執
+        self._send(ws, {"type": "ack", "of": of, "intent_id": iid})
+        self.acked += 1
+
+    def _on_message(self, raw, ws=None):
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -209,6 +231,11 @@ class IntentLink(threading.Thread):
             self.rejected += 1
             log.error("地面站拒絕：%s", msg.get("reason"))
         elif t == "intent":
+            # **先回執，再照原流程回 event**（協定 §2）。回執在 `_dispatch`
+            # 之前：重送的 intent（冪等短記憶命中）一樣要回執——「我收到了」
+            # 與「這則我先前就處理過」是兩件事
+            if ws is not None:
+                self._ack(ws, "intent", msg.get("intent_id"))
             self._dispatch(msg, self.on_intent)
         elif t == "decision":
             self._dispatch(msg, self.on_decision)

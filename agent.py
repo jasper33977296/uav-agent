@@ -102,6 +102,23 @@ GPS_FIX = {0: "NO_GPS", 1: "NO_FIX", 2: "2D", 3: "3D", 4: "DGPS",
 #: MAV_LANDED_STATE。0＝UNDEFINED 是「這台韌體不回報」，不是「不在地上」
 LANDED = {1: "on_ground", 2: "in_air", 3: "takeoff", 4: "landing"}
 
+#: `MAV_SYS_STATUS_SENSOR_RC_RECEIVER`（1 << 16）。SYS_STATUS 的 present／health
+#: 兩組旗標各有這一位元，合起來才是三態（039 複裁 A）：
+#:
+#: * present 沒有這一位 → **這台韌體沒回報 RC**＝不知道（`None`），不擋
+#: * present 有、health 沒有 → RC 掉線（`False`）
+#: * 兩者都有 → RC 在線（`True`）
+#:
+#: **為什麼用這裡而不是 `RC_CHANNELS.rssi`**：rssi 沒有「不知道」這一態——
+#: 255 在 MAVLink 是「無效值」而不是「滿格」，讀成滿格的後果是 RC 掉線時守門
+#: 照樣放行起飛，而那正是這條規則要防的事。present 位元把「沒有回報」與
+#: 「回報說沒有」分得開，這個分別是整條規則的地基。
+#:
+#: **真機覆核未做**：ArduPilot 4.7 在 RC failsafe 期間是否清掉 health 位元、
+#: 以及 present 位元在沒有接收機時是否為 0，都要在真機上看過才算數。
+#: 覆核前這個欄位仍會照送——送 `None` 不擋，送錯才擋，而目前的風險是前者。
+SENSOR_RC_RECEIVER = 1 << 16
+
 
 class Link:
     """一條往地面站的 UDP 通道。"""
@@ -175,6 +192,23 @@ class Monitor:
                 else msg.battery_remaining
             s["cpu_load_pct"] = round(msg.load / 10, 1)
             s["sensors_health"] = msg.onboard_control_sensors_health
+            s["sensors_present"] = msg.onboard_control_sensors_present
+            # RC 遙控器在不在（039 複裁 A）。**沒回報就是 None**：把「不知道」
+            # 當成「沒有 RC」會讓所有還沒驗證過這個欄位的機都起飛不了
+            rc = (bool(msg.onboard_control_sensors_health & SENSOR_RC_RECEIVER)
+                  if msg.onboard_control_sensors_present & SENSOR_RC_RECEIVER
+                  else None)
+            # **不走 `_change`**：它把第一次讀到的值當成「還沒讀到」而不留痕，
+            # 而這裡的 `None` 是一個真正的值（不知道）。用 `_change` 的話
+            # 「不知道 → RC 掉線」這個轉換會安靜地過去——那正是最該留痕的一次
+            prev_rc = s.get("rc_link", "unset")
+            s["rc_link"] = rc
+            if prev_rc != "unset" and prev_rc != rc:
+                txt = ("遙控器已連線" if rc else
+                       "⚠ 遙控器離線——此時不得起飛／開始任務" if rc is False
+                       else "遙控器狀態不明（韌體停止回報）")
+                self.events.append((time.time(), "rc_link", txt))
+                log.info("狀態變化：%s", txt)
             if s["battery_pct"] is not None:
                 for th in (20, 10, 5):
                     if s["battery_pct"] <= th:
@@ -572,7 +606,9 @@ class Agent:
         """
         action = msg.get("action")
         state = self.flight_state()
-        ok, why = guard.check(state, action)
+        # RC 前置條件的事實在機上（039 複裁 A）：地面站把同一條規則畫成按鈕
+        # 按不下去，但那是提示，**權威在這裡**——按鈕擋得住人，擋不住補送
+        ok, why = guard.check(state, action, self.mon.state.get("rc_link"))
         base = {"intent_id": msg.get("intent_id"), "action": action,
                 "state": state, "executor": guard.executor(action or "")}
         if not ok:
@@ -581,24 +617,32 @@ class Agent:
                 (time.time(), "guard", f"擋下 {action}：{why}"))
             return {**base, "event": "guard_refused", "reason": why}
         if action == "change_route":
+            # 算提案本來就不動飛機，乾跑與否走同一條路——而**補送的
+            # change_route 需要的正是重算提案再要人確認**（協定 §2）
             return self._change_route_proposal(msg, base)
-        if guard.executor(action) == "ground":
-            # **放行不等於做完**：地面站有完整的廠牌方言，由它執行；
-            # 代理只負責說「現在這件事可以做」
-            log.info("守門放行 %s（狀態 %s）→ 由地面站執行", action, state)
-            return {**base, "event": "cleared",
-                    "reason": "守門通過，由地面站執行"}
         if (msg.get("params") or {}).get("dry_run"):
             # **乾跑：問判決但不動飛機。**
             # 沒有這個模式的話，要驗證守門「放行」那幾格就一定得真的下指令——
             # 2026-08-25 我就對一台停在地上的真機送出了 RTL／LAND／LOITER，
             # 只為了確認守門會放行。機是上鎖的所以無害，但**驗證不該需要
             # 動到飛機**，而且下次可能就不是上鎖狀態了
-            log.info("守門放行 %s（狀態 %s）→ 乾跑，不下指令", action, state)
-            return {**base, "event": "would_execute",
-                    "mode": self._INTENT_MODE.get(action),
-                    "reason": f"守門通過；乾跑模式，沒有下達 "
-                              f"{self._INTENT_MODE.get(action)}"}
+            #
+            # **這道排在執行者分岔之前**（039 複裁 G）：原本它只擋代理自己
+            # 執行的那幾個，地面站執行的 `start_mission` 走上面那條回
+            # `cleared`——而 `cleared` 在地面站那端**就是放行**。失聯期間
+            # 壓下來的意圖恢復後補送、每則都帶 `dry_run`，少了這道，一個人
+            # 在四十秒前按下的「開始任務」會在恢復的瞬間真的執行
+            mode = self._INTENT_MODE.get(action)
+            log.info("守門放行 %s（狀態 %s）→ 乾跑，不動飛機", action, state)
+            return {**base, "event": "would_execute", "mode": mode,
+                    "reason": ("守門通過；乾跑模式，沒有下達 " + mode) if mode
+                              else "守門通過；乾跑模式，沒有交給地面站執行"}
+        if guard.executor(action) == "ground":
+            # **放行不等於做完**：地面站有完整的廠牌方言，由它執行；
+            # 代理只負責說「現在這件事可以做」
+            log.info("守門放行 %s（狀態 %s）→ 由地面站執行", action, state)
+            return {**base, "event": "cleared",
+                    "reason": "守門通過，由地面站執行"}
         return self._do_agent_action(action, base)
 
     def _change_route_proposal(self, msg, base):
@@ -655,7 +699,8 @@ class Agent:
             self.proposals.pop(iid, None)
             log.info("人取消了改航線（%s）", iid)
             return {**base, "event": "cancelled", "reason": "人取消"}
-        ok, why = guard.check(base["state"], "change_route")
+        ok, why = guard.check(base["state"], "change_route",
+                              self.mon.state.get("rc_link"))
         if not ok:
             self.proposals.pop(iid, None)
             log.warning("確認之後守門仍擋下：%s", why)
@@ -764,6 +809,11 @@ class Agent:
             "seq_step": (self.seq or {}).get("step"),
             "mission_seq": s.get("mission_seq"),
             "mission_total": s.get("mission_total"),
+            # **RC 遙控器在不在**（039 複裁 A）。放在頂層而不是 derived 裡：
+            # 地面站的鏡像讀的是 `p.get("rc_link")`（agent_link.py），而
+            # `derived` 是整包原封鏡像的，位置放錯畫面就永遠是「不知道」。
+            # **沒讀到就送 None**——不知道不擋，權威守門在這台機上
+            "rc_link": s.get("rc_link"),
             "derived": {
                 "armed": bool(s.get("armed")),
                 "landed": s.get("landed_state"),
@@ -922,6 +972,32 @@ class Agent:
             return "HOLDING"                # 地面站按的暫停
         return "PILOT_CONTROL"              # 含溯源不明的 LOITER 與所有手飛模式
 
+    def _mission_done_by_seq(self):
+        """`mission_seq == mission_total` 的替代完成判定（039 複裁 C）。
+
+        **預設關閉，要旗標才啟用。** 韌體不回報 `mission_state` 時，目前只能
+        靠單飛時間上限收尾——那是能用但鈍的收法。用 seq 到底了來補，問題在於
+        `total` 到底含不含 home（航點 0），以及最後一個航點的 seq 在停留期間
+        會不會就停在那個值：兩者都是**廠牌與版本的行為**，讀規格讀不出來。
+        猜錯的後果不對稱——早一格判成「跑完」＝任務還沒飛完就被 RTL 打斷。
+
+        所以照裁定：實作放這裡、預設不啟用，**真機覆核 ArduPilot 4.7 之後**
+        再打開。啟用時只在韌體真的沒回報 `mission_state` 的情況下才作數——
+        有權威值就用權威值，不必猜。
+        """
+        if not self.a.mission_complete_by_seq:
+            return None
+        s = self.mon.state
+        if s.get("mission_state"):
+            return None                 # 韌體有回報，輪不到替代判定
+        seq, total = s.get("mission_seq"), s.get("mission_total")
+        if seq is None or not total:
+            return None
+        if seq >= total:
+            return (f"任務已完成（seq {seq}/{total} 到底；"
+                    "韌體不回報 mission_state，用的是替代判定）")
+        return None
+
     def _loss_verdict(self, state, now):
         """回傳：字串＝立刻 RTL 的理由；False＝這個狀態永不介入；None＝再等一拍。"""
         # 不介入的四類：已經在自己回家／降落、飛手拿著、飛控 failsafe 正在跑、
@@ -952,7 +1028,17 @@ class Agent:
             return False
         # ── FLYING_MISSION：跑完再 RTL，但有兩個上限 ──────────────
         batt = self.mon.state.get("battery_pct")
-        if batt is not None and batt < self.a.link_loss_min_batt:
+        # **讀不到電量＝不准續飛**（039 複裁 E，2026-08-31 使用者裁定）。
+        # 原本這裡是 `batt is not None and ...`——電量未知時整項檢查被跳過，
+        # 等於把「不知道」當成「電量充足」。而這條規則存在的前提就是知道還剩
+        # 多少電：前提不成立時不該假設它成立。
+        # **注意這與 rc_link 的 None 方向相反**，兩者不是同一種「不知道」：
+        # RC 那個 None 是「這台韌體沒回報過這個欄位」＝擋了就永遠不能起飛；
+        # 這個 None 是「續飛所依賴的事實現在讀不到」＝不擋就在無人監看下
+        # 帶著未知電量繼續飛。方向由「不知道時哪一邊會出事」決定，不是慣例
+        if batt is None:
+            return "讀不到電量——不知道還剩多少電就不續飛（複裁 E）"
+        if batt < self.a.link_loss_min_batt:
             return f"電量 {batt}% 低於 {self.a.link_loss_min_batt}%"
         # 用 is None 而不是 `or`：loss_started 是 epoch 秒數，`or` 會把
         # 合法的 0.0 當成未設定——測試就是這樣抓到的（單飛上限永不觸發）
@@ -962,6 +1048,9 @@ class Agent:
             return f"無人監看已 {solo:.0f} 秒（上限 {self.a.link_loss_max_solo_s:.0f}）"
         if self.mon.state.get("mission_state") == 5:
             return "任務已完成"
+        seq_done = self._mission_done_by_seq()
+        if seq_done:
+            return seq_done
         if not self._solo_logged:
             self._solo_logged = True
             ms = self.mon.state.get("mission_state")
@@ -969,8 +1058,11 @@ class Agent:
                         "為止%s", self.mon.state.get("mission_seq"),
                         self.mon.state.get("mission_total") or "?",
                         self.a.link_loss_max_solo_s, self.a.link_loss_min_batt,
-                        "" if ms else "（韌體不回報 mission_state＝測不到"
-                                      "「跑完」，只能靠時間上限收尾）")
+                        "" if ms else
+                        ("（韌體不回報 mission_state；已啟用 seq 替代判定）"
+                         if self.a.mission_complete_by_seq else
+                         "（韌體不回報 mission_state＝測不到「跑完」，"
+                         "只能靠時間上限收尾）"))
             self.mon.events.append(
                 (now, "gs_link", "地面失聯，任務續飛中（上限內）"))
         return None
@@ -1080,6 +1172,15 @@ def main():
     p.add_argument("--link-loss-min-batt", type=int,
                    default=int(os.environ.get("LINK_LOSS_MIN_BATT_PCT", 15)),
                    help="失聯續飛的電量下限，低於就立刻 RTL（使用者定案：15%%）")
+    # 複裁 C（2026-08-31）：韌體不回報 mission_state 時，用 seq 到底了當替代
+    # 的「跑完」判定。**預設關**——`total` 含不含 home、最後一個航點停留時
+    # seq 停在哪，是廠牌與版本的行為，猜錯就會在任務還沒飛完時 RTL 打斷它。
+    # 真機覆核 ArduPilot 4.7 之後才開
+    p.add_argument("--mission-complete-by-seq", action="store_true",
+                   default=os.environ.get("MISSION_COMPLETE_BY_SEQ", "")
+                   .lower() in ("1", "true", "yes"),
+                   help="用 mission_seq == mission_total 當替代的任務完成判定"
+                        "（複裁 C；真機覆核 ArduPilot 4.7 前不要開）")
     # 改航線序列的死線：地面站中途掛掉時清掉序列旗標。三步序列正常只要幾秒，
     # 120 秒已經是「顯然出事了」的量級
     p.add_argument("--seq-timeout-s", type=float,
@@ -1107,10 +1208,18 @@ def main():
             "要讓續飛真的發生，把 LINK_ACTION_S 調小或把 LINK_LOSS_MAX_SOLO_S 調大",
             a.link_loss_max_solo_s, a.link_action_s, a.link_action.upper())
     log.info("地面失聯處置（選項 C／逐狀態）：%.0fs 告警／%.0fs 起算；"
-             "任務中續飛（上限 %.0fs 或電量 %d%%）、暫停中立刻 %s、"
-             "已在 RTL/LAND 或飛手手上則不介入",
+             "任務中續飛（上限 %.0fs 或電量 %d%%，讀不到電量＝不續飛）、"
+             "暫停中立刻 %s、已在 RTL/LAND 或飛手手上則不介入",
              a.link_warn_s, a.link_action_s, a.link_loss_max_solo_s,
              a.link_loss_min_batt, a.link_action.upper())
+    # 兩條都是「預設不啟用」的安全前提，而預設不啟用最容易被忘記——啟動時
+    # 說一次，免得事後從行為反推
+    log.info("「跑完」的判定：mission_state；替代判定（seq 到底）%s",
+             "已啟用（複裁 C——真機覆核過了嗎？）"
+             if a.mission_complete_by_seq else
+             "**未啟用**（複裁 C：待真機覆核 ArduPilot 4.7 的 seq 行為）")
+    log.info("RC 前置條件（複裁 A）：rc_link 為 false 時擋下 %s；"
+             "**未回報＝不知道＝不擋**", sorted(guard.RC_REQUIRED))
     log.info("訊號採樣：%s", a.modem_port or "停用")
     Agent(a).run()
 
