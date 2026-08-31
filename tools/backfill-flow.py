@@ -11,6 +11,7 @@
 
 用法：python3 tools/backfill-flow.py
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -35,21 +36,18 @@ POSTED = []
 
 
 class Fake(B.Backfill):
+    """**只擋 HTTP，不蓋掉 `_flush`。** 蓋掉的話批次換算（單調→牆鐘）與緩衝
+    彈出這兩段就一格都測不到，而那正是最容易寫錯的地方。"""
+
     def __init__(self):
         super().__init__("x", 1, lambda: "board-1", lambda: STATE,
                          lambda: LINK["ok"])
         self.fail_next = False
 
-    def _flush(self):
+    def _post(self, body):
         if self.fail_next:
-            self.failed += 1
-            return                      # 模擬送失敗：資料要留在緩衝裡
-        with self._lock:
-            n = min(B.BATCH, len(self.buf))
-            POSTED.extend(self.buf[i] for i in range(n))
-            for _ in range(n):
-                self.buf.popleft()
-        self.sent += n
+            raise OSError("模擬送失敗")     # 資料要留在緩衝裡
+        POSTED.extend(json.loads(body)["samples"])
 
 
 g = Fake()
@@ -58,17 +56,19 @@ print("── 鏈路通的時候不累積 ────────────�
 for _ in range(5):
     g._last_sample = 0
     if not g.link_ok_fn():
-        g._sample(time.time())
+        g._sample(time.monotonic())
 chk("通的時候緩衝是空的", len(g.buf) == 0)
 
 print("\n── 斷線 → 取樣 ────────────────────────────────────────")
 LINK["ok"] = False
-t0 = time.time()
+t0 = time.monotonic()
 for i in range(10):
     g._sample(t0 + i)
 chk("斷線期間有累積", len(g.buf) == 10, len(g.buf))
-chk("欄位就是 telemetry 表那幾個",
-    set(g.buf[0]) >= {"t", "lat", "lon", "alt_rel", "flight_mode", "armed"},
+chk("緩衝裡記的是**單調時間**（牆鐘會被 NTP 調）",
+    "_m" in g.buf[0] and "t" not in g.buf[0], sorted(g.buf[0]))
+chk("其餘欄位就是 telemetry 表那幾個",
+    set(g.buf[0]) >= {"_m", "lat", "lon", "alt_rel", "flight_mode", "armed"},
     sorted(g.buf[0]))
 
 print("\n── 沒有定位就不填位置（0,0 是哨兵不是座標）──────────")
@@ -86,7 +86,7 @@ cap = g.buf.maxlen
 for i in range(cap + 50):
     g._sample(t0 + 100 + i)
 chk(f"不超過上限（{cap} 筆 ≈ {B.BUFFER_S/60:.0f} 分鐘）", len(g.buf) == cap)
-chk("留下的是最新的那段", g.buf[-1]["t"] > g.buf[0]["t"])
+chk("留下的是最新的那段", g.buf[-1]["_m"] > g.buf[0]["_m"])
 
 print("\n── 恢復後補傳 ─────────────────────────────────────────")
 g.buf.clear(); POSTED.clear()
@@ -101,8 +101,62 @@ g.fail_next = False
 g._flush()
 chk("重送成功 → 緩衝清空", len(g.buf) == 0 and len(POSTED) == 5,
     (len(g.buf), len(POSTED)))
-chk("補傳的時間戳是機上的（不是補傳當下）",
-    abs(POSTED[0]["t"] - (t0 + 200)) < 0.01, POSTED[0]["t"])
+chk("送出去的是牆鐘 `t`（單調時間不外流）",
+    "t" in POSTED[0] and "_m" not in POSTED[0], sorted(POSTED[0]))
+chk("補傳的時間戳是機上取樣的那一刻（不是補傳當下）",
+    abs(POSTED[0]["t"] - (time.time() - time.monotonic() + t0 + 200)) < 0.05,
+    POSTED[0]["t"])
+chk("批次內單調遞增（1 Hz 取樣就該差 1 秒）",
+    all(abs((POSTED[i + 1]["t"] - POSTED[i]["t"]) - 1.0) < 0.01
+        for i in range(len(POSTED) - 1)),
+    [round(r["t"], 2) for r in POSTED])
+
+print("\n── 牆鐘被 NTP 調過：補上去的時間仍然要對 ───────────────")
+# **這台 Pi 的 RTC 沒有電池**，每次開機系統時間從 1970 起算，靠 5G 上的 NTP
+# 修正——也就是「失聯期間取樣」與「恢復後補傳」很可能落在時鐘跳躍的兩側。
+# 取樣記單調、送出前才換算，跳躍就不會寫進資料裡
+real_time = time.time
+g.buf.clear(); POSTED.clear()
+LINK["ok"] = False
+try:
+    time.time = lambda: 14.0                  # 假裝時鐘還停在 1970
+    base = time.monotonic()
+    for i in range(3):
+        g._sample(base + i)
+    chk("時鐘還沒同步時 `_flush` 不送（換算基準是錯的）",
+        (LINK.__setitem__("ok", True), g._flush(), len(g.buf) == 3
+         and not POSTED)[-1], f"buf={len(g.buf)} posted={len(POSTED)}")
+    time.time = real_time                     # NTP 把時間校正回來
+    g._flush()
+finally:
+    time.time = real_time
+chk("時鐘校正後才送出去", len(g.buf) == 0 and len(POSTED) == 3,
+    (len(g.buf), len(POSTED)))
+chk("**送出去的是校正後的時間，不是 1970**",
+    all(r["t"] > B.CLOCK_SANE_EPOCH for r in POSTED),
+    [round(r["t"], 1) for r in POSTED])
+chk("跳躍沒有寫進資料：批次內仍然單調且間隔 1 秒",
+    all(abs((POSTED[i + 1]["t"] - POSTED[i]["t"]) - 1.0) < 0.01
+        for i in range(len(POSTED) - 1)),
+    [round(r["t"], 2) for r in POSTED])
+
+print("\n── 節流用單調時鐘：牆鐘往回跳不會讓取樣停擺 ───────────")
+# 舊寫法 `now - _last_sample >= SAMPLE_S` 用牆鐘：往回校正 Δ 秒的話取樣會
+# 靜默停擺 Δ 秒（sampled 不動、log 不叫）
+g2 = Fake()
+g2._last_sample = time.monotonic()
+before = g2.sampled
+try:
+    time.time = lambda: real_time() - 86400   # 牆鐘往回跳一天
+    time.sleep(1.05)
+    m = time.monotonic()
+    if m - g2._last_sample >= B.SAMPLE_S:
+        g2._last_sample = m
+        g2._sample(m)
+finally:
+    time.time = real_time
+chk("牆鐘往回跳一天，取樣照常進行", g2.sampled == before + 1,
+    f"sampled {before} → {g2.sampled}")
 
 print("\n── stayed_armed：D 層判斷「還算不算同一趟」──────────")
 chk("這段期間 armed 過 → stayed_armed=True", g.stayed_armed is True)

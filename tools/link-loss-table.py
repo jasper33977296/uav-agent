@@ -46,8 +46,19 @@ class Fake(A.Agent):
         self.loss_started = 0.0
         self.seq = st.pop("_seq", None)   # 改航線序列進行中？
         self._solo_logged = True            # 靜音，測的是判定不是播報
+        # 處置動作那段（D／F）要用的：預設與正式值一致
+        self.sent_modes = []
+        self.mode_req = None
+        self.loss_warned = False
+        self.loss_acted = False
+        self.gs_link_ok = False
+        self.last_gs_rx = 0.0
+        self.serial = types.SimpleNamespace(
+            mav=types.SimpleNamespace(
+                command_long_send=lambda *args: self.sent_modes.append(args[5])))
         self.a = types.SimpleNamespace(
             link_loss_max_solo_s=30.0, link_loss_min_batt=15,
+            link_warn_s=5.0, link_action_s=10.0, link_action="rtl",
             # 複裁 C 的替代完成判定：**預設關**，與正式預設一致。
             # 測試若預設開著，就測不出「預設是關的」這件事本身
             mission_complete_by_seq=by_seq)
@@ -162,6 +173,56 @@ ok &= case("旗標開但韌體有回報 mission_state → 用權威值", "FLYING
 ok &= case("旗標開但 total 不明（0）→ 不猜", "FLYING_MISSION", "續飛觀察",
            solo=20.0, mode="AUTO", mission_state=0, mission_seq=9,
            mission_total=0, battery_pct=80, _by_seq=True, **AIR)
+
+print("\n── 複裁 D：處置動作一律 RTL，不因低電量改 LAND ─────────")
+# **多一條分支就多一條沒被測過的路徑**（2026-08-31 複裁 D 維持現值）。
+# 低電量是「立刻回家」的理由，不是「改成就地降落」的理由——就地降落會把
+# 飛機留在一個沒有人在旁邊的地方
+RTL_ID, LAND_ID = A.COPTER_MODE_ID["RTL"], A.COPTER_MODE_ID["LAND"]
+for label, batt in (("電量 12%（低於下限）", 12), ("電量 80%（充足）", 80)):
+    g = Fake(mode="AUTO", mission_state=3, battery_pct=batt, **AIR)
+    why = g._loss_verdict(g.flight_state(), 20.0)
+    g._do_link_loss_action(time.time(), 20.0, "AUTO", str(why))
+    hit = g.sent_modes and all(m == RTL_ID for m in g.sent_modes)
+    print(f"{'✓' if hit else '✗'} {label} → 下達 RTL"
+          f"（模式碼 {set(g.sent_modes)}，LAND 是 {LAND_ID}）")
+    ok &= bool(hit)
+    ok &= LAND_ID not in g.sent_modes
+
+print("\n── 複裁 F：鏈路恢復不取消已經開始的 RTL ────────────────")
+# 恢復**只解除警戒並留痕**，要不要繼續是人的決定。自動取消等於系統替人
+# 做了決定，而且是在它剛剛才因為看不到而做過一次決定之後
+g = Fake(mode="RTL", **AIR)              # 已經因為失聯下過 RTL，正在返航
+g.loss_acted = True
+g.loss_warned = True
+g.loss_started = time.time() - 40
+g.gs_link_ok = False
+g.last_gs_rx = time.time()               # 鏈路剛恢復
+g._check_gs_link(time.time())
+chk_ok = not g.sent_modes
+print(f"{'✓' if chk_ok else '✗'} 恢復時不對飛機下任何指令"
+      f"（送出了 {g.sent_modes}）")
+ok &= chk_ok
+print(f"{'✓' if g.gs_link_ok else '✗'} 恢復被認出來了（gs_link_ok=True）")
+ok &= bool(g.gs_link_ok)
+print(f"{'✓' if not g.loss_acted else '✗'} 警戒解除（下次真的再失聯還會處置）")
+ok &= not g.loss_acted
+traced = any(e[1] == "gs_link" for e in g.mon.events)
+print(f"{'✓' if traced else '✗'} 恢復有留痕｜"
+      f"{[e[2] for e in g.mon.events][-1:]}")
+ok &= traced
+# **反向驗證**：不是把 _check_gs_link 整個變成不動作——還在失聯而且到期時
+# 仍然要處置
+g2 = Fake(mode="AUTO", mission_state=3, battery_pct=80, **AIR)
+g2.loss_warned = True
+g2.gs_link_ok = False
+g2.last_gs_rx = time.time() - 60         # 失聯 60 秒，早就超過單飛上限
+g2.loss_started = g2.last_gs_rx
+g2._check_gs_link(time.time())
+acted = g2.sent_modes and all(m == RTL_ID for m in g2.sent_modes)
+print(f"{'✓' if acted else '✗'} **反向驗證**：仍在失聯且超過上限 → 照樣下 RTL"
+      f"（{set(g2.sent_modes)}）")
+ok &= bool(acted)
 
 print("\n── 反向驗證：斷言真的分得出來 ──────────────────────────")
 # 同一個 LOITER，只改溯源，處置必須相反——這是整套規則最容易寫錯的一格
