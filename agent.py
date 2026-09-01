@@ -76,6 +76,7 @@ from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import guard
+import normalize
 import route
 from backfill import Backfill
 from intent import IntentLink
@@ -192,6 +193,9 @@ class Monitor:
         self.last_hb = 0.0
         self.counts = defaultdict(int)
         self.events = []
+        #: PREARM_CHECK 位元見過沒有（026 B4-b）。**黏性**：見過一次就信
+        #: health 位元；從未見過＝韌體不回報，就緒判定退回次級訊號
+        self._prearm_seen = False
 
     def feed(self, msg):
         t = msg.get_type()
@@ -207,6 +211,11 @@ class Monitor:
             self._change("mode", mode, f"飛行模式 → {mode}")
             s["sysid"] = msg.get_srcSystem()
             s["system_status"] = msg.system_status
+            # 026 B4-b：驅動要的是**原始 custom_mode**，不是我們譯過的名字。
+            # 譯過的那份是 Copter 專用表（`COPTER_MODE`），而驅動同時要服務
+            # PX4——把譯好的字串再餵回去等於用一家的表去解另一家的數字
+            s["custom_mode"] = msg.custom_mode
+            s["mav_state"] = normalize.MAV_STATE.get(msg.system_status)
             s["autopilot_raw"] = msg.autopilot
             s["vehicle_type"] = msg.type
         elif t == "SYS_STATUS":
@@ -217,6 +226,15 @@ class Monitor:
             s["cpu_load_pct"] = round(msg.load / 10, 1)
             s["sensors_health"] = msg.onboard_control_sensors_health
             s["sensors_present"] = msg.onboard_control_sensors_present
+            s["sensors_enabled"] = msg.onboard_control_sensors_enabled
+            # 026 B4-b：就緒判定的兩個輸入。**present 且 enabled 且不 health**
+            # 才算異常——沒裝的感測器不健康是廢話，關掉的也是
+            pres, enab, heal = (msg.onboard_control_sensors_present,
+                                msg.onboard_control_sensors_enabled,
+                                msg.onboard_control_sensors_health)
+            s["sensors_unhealthy"] = normalize.sensors_unhealthy(pres, enab, heal)
+            s["prearm_ok"], self._prearm_seen = normalize.prearm(
+                pres, enab, heal, self._prearm_seen)
             # RC 遙控器在不在（039 複裁 A）。**沒回報就是 None**：把「不知道」
             # 當成「沒有 RC」會讓所有還沒驗證過這個欄位的機都起飛不了
             rc = (bool(msg.onboard_control_sensors_health & SENSOR_RC_RECEIVER)
@@ -241,6 +259,9 @@ class Monitor:
                         break
         elif t == "GPS_RAW_INT":
             s["gps_fix"] = GPS_FIX.get(msg.fix_type, msg.fix_type)
+            # 就緒判定比的是數字（`fix < 3`），不是名字。存原始值而不是回頭
+            # 反查譯名——反查表會與正查表漂移，而漂移的症狀是靜默的錯判
+            s["gps_fix_raw"] = msg.fix_type
             s["gps_sats"] = msg.satellites_visible
             self._change("gps_fix_state", s["gps_fix"],
                          f"GPS 定位 → {s['gps_fix']}（{s['gps_sats']} 顆）")
@@ -258,6 +279,11 @@ class Monitor:
             # UNDEFINED（0）＝**這台韌體沒回報**，不是「不在地上」——那時才退回
             # 用高度與地速猜，而且要讓人知道用的是猜的（見 Agent.flight_state）
             s["landed_state"] = LANDED.get(msg.landed_state)
+        elif t in normalize.EKF_MSG_TYPES:
+            # 訊息層方言：PX4 發 ESTIMATOR_STATUS、ArduPilot 發 EKF_STATUS_REPORT
+            # ——**同一件事兩個訊息名**，所需位元在 bit 1..512 同義。型別清單是
+            # 從驅動的 MESSAGE_ADJUSTMENTS 推導的，不是手寫（見 normalize.py）
+            s["ekf_ok"] = normalize.ekf_ready(msg.flags)
         elif t == "MISSION_CURRENT":
             # 失聯處置的「跑完再 RTL」要知道任務**什麼時候算跑完**。
             # mission_state 是後來才加進 MAVLink 的欄位：舊韌體不填（0＝UNKNOWN），
@@ -623,7 +649,15 @@ class Agent:
              "inputs": ["telemetry"], "protocol": [1],
              # 地面站據此知道哪些意圖要自己執行、哪些丟給代理（丙案分工）
              "executes": sorted(guard.AGENT_ACTIONS),
-             "vets": sorted(guard.ACTIONS)},
+             "vets": sorted(guard.ACTIONS),
+             # 026 待決點 6：驅動跟著飛機走，機隊裡就可能同時存在不同版本。
+             # **先讓差異可見**——「版本不合就降級唯讀」那類守則本批不做，
+             # 因為沒有人看得到的漂移，訂再多守則也管不到。
+             # `limits` 依這台機的廠牌給；廠牌還沒問到（沒收過 HEARTBEAT）時
+             # 是 UnknownDriver 的空表，那是誠實的「不知道」
+             "driver": {**normalize.driver_info(),
+                        "limits": normalize.driver_limits(
+                            self.mon.state.get("autopilot_raw"))}},
             on_intent=self.on_intent, on_decision=self.on_decision,
             on_progress=self.on_progress)
         self.intent.start()
@@ -858,6 +892,11 @@ class Agent:
                 # 地面站失聯是**代理這一側看到的事實**，與地面站自己看到的
                 # 不一定同時發生——兩邊不一致本身就是要報警的事（狀態機 §6.4）
                 "gs_link_ok": self.gs_link_ok,
+                # 026 B4-b：驅動算出來的正規化欄位（協定 §4.2）。
+                # **判斷用 mode_verb、顯示用 mode_name**；`ready` 三態。
+                # 地面站認得這個廠牌時會拿自己算的來對，不一致就報警——
+                # 那不是要調解的分歧，是**有一邊的驅動錯了**
+                **normalize.derived(s),
             },
         })
 

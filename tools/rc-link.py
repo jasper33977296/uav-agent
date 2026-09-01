@@ -41,18 +41,24 @@ import guard  # noqa: E402
 BIT = A.SENSOR_RC_RECEIVER
 
 
-def sys_status(present, health):
-    """一則剛好夠 Monitor.feed 用的 SYS_STATUS。"""
+def sys_status(present, health, enabled=None):
+    """一則剛好夠 Monitor.feed 用的 SYS_STATUS。
+
+    `enabled` 預設跟著 `present`：**RC 三態刻意只看 present／health**，
+    但 `sensors_unhealthy`（026 B4-b）要 present 且 enabled 且不 health，
+    所以這個欄位還是得有——沒有的話 feed 會直接拋 AttributeError。
+    """
     return types.SimpleNamespace(
         get_type=lambda: "SYS_STATUS", voltage_battery=12000,
         battery_remaining=80, load=250,
         onboard_control_sensors_present=present,
+        onboard_control_sensors_enabled=present if enabled is None else enabled,
         onboard_control_sensors_health=health)
 
 
-def feed(present, health):
+def feed(present, health, enabled=None):
     mon = A.Monitor()
-    mon.feed(sys_status(present, health))
+    mon.feed(sys_status(present, health, enabled))
     return mon
 
 
@@ -97,6 +103,18 @@ chk("其他感測器的位元不會誤觸這一格",
     feed(0xFFFF, 0xFFFF).state["rc_link"] is None, "低 16 位元全開")
 chk("**反向驗證**：同時有別的感測器時仍讀得出 RC",
     feed(0xFFFF | BIT, 0xFFFF).state["rc_link"] is False)
+
+# **`rc_link` 刻意不看 `enabled`**，與 `sensors_unhealthy` 不同。方向是安全的：
+# 「present 但沒 enabled」代表接收機在但不可用，而 rc_link=False 的後果是擋下
+# 起飛——擋錯了人看得到理由並可以處理，放行錯了是沒有人能接管
+chk("present 有、health 有，但 enabled 沒有 → 仍是 True（只看 present/health）",
+    feed(BIT, BIT, enabled=0).state["rc_link"] is True)
+chk("**對照**：同一組輸入下 sensors_unhealthy 不會列 RC（它要 enabled）",
+    feed(BIT, 0, enabled=0).state["sensors_unhealthy"] == [],
+    feed(BIT, 0, enabled=0).state["sensors_unhealthy"])
+chk("**對照**：enabled 有而 health 無時，兩邊都說 RC 有問題",
+    feed(BIT, 0, enabled=BIT).state["rc_link"] is False
+    and "RC 接收器" in feed(BIT, 0, enabled=BIT).state["sensors_unhealthy"])
 
 print("\n── 變化要留痕（含「不知道 → 掉線」）───────────────────")
 mon = A.Monitor()

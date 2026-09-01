@@ -190,11 +190,45 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/rc-link.py` | RC 三態解析；`--live` 可接真飛控做覆核 |
 | `tools/intent-ack.py` | 意圖回執的順序：先 ack 再 event |
 | `tools/decision-flow.py` | 提案→確認→序列、乾跑、RC 前置 |
+| `autopilot/` | 自駕儀驅動，**與 uav-system `libs/autopilot/` 逐字相同**（026 B4-b） |
+| `normalize.py` | 正規化欄位：模式動詞／名稱、就緒判定（移植自地面站 `state.py`） |
+| `tools/driver-parity.py` | 搬家的等價驗收：兩份實作同時載入逐鍵比對（B4-d 核心） |
+| `tools/derived-fields.py` | 從 MAVLink 餵進去，看 `derived` 送出什麼 |
+| `tools/udp-link.py` | 代理對 UDP 端點（SITL）的連線路徑 |
 | `tools/backfill-flow.py` | 緩衝與補傳的邏輯（HTTP 用假的） |
 | `tools/backfill-live.py` | 補傳端到端：真代理 → 跑著的地面站 → 真入庫 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |
+
+## 自駕儀驅動（026 B4-b，2026-09-01）
+
+廠牌方言從地面站搬到機上：由代理解讀飛控遙測後，把**正規化**的值送上去
+（協定 §4.2）——`mode_verb`（判斷用，廠牌無關）、`mode_name`（顯示用，
+廠牌自己的名字）、`ready`／`not_ready_reasons`／`prearm_ok`／`ekf_ok`。
+
+**地面站的驅動不刪。** 「這台機有沒有代理」是執行期的事實不是編譯期的：
+SITL 沒接代理就整個開發流程斷掉，而第三方的機永遠不會有代理。所以：
+
+| 情況 | 處置 |
+|---|---|
+| 地面站**認得**那個廠牌 | 兩邊各自算，**不一致就報警**——不是拿來選一邊的 |
+| 地面站**不認得**（新廠牌） | 用代理的值並標明來源。**這才是搬家真正的收穫** |
+| 沒有代理 | 地面站自己解讀 |
+
+**`autopilot/` 四支檔案與上游 `uav-system/libs/autopilot/` 逐字相同**——
+搬家不是改寫，唯一的驗收標準是新舊輸出完全相同。所以那幾支不加檔頭、
+不修看起來像 bug 的地方（來源與已知差異記在 `autopilot/_provenance.py`），
+這樣 `diff -r` 出零差異才能回答「有沒有漂移」。
+
+真正被移植的是**就緒判定**（原本住在地面站的 `state.py`，不在 `libs/autopilot`
+裡）——那是唯一有機會搬錯的地方，所以 `tools/driver-parity.py` 把兩份實作
+同時載進同一個行程，用 2916 組輸入逐鍵比對。**兩份實作並存的這段期間，
+正是唯一能做這個比對的窗口**：地面站那份刪掉之後就沒有對照組了。
+
+> **缺欄位＝代理沒說，不是值是 false。** 舊版代理不送這些欄位，把缺欄位讀成
+> `ready: false` 會讓所有還沒升級的機都變成不可飛——與 `rc_link` 三態同一個
+>教訓。`ready = None` 是「我算過了但沒有依據」，與「整個鍵不存在」不同。
 
 ## 設計決策（為什麼是這樣寫的）
 
