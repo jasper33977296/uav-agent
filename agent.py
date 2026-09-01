@@ -78,6 +78,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 import guard
 import normalize
 import route
+from autopilot import get_driver
 from backfill import Backfill
 from intent import IntentLink
 from modem import ModemSampler
@@ -292,6 +293,16 @@ class Monitor:
             s["mission_seq"] = msg.seq
             s["mission_total"] = getattr(msg, "total", 0) or 0
             s["mission_state"] = getattr(msg, "mission_state", 0) or 0
+        elif t == "PARAM_VALUE":
+            # **值的解讀是廠牌方言**：PX4 把整數參數的位元組原樣塞進 float32，
+            # ArduPilot 寫數值本身——用驅動解，不要自己判斷（026 B4-b）
+            name = msg.param_id
+            if isinstance(name, (bytes, bytearray)):
+                name = name.decode("ascii", "replace")
+            name = name.rstrip("\x00").strip()
+            drv = get_driver(s.get("autopilot_raw"))
+            s.setdefault("params", {})[name] = drv.decode_param(
+                msg.param_value, getattr(msg, "param_type", None))
         elif t == "AUTOPILOT_VERSION":
             # 板子身分（uav-system issues/038）。**代理原本只轉發不解**——
             # 但註冊要以 board_uid 為鍵，所以自己也得看得懂。
@@ -331,6 +342,13 @@ class Agent:
         self.last_stream_req = 0.0
         self.streams_requested = False
         self.caps_requested = False
+        # 飛控 GCS failsafe 的開機自檢（uav-system 039，2026-09-01 裁定「開」）。
+        # **一次就好，不週期重讀**——參數不會自己變，會變是因為有人去改，
+        # 那種情況下重啟一次代理不算苛求。這正是地面站拔掉 SYSID_MYGCS 探測
+        # 的理由之一（每 30 秒對每台 ArduPilot 機重讀）
+        self.fs_gcs_asked = 0            # 問過幾次
+        self.fs_gcs_asked_at = 0.0       # 上次開口的時間
+        self.fs_gcs_said = False         # 結論說過了沒有
         self.hello_sent = False
         self.drone_id = None
         self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
@@ -422,6 +440,134 @@ class Agent:
             log.warning("請求板子身分失敗：%s", e)
             self.caps_requested = False      # 失敗就讓下一拍再試
 
+    #: 飛控那層 GCS failsafe 的參數名。**這是 ArduPilot 的方言**，照理說該住在
+    #: `autopilot/ardupilot.py` 裡——但那四支檔案與上游逐字相同是刻意維持的
+    #: 性質（見 `autopilot/_provenance.py`），在複製品裡加方法會讓 `diff -r`
+    #: 再也回答不了「有沒有漂移」。**要加就加在上游**，已回報；在那之前放這裡，
+    #: 並且只對 ArduPilot 發問（PX4 的對應機制是 NAV_DLL_* 系列，不是這兩個）
+    FS_GCS_PARAMS = ("FS_GCS_ENABLE", "FS_GCS_TIMEOUT")
+    #: 沒回應就再問一次的間隔，以及徹底放棄的時限。**不是週期重讀**：
+    #: 拿到答案或用完次數之後就永遠停手
+    FS_GCS_RETRY_S = 10.0
+    FS_GCS_GIVEUP_S = 25.0
+
+    def request_fs_gcs(self, now):
+        """開機時問一次飛控的 GCS failsafe 設定（039，2026-09-01 裁定）。
+
+        **為什麼現在值得問，而 2026-08-31 不值得**：那時候讀了也不會據此做
+        任何事，只為了印一行話對 57600 多送一輪請求不划算。現在有裁定值，
+        這個檢查會據以做事——不變式不成立就大聲說。
+
+        只對 ArduPilot 發問：`FS_GCS_*` 是它的參數名，對 PX4 送出去只會石沉
+        大海，然後我們把「這台機沒有這兩個參數」誤讀成「讀不到」。
+        """
+        s = self.mon.state
+        tgt = s.get("sysid")
+        if tgt is None or self.fs_gcs_said:
+            return
+        if s.get("autopilot_raw") != 3:          # MAV_AUTOPILOT_ARDUPILOTMEGA
+            return
+        got = s.get("params") or {}
+        if all(k in got for k in self.FS_GCS_PARAMS):
+            return                               # 兩個都到了，不必再問
+        if self.fs_gcs_asked >= 2:
+            return                               # 問過兩輪就不再開口
+        if self.fs_gcs_asked and now - self.fs_gcs_asked_at < self.FS_GCS_RETRY_S:
+            return
+        self.fs_gcs_asked += 1
+        self.fs_gcs_asked_at = now
+        try:
+            for name in self.FS_GCS_PARAMS:
+                if name in got:
+                    continue
+                # 送三次：57600 上單包丟失是真實風險，而這是一次性請求
+                for _ in range(3):
+                    self.serial.mav.param_request_read_send(
+                        tgt, 1, name.encode("ascii"), -1)
+                    time.sleep(0.05)
+            log.info("已請求飛控 GCS failsafe 設定（第 %d 次）：%s",
+                     self.fs_gcs_asked, "、".join(self.FS_GCS_PARAMS))
+        except Exception as e:
+            log.warning("請求 GCS failsafe 參數失敗：%s", e)
+            self.fs_gcs_asked -= 1               # 沒送出去就不算問過
+
+    def _check_fs_gcs(self, now):
+        """自檢並**只說一次**：飛控那層會不會搶在代理前面動作。
+
+        不變式（uav-system 039，2026-09-01 使用者裁定）：
+
+            FS_GCS_TIMEOUT  >  LINK_LOSS_MAX_SOLO_S  >  LINK_ACTION_S
+
+        飛控那層的角色是**代理的後備**——只在代理沒有動手時才出手。逾時若
+        小於單飛上限，飛控會在續飛的中途搶先，而使用者裁定的「失聯後跑完
+        任務再 RTL」那一格**就永遠不會發生**。這是選項 C 的**第三條**安靜
+        退化途徑（另兩條：兩個門檻撞在一起、以及這條的前身），理由與那兩條
+        相同：安靜地退化成另一種策略，比策略本身選錯更難發現。
+
+        **「讀不到」與「讀到了但不合」分開講**：前者是「不知道飛控怎麼設定」，
+        後者是「知道它設錯了」——處置完全不同，混成一句話等於沒說。
+        """
+        if self.fs_gcs_said:
+            return
+        s = self.mon.state
+        if s.get("sysid") is None:
+            return
+        raw = s.get("autopilot_raw")
+        if raw is not None and raw != 3:
+            self.fs_gcs_said = True
+            log.info("GCS failsafe 自檢跳過：這台不是 ArduPilot（autopilot=%s）"
+                     "——FS_GCS_* 是 ArduPilot 的參數名，"
+                     "其他廠牌的對應機制不同，本檢查對它沒有意義", raw)
+            return
+        got = s.get("params") or {}
+        have = {k: got[k] for k in self.FS_GCS_PARAMS if k in got}
+        if len(have) < len(self.FS_GCS_PARAMS):
+            if not self.fs_gcs_asked_at or now - self.fs_gcs_asked_at < self.FS_GCS_GIVEUP_S:
+                return                            # 還在等
+            self.fs_gcs_said = True
+            missing = [k for k in self.FS_GCS_PARAMS if k not in got]
+            # **讀不到 ≠ 設錯了。** 可能是參數不存在（舊韌體沒有
+            # FS_GCS_TIMEOUT）、也可能是請求或回應在 57600 上丟了——
+            # 兩者我們分不出來，所以不要假裝分得出來
+            log.warning("⚠ **讀不到飛控的 GCS failsafe 設定**（缺 %s，已問 %d 次）"
+                        "——不是「設錯了」而是「不知道它怎麼設」。可能是舊韌體"
+                        "沒有這個參數，也可能是請求或回應掉了。"
+                        "無法確認 FS_GCS_TIMEOUT > %.0fs 這條不變式是否成立",
+                        "、".join(missing), self.fs_gcs_asked,
+                        self.a.link_loss_max_solo_s)
+            self.mon.events.append(
+                (now, "fs_gcs", f"讀不到 GCS failsafe 設定（缺 {'、'.join(missing)}）"))
+            return
+
+        self.fs_gcs_said = True
+        enable, timeout = have["FS_GCS_ENABLE"], have["FS_GCS_TIMEOUT"]
+        solo, act = self.a.link_loss_max_solo_s, self.a.link_action_s
+        problems = []
+        if not enable:
+            # 裁定是「開」。關著的話飛控那層後備不存在——代理掛掉就沒有任何人
+            problems.append(
+                f"FS_GCS_ENABLE={enable:g}＝**關**：飛控那層後備不存在，"
+                "代理自己掛掉時沒有任何人接手")
+        if timeout <= solo:
+            problems.append(
+                f"FS_GCS_TIMEOUT={timeout:g}s **不大於**單飛上限 {solo:.0f}s："
+                "飛控會在續飛中途搶先動作，「失聯後跑完任務再 RTL」那一格"
+                "永遠不會發生（選項 C 退化）")
+        if solo <= act:
+            problems.append(
+                f"單飛上限 {solo:.0f}s 不大於處置起算 {act:.0f}s：選項 C 退化成 A")
+        if problems:
+            log.error("⚠⚠ **GCS failsafe 不變式不成立**"
+                      "（要求 FS_GCS_TIMEOUT > %.0fs > %.0fs）：%s",
+                      solo, act, "；".join(problems))
+            self.mon.events.append(
+                (now, "fs_gcs", "⚠ GCS failsafe 設定與失聯處置衝突："
+                                + "；".join(problems)))
+            return
+        log.info("GCS failsafe 自檢通過：FS_GCS_ENABLE=%g、FS_GCS_TIMEOUT=%gs "
+                 "> 單飛上限 %.0fs > 處置起算 %.0fs——飛控那層是後備，"
+                 "只在代理沒動手時才出手", enable, timeout, solo, act)
+
     def request_streams_once(self):
         """看到飛控就把串流請求送一次。
 
@@ -509,6 +655,8 @@ class Agent:
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
         self.request_board_id()
+        self.request_fs_gcs(now)
+        self._check_fs_gcs(now)
         self.request_streams_once()
         self.say_hello()
         self._track_mode_owner()
@@ -1299,18 +1447,18 @@ def main():
              "**未啟用**（複裁 C：待真機覆核 ArduPilot 4.7 的 seq 行為）")
     log.info("RC 前置條件（複裁 A）：rc_link 為 false 時擋下 %s；"
              "**未回報＝不知道＝不擋**", sorted(guard.RC_REQUIRED))
-    # **選項 C 有第二條安靜退化的路，而且比參數撞在一起那條更大。**
-    # GCS 心跳是地面的指令服務每秒送的，經 5G 過本代理到飛控（模組說明有
-    # 完整查證）——所以 5G 一斷，飛控那邊的心跳也真的停了。若 `FS_GCS_ENABLE`
-    # 是開的，飛控的逾時遠短於這裡的單飛上限，它會搶在選項 C 前面動作，
-    # 而**代理完全不會知道**：我們只看得到模式突然變了，看起來就像飛手切的。
-    # 說出來的理由與上面那條相同：安靜地退化成另一種策略，比策略本身選錯
-    # 更難發現。代理不去讀那兩個參數是刻意的——讀參數要對飛控多送一輪
-    # 請求，而它現在還不會據此做任何決定（039 待裁），只為了印一行話不值得
-    log.info("⚠ 飛控的 GCS failsafe（FS_GCS_ENABLE／FS_GCS_TIMEOUT）**現值未知**："
-             "GCS 心跳來自地面、走 5G，失聯時飛控那邊也會停。若它是開的且逾時 "
-             "< %.0fs，飛控會搶在選項 C 前面動作，「跑完任務再 RTL」不會發生"
-             "（uav-system issues/039 待裁）", a.link_loss_max_solo_s)
+    # **選項 C 的第三條安靜退化途徑。** GCS 心跳是地面的指令服務每秒送的，
+    # 經 5G 過本代理到飛控——5G 一斷，飛控那邊的心跳也真的停了。飛控那層
+    # 若搶在代理前面動作，**代理完全不會知道**：我們只看得到模式突然變了，
+    # 而 `_track_mode_owner` 會把它判成飛手切的，於是決定永不介入。
+    # 2026-09-01 使用者裁定 FS_GCS_ENABLE=1、FS_GCS_TIMEOUT=45，不變式是
+    #   FS_GCS_TIMEOUT > LINK_LOSS_MAX_SOLO_S > LINK_ACTION_S
+    # 飛控那層的角色是**代理的後備**：只在代理沒動手時才出手。開機時讀一次
+    # 參數自檢（`request_fs_gcs`／`_check_fs_gcs`），不週期重讀
+    log.info("飛控 GCS failsafe：開機後會讀一次 FS_GCS_ENABLE／FS_GCS_TIMEOUT "
+             "自檢，要求 FS_GCS_TIMEOUT > %.0fs（單飛上限）> %.0fs（處置起算）"
+             "；讀不到與讀到但不合會分開報",
+             a.link_loss_max_solo_s, a.link_action_s)
     log.info("訊號採樣：%s", a.modem_port or "停用")
     Agent(a).run()
 

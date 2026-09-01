@@ -106,15 +106,33 @@ backend 需設 `LINK_SOURCE=modem` 才會收 `/api/link-metrics/*`。
 飛手手上不介入）只有代理做得到，因為只有代理同時看得到飛控的全部狀態與
 地面的死活。
 
-> **`FS_GCS_ENABLE` 是待裁項，不是設定細節**（uav-system issues/039，
-> 2026-08-31 立案）。**開**＝多一層完全獨立於 5G 的防線，但 ArduPilot 的
-> GCS failsafe 逾時遠短於下方的 30 秒單飛上限，**飛控會搶在選項 C 前面**，
-> 使用者裁定的「跑完任務再 RTL」實際上不會發生；**關**＝選項 C 照裁定生效，
-> 但代理自己掛掉時就沒有任何人了。
+**裁定（2026-09-01 使用者，uav-system issues/039）**：`FS_GCS_ENABLE = 1`、
+`FS_GCS_TIMEOUT = 45`。飛控那層的角色是**代理的後備**——只在代理沒有動手時
+才出手。不變式：
+
+```
+FS_GCS_TIMEOUT (45s)  >  LINK_LOSS_MAX_SOLO_S (30s)  >  LINK_ACTION_S (10s)
+```
+
+> **逾時只要大於 `LINK_ACTION_S` 是不夠的。** 代理在第 10 秒只是**開始判斷**，
+> `FLYING_MISSION` 那一格會續飛到單飛滿 30 秒才動手。逾時設 15 秒的話飛控
+> 仍然會在續飛中途搶先，「跑完任務再 RTL」照樣不會發生。要比的是 30 不是 10。
+
+代理**開機時讀一次**這兩個參數自檢（`request_fs_gcs`／`_check_fs_gcs`），
+不成立就大聲說，**而且「讀不到」與「讀到了但不合」分開報**——「不知道飛控
+怎麼設定」和「知道它設錯了」處置完全不同。**一次就好不週期重讀**：參數不會
+自己變，會變是因為有人去改，那種情況下重啟一次代理不算苛求。
+
+> **這組數字的代價**：代理自己掛掉（Pi 死了、飛控還活著）時，**沒有任何人管
+> 到第 45 秒**——出廠的 5 秒只要 5 秒就有人接手。這是在賭「代理活著」的機率
+> 高於「任務被無謂打斷」的成本；5G 抖動在本場域是常態、Pi 掛掉罕見，所以
+> 合理，但它是一個賭。**因此主迴圈那條 catch-all（「這個迴圈不准死」）的
+> 重要性又高了一級**：它死掉的代價從「失聯處置不會發生」變成「失聯處置不會
+> 發生，而且飛控要 45 秒後才接手」。
 >
-> **裁定前不要動這些參數，也不要在代理裡補 `heartbeat_send`**——那會讓機上
-> 多一個心跳源，等於在沒有裁定的情況下把 `FS_GCS` 悄悄關掉。真機覆核時
-> 一併讀 `FS_GCS_ENABLE`、`FS_GCS_TIMEOUT`（決定它搶先多久）、`SYSID_MYGCS`。
+> **不要在代理裡補 `heartbeat_send`**——那會讓機上多一個心跳源，等於把
+> `FS_GCS` 這條後備悄悄關掉。45 這個數字與 `FS_GCS_TIMEOUT` 的值域上限
+> 尚未實機覆核。
 
 ### 處置行為
 
@@ -195,6 +213,7 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/driver-parity.py` | 搬家的等價驗收：兩份實作同時載入逐鍵比對（B4-d 核心） |
 | `tools/derived-fields.py` | 從 MAVLink 餵進去，看 `derived` 送出什麼 |
 | `tools/udp-link.py` | 代理對 UDP 端點（SITL）的連線路徑 |
+| `tools/fs-gcs-check.py` | 飛控 GCS failsafe 的開機自檢（不變式與三種結論） |
 | `tools/backfill-flow.py` | 緩衝與補傳的邏輯（HTTP 用假的） |
 | `tools/backfill-live.py` | 補傳端到端：真代理 → 跑著的地面站 → 真入庫 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
