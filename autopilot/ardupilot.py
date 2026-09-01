@@ -10,7 +10,15 @@ from .driver import Limit, MessageEquivalence
 
 NAME = "ardupilot"
 AUTOPILOT_RAW = 3                   # MAV_AUTOPILOT_ARDUPILOTMEGA
-GCS_SYSID = 254                     # 與 mav.GCS_SYSID 一致
+#: **這裡原本有第三份 `GCS_SYSID = 254`，2026-09-01 刪除。** 它定義了卻從來
+#: 沒有被用到，而且**已經漂移**：`mav.py` 與 `capabilities.py` 在 08-25 一起
+#: 改成 255，這份沒跟上。command 服務開機時會比對那兩處不一致就拒絕啟動，
+#: 但那個檢查只認得兩處——**漂掉的正好是它沒看的第三處**。
+#:
+#: 修法不是把它同步、也不是把檢查擴成三處，是**刪掉**：GCS sysid 是我方的
+#: 身分，不是廠牌方言，本來就不該住在驅動裡。少一份就少一個會漂的地方，
+#: 而多一道檢查只是讓漂移變得看得見而已。（機端 session 2026-09-01 移植
+#: 驅動時發現，照「搬家不是改寫」原封留著並回報——那個判斷是對的。）
 
 # DO_SET_MODE 的 **param2 直接是模式號**，沒有 sub。權威來源：
 # reference/ardupilot/copter-mode.h。**gap-analysis 列為 critical**——送錯數字
@@ -185,6 +193,19 @@ class ArduPilotDriver:
     # ── 值域與能力 ──────────────────────────────────────────────────
     def limits(self) -> dict[str, Limit]:
         return {"takeoff_alt_m": Limit(confidence="unverified")}
+
+    def gcs_failsafe_params(self) -> dict[str, str]:
+        """地面站失聯 failsafe 的參數名（issues/033 §1.3，2026-09-01 裁定）。
+
+        **這是真的方言**：同一件事兩家的參數名與語意都不同，而且它是飛安設定
+        ——`FS_GCS_ENABLE` 必須開、`FS_GCS_TIMEOUT` 必須大於代理的
+        `LINK_LOSS_MAX_SOLO_S`（30s），否則飛控會搶在代理的分狀態處置之前
+        動作，039 選項 C 的每一格都不會發生。
+
+        **值不在這裡**：這裡只回參數叫什麼名字。值是逐台機的事實，要讀回來
+        （由代理讀——它就在飛控旁邊，而且手上有自己的門檻值可以比對）。
+        """
+        return {"enable": "FS_GCS_ENABLE", "timeout_s": "FS_GCS_TIMEOUT"}
 
     def capabilities(self, ctx: dict | None = None):
         """015 驗收進行中：**逐鍵開**，不整組開。只有實際驗過的鍵才是 ok。"""

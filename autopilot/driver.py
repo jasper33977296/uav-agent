@@ -129,6 +129,13 @@ class AutopilotDriver(Protocol):
     def adjust_outgoing(self, msg: Any) -> Any:
         """把要送出的訊息改成該廠牌認得的形式。限制同 `adjust_incoming`。"""
 
+    def gcs_failsafe_params(self) -> dict[str, str]:
+        """地面站失聯 failsafe 的參數名：`{"enable": …, "timeout_s": …}`。
+
+        **只回名字不回值**：值是逐台機的事實，要向飛控讀。不知道的廠牌回空表
+        ——沒有意見時不要製造意見（issues/033 §1.3）。
+        """
+
     # ── 解讀層：模式 ────────────────────────────────────────────────
     def decode_mode(self, custom_mode: int) -> str:
         """HEARTBEAT.custom_mode → 顯示用模式名（差異 2）。"""

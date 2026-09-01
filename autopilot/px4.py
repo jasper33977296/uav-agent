@@ -143,5 +143,19 @@ class Px4Driver:
         # B3 一致性測試實測後才會升成 sitl。
         return {"takeoff_alt_m": Limit(confidence="unverified")}
 
+    def gcs_failsafe_params(self) -> dict[str, str]:
+        """地面站失聯 failsafe 的參數名（issues/033 §1.3）。
+
+        PX4 的對應是 data link loss：`NAV_DLL_ACT`（做什麼）與 `COM_DL_LOSS_T`
+        （多久算失聯）。**與 ArduPilot 不只是改名**——ArduPilot 的
+        `FS_GCS_ENABLE` 是開關，PX4 的 `NAV_DLL_ACT` 是行為列舉，所以
+        「enable」在 PX4 上其實是「動作不等於 0」。呼叫端要照這個語意讀。
+
+        ⚠ **未在真的 PX4 上覆核過**（本專案的實機是 ArduPilot 4.7）。
+        照這裡的名字讀不到就是讀不到，**不要當成「參數沒設」**——那是
+        「我們可能寫錯名字」與「機端沒有這個設定」兩件事，分不出來就不要猜。
+        """
+        return {"enable": "NAV_DLL_ACT", "timeout_s": "COM_DL_LOSS_T"}
+
     def capabilities(self, ctx: dict | None = None):
         return {k: "ok" for k in CAP_KEYS}, {}

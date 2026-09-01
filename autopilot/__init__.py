@@ -96,6 +96,12 @@ class UnknownDriver:
     def limits(self):
         return {}
 
+    def gcs_failsafe_params(self):
+        # 不知道的廠牌**沒有意見**：回空表，呼叫端據此顯示「不知道這台機的
+        # 失聯設定」，而不是拿別家的參數名去問（問了也只會石沉大海，然後被
+        # 誤讀成「讀不到＝沒設定」）
+        return {}
+
     def capabilities(self, ctx=None):
         r = "非 MAVLink 或未知自駕儀，不支援指令"
         return {k: "unsupported" for k in CAP_KEYS}, {k: r for k in CAP_KEYS}

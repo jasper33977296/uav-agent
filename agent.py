@@ -440,36 +440,46 @@ class Agent:
             log.warning("請求板子身分失敗：%s", e)
             self.caps_requested = False      # 失敗就讓下一拍再試
 
-    #: 飛控那層 GCS failsafe 的參數名。**這是 ArduPilot 的方言**，照理說該住在
-    #: `autopilot/ardupilot.py` 裡——但那四支檔案與上游逐字相同是刻意維持的
-    #: 性質（見 `autopilot/_provenance.py`），在複製品裡加方法會讓 `diff -r`
-    #: 再也回答不了「有沒有漂移」。**要加就加在上游**，已回報；在那之前放這裡，
-    #: 並且只對 ArduPilot 發問（PX4 的對應機制是 NAV_DLL_* 系列，不是這兩個）
-    FS_GCS_PARAMS = ("FS_GCS_ENABLE", "FS_GCS_TIMEOUT")
     #: 沒回應就再問一次的間隔，以及徹底放棄的時限。**不是週期重讀**：
     #: 拿到答案或用完次數之後就永遠停手
     FS_GCS_RETRY_S = 10.0
     FS_GCS_GIVEUP_S = 25.0
 
+    def _fs_gcs_names(self):
+        """這台機的失聯 failsafe 參數叫什麼名字——**向驅動要，不要寫死**。
+
+        同一件事兩家的名字與語意都不同：ArduPilot 是
+        `FS_GCS_ENABLE`（開關）／`FS_GCS_TIMEOUT`，PX4 是
+        `NAV_DLL_ACT`（**行為列舉，不是開關**）／`COM_DL_LOSS_T`。所以
+        「enable」在 PX4 上的意思是「動作不等於 0」。
+
+        未知廠牌回空表＝**沒有意見**。拿別家的參數名去問，問了只會石沉大海，
+        然後被誤讀成「讀不到＝沒設定」。
+
+        （這份名單一度寫死在本檔，因為當時把它加進驅動會破壞
+        `autopilot/` 與上游的逐字相同。上游 `c585825` 加了 `gcs_failsafe_params()`
+        之後就改成向驅動要——寫死的那份也就跟著刪掉，不留第二個會漂的地方。）
+        """
+        return get_driver(self.mon.state.get("autopilot_raw")
+                          ).gcs_failsafe_params() or {}
+
     def request_fs_gcs(self, now):
-        """開機時問一次飛控的 GCS failsafe 設定（039，2026-09-01 裁定）。
+        """開機時問一次飛控的失聯 failsafe 設定（039，2026-09-01 裁定）。
 
         **為什麼現在值得問，而 2026-08-31 不值得**：那時候讀了也不會據此做
         任何事，只為了印一行話對 57600 多送一輪請求不划算。現在有裁定值，
         這個檢查會據以做事——不變式不成立就大聲說。
-
-        只對 ArduPilot 發問：`FS_GCS_*` 是它的參數名，對 PX4 送出去只會石沉
-        大海，然後我們把「這台機沒有這兩個參數」誤讀成「讀不到」。
         """
         s = self.mon.state
         tgt = s.get("sysid")
         if tgt is None or self.fs_gcs_said:
             return
-        if s.get("autopilot_raw") != 3:          # MAV_AUTOPILOT_ARDUPILOTMEGA
-            return
+        names = list(self._fs_gcs_names().values())
+        if not names:
+            return                               # 驅動沒有意見，不要製造意見
         got = s.get("params") or {}
-        if all(k in got for k in self.FS_GCS_PARAMS):
-            return                               # 兩個都到了，不必再問
+        if all(k in got for k in names):
+            return                               # 都到了，不必再問
         if self.fs_gcs_asked >= 2:
             return                               # 問過兩輪就不再開口
         if self.fs_gcs_asked and now - self.fs_gcs_asked_at < self.FS_GCS_RETRY_S:
@@ -477,7 +487,7 @@ class Agent:
         self.fs_gcs_asked += 1
         self.fs_gcs_asked_at = now
         try:
-            for name in self.FS_GCS_PARAMS:
+            for name in names:
                 if name in got:
                     continue
                 # 送三次：57600 上單包丟失是真實風險，而這是一次性請求
@@ -485,8 +495,8 @@ class Agent:
                     self.serial.mav.param_request_read_send(
                         tgt, 1, name.encode("ascii"), -1)
                     time.sleep(0.05)
-            log.info("已請求飛控 GCS failsafe 設定（第 %d 次）：%s",
-                     self.fs_gcs_asked, "、".join(self.FS_GCS_PARAMS))
+            log.info("已請求飛控失聯 failsafe 設定（第 %d 次）：%s",
+                     self.fs_gcs_asked, "、".join(names))
         except Exception as e:
             log.warning("請求 GCS failsafe 參數失敗：%s", e)
             self.fs_gcs_asked -= 1               # 沒送出去就不算問過
@@ -512,61 +522,67 @@ class Agent:
         s = self.mon.state
         if s.get("sysid") is None:
             return
-        raw = s.get("autopilot_raw")
-        if raw is not None and raw != 3:
+        names = self._fs_gcs_names()
+        if not names:
+            if s.get("autopilot_raw") is None:
+                return                            # 還沒收到心跳，廠牌未知
             self.fs_gcs_said = True
-            log.info("GCS failsafe 自檢跳過：這台不是 ArduPilot（autopilot=%s）"
-                     "——FS_GCS_* 是 ArduPilot 的參數名，"
-                     "其他廠牌的對應機制不同，本檢查對它沒有意義", raw)
+            log.info("失聯 failsafe 自檢跳過：驅動對這個廠牌"
+                     "（autopilot=%s）沒有意見——**沒有意見時不要製造意見**，"
+                     "拿別家的參數名去問只會被誤讀成「讀不到＝沒設定」",
+                     s.get("autopilot_raw"))
             return
+        n_en, n_to = names.get("enable"), names.get("timeout_s")
         got = s.get("params") or {}
-        have = {k: got[k] for k in self.FS_GCS_PARAMS if k in got}
-        if len(have) < len(self.FS_GCS_PARAMS):
+        missing = [k for k in (n_en, n_to) if k and k not in got]
+        if missing:
             if not self.fs_gcs_asked_at or now - self.fs_gcs_asked_at < self.FS_GCS_GIVEUP_S:
                 return                            # 還在等
             self.fs_gcs_said = True
-            missing = [k for k in self.FS_GCS_PARAMS if k not in got]
-            # **讀不到 ≠ 設錯了。** 可能是參數不存在（舊韌體沒有
-            # FS_GCS_TIMEOUT）、也可能是請求或回應在 57600 上丟了——
-            # 兩者我們分不出來，所以不要假裝分得出來
-            log.warning("⚠ **讀不到飛控的 GCS failsafe 設定**（缺 %s，已問 %d 次）"
-                        "——不是「設錯了」而是「不知道它怎麼設」。可能是舊韌體"
-                        "沒有這個參數，也可能是請求或回應掉了。"
-                        "無法確認 FS_GCS_TIMEOUT > %.0fs 這條不變式是否成立",
+            # **讀不到 ≠ 設錯了。** 三個可能：這個韌體沒有這個參數、我們的
+            # 參數名寫錯（PX4 那組上游標明未在真機覆核過）、或請求／回應在
+            # 57600 上掉了。**三者我們分不出來**，所以不要假裝分得出來
+            log.warning("⚠ **讀不到飛控的失聯 failsafe 設定**（缺 %s，已問 %d 次）"
+                        "——不是「設錯了」而是「不知道它怎麼設」。可能這個韌體"
+                        "沒有這個參數、可能我們的參數名不對、也可能請求或回應"
+                        "掉了。無法確認 %s > %.0fs 這條不變式是否成立",
                         "、".join(missing), self.fs_gcs_asked,
-                        self.a.link_loss_max_solo_s)
+                        n_to, self.a.link_loss_max_solo_s)
             self.mon.events.append(
-                (now, "fs_gcs", f"讀不到 GCS failsafe 設定（缺 {'、'.join(missing)}）"))
+                (now, "fs_gcs", f"讀不到失聯 failsafe 設定（缺 {'、'.join(missing)}）"))
             return
 
         self.fs_gcs_said = True
-        enable, timeout = have["FS_GCS_ENABLE"], have["FS_GCS_TIMEOUT"]
+        enable, timeout = got[n_en], got[n_to]
         solo, act = self.a.link_loss_max_solo_s, self.a.link_action_s
         problems = []
         if not enable:
-            # 裁定是「開」。關著的話飛控那層後備不存在——代理掛掉就沒有任何人
+            # 裁定是「開」。關著的話飛控那層後備不存在——代理掛掉就沒有任何人。
+            # **「開」的判準是「不等於 0」而不是「等於 1」**：ArduPilot 的
+            # FS_GCS_ENABLE 是開關，PX4 的 NAV_DLL_ACT 是行為列舉，
+            # 兩家共通的只有「0＝不動作」
             problems.append(
-                f"FS_GCS_ENABLE={enable:g}＝**關**：飛控那層後備不存在，"
+                f"{n_en}={enable:g}＝**不動作**：飛控那層後備不存在，"
                 "代理自己掛掉時沒有任何人接手")
         if timeout <= solo:
             problems.append(
-                f"FS_GCS_TIMEOUT={timeout:g}s **不大於**單飛上限 {solo:.0f}s："
+                f"{n_to}={timeout:g}s **不大於**單飛上限 {solo:.0f}s："
                 "飛控會在續飛中途搶先動作，「失聯後跑完任務再 RTL」那一格"
                 "永遠不會發生（選項 C 退化）")
         if solo <= act:
             problems.append(
                 f"單飛上限 {solo:.0f}s 不大於處置起算 {act:.0f}s：選項 C 退化成 A")
         if problems:
-            log.error("⚠⚠ **GCS failsafe 不變式不成立**"
-                      "（要求 FS_GCS_TIMEOUT > %.0fs > %.0fs）：%s",
-                      solo, act, "；".join(problems))
+            log.error("⚠⚠ **失聯 failsafe 不變式不成立**"
+                      "（要求 %s > %.0fs > %.0fs）：%s",
+                      n_to, solo, act, "；".join(problems))
             self.mon.events.append(
-                (now, "fs_gcs", "⚠ GCS failsafe 設定與失聯處置衝突："
+                (now, "fs_gcs", "⚠ 失聯 failsafe 設定與失聯處置衝突："
                                 + "；".join(problems)))
             return
-        log.info("GCS failsafe 自檢通過：FS_GCS_ENABLE=%g、FS_GCS_TIMEOUT=%gs "
-                 "> 單飛上限 %.0fs > 處置起算 %.0fs——飛控那層是後備，"
-                 "只在代理沒動手時才出手", enable, timeout, solo, act)
+        log.info("失聯 failsafe 自檢通過：%s=%g、%s=%gs > 單飛上限 %.0fs "
+                 "> 處置起算 %.0fs——飛控那層是後備，只在代理沒動手時才出手",
+                 n_en, enable, n_to, timeout, solo, act)
 
     def request_streams_once(self):
         """看到飛控就把串流請求送一次。

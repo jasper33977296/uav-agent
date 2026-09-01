@@ -85,6 +85,11 @@ agent_modes = {
                      raw, vals)
     for raw, vals in ((3, MODES_AP), (12, MODES_PX4), (None, MODES_AP))}
 agent_copter = dict(agent_mod.COPTER_MODE)
+# **真的呼叫，不是 hasattr**：旗標會漏，方法一樣會漏而且更難發現——
+# `hasattr` 過得了，要呼叫下去才知道（上游 test-driver-flags.py 同一個理由，
+# 起因是 2026-08-26 `no_coord_frames` 漏了 PX4 直接 AttributeError）
+agent_fsparams = {raw: agent_get_driver(raw).gcs_failsafe_params()
+                  for raw in (3, 12, None)}
 agent_ekf_types = agent_norm.EKF_MSG_TYPES
 agent_ekf_bits = agent_norm.EKF_READY_BITS
 
@@ -113,6 +118,8 @@ def _gs_readiness(prearm, ekf, fix, mav_state, sensors, raw):
 
 
 gs_ready = sweep_readiness(_gs_readiness)
+gs_fsparams = {raw: gs_get_driver(raw).gcs_failsafe_params()
+               for raw in (3, 12, None)}
 gs_modes = {
     raw: sweep_modes(lambda r, v: gs_get_driver(r).decode_mode(v),
                      lambda r, v: gs_get_driver(r).decode_verb(v),
@@ -165,6 +172,21 @@ drift = [(k, v, gs_get_driver(3).decode_mode(k))
          for k, v in agent_copter.items()
          if gs_get_driver(3).decode_mode(k) != v]
 chk("agent.COPTER_MODE 與 ArduPilot 驅動逐鍵一致", not drift, drift[:3])
+
+print("\n── 失聯 failsafe 參數名：代理實際依賴的那個方法 ────────")
+# 代理的開機自檢向驅動要參數名（`Agent._fs_gcs_names`），所以這個方法的
+# 回傳值是**執行期契約**，不只是資料
+chk("三個驅動的 gcs_failsafe_params() 兩邊相同",
+    agent_fsparams == gs_fsparams,
+    f"機端={agent_fsparams} 地面站={gs_fsparams}")
+chk("ArduPilot 與 PX4 的名字**不同**（是方言不是改名）",
+    agent_fsparams[3] != agent_fsparams[12],
+    (agent_fsparams[3], agent_fsparams[12]))
+chk("未知廠牌回空表（沒有意見就不要製造意見）",
+    agent_fsparams[None] == {}, agent_fsparams[None])
+chk("兩家都給得出 enable 與 timeout_s 兩個鍵",
+    all(set(agent_fsparams[r]) == {"enable", "timeout_s"} for r in (3, 12)),
+    {r: sorted(agent_fsparams[r]) for r in (3, 12)})
 
 print("\n── 訊息層等價的推導 ───────────────────────────────────")
 chk("EKF 訊息型別兩邊相同（都是從 MESSAGE_ADJUSTMENTS 推導）",

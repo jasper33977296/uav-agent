@@ -87,7 +87,10 @@ chk("**15s 不因為「大於處置起算 10s」就放行**（舊條件太弱的
 
 g = Fake(params={"FS_GCS_ENABLE": 0.0, "FS_GCS_TIMEOUT": 45.0})
 said, evs = run(g)
-chk("FS_GCS_ENABLE=0 → 報「後備不存在」", said and evs and "關" in evs[0], evs)
+# 措辭是「不動作」而不是「關」：ArduPilot 的 FS_GCS_ENABLE 是開關，
+# PX4 的 NAV_DLL_ACT 是行為列舉，**兩家共通的只有「0＝不動作」**
+chk("FS_GCS_ENABLE=0 → 報「後備不存在」",
+    said and evs and "不動作" in evs[0] and "FS_GCS_ENABLE" in evs[0], evs)
 chk("而且說得出後果（代理掛掉沒人接手）",
     evs and "沒有任何人接手" in evs[0], evs[:1])
 
@@ -107,19 +110,50 @@ chk("說的是「讀不到」而不是「設錯了」",
     evs and "讀不到" in evs[0] and "衝突" not in evs[0], evs)
 chk("指名缺的是哪一個", evs and "FS_GCS_TIMEOUT" in evs[0], evs)
 
-print("\n── 不是 ArduPilot 就不問 ──────────────────────────────")
-g = Fake(raw=12, params={})                      # PX4
-said, evs = run(g)
-chk("PX4 → 跳過且不報警（FS_GCS_* 是 ArduPilot 的參數名）",
-    said and not evs, evs)
-g = Fake(raw=12)
-g.fs_gcs_said = False
+print("\n── 參數名向驅動要，不是寫死 ───────────────────────────")
+# 上游 c585825 把 `gcs_failsafe_params()` 加進三個驅動之後，代理這邊寫死的
+# 那份就刪掉了——不留第二個會漂的地方
+g = Fake(raw=12)                                 # PX4
+g.fs_gcs_asked = 0
+g.fs_gcs_asked_at = 0.0
 g.request_fs_gcs(1000.0)
-chk("**也不會對 PX4 送出請求**（送了只會石沉大海，然後誤讀成讀不到）",
+chk("PX4 問的是它自己的參數名（NAV_DLL_ACT／COM_DL_LOSS_T）",
+    set(n.decode() if isinstance(n, bytes) else n for n in g.sent)
+    == {"NAV_DLL_ACT", "COM_DL_LOSS_T"}, g.sent)
+g2 = Fake(raw=3)
+g2.fs_gcs_asked = 0
+g2.fs_gcs_asked_at = 0.0
+g2.request_fs_gcs(1000.0)
+chk("**對照**：ArduPilot 問的是 FS_GCS_*",
+    set(n.decode() if isinstance(n, bytes) else n for n in g2.sent)
+    == {"FS_GCS_ENABLE", "FS_GCS_TIMEOUT"}, g2.sent)
+# PX4 的 NAV_DLL_ACT 是**行為列舉不是開關**，共通的只有「0＝不動作」
+g3 = Fake(raw=12, params={"NAV_DLL_ACT": 0.0, "COM_DL_LOSS_T": 45.0})
+said, evs = run(g3)
+chk("PX4：動作＝0 → 報「後備不存在」，訊息用它自己的參數名",
+    said and evs and "NAV_DLL_ACT" in evs[0], evs)
+g4 = Fake(raw=12, params={"NAV_DLL_ACT": 2.0, "COM_DL_LOSS_T": 45.0})
+said, evs = run(g4)
+chk("**反向驗證**：非 0 的行為列舉算「有動作」，不是只認 1",
+    said and not evs, evs)
+
+print("\n── 未知廠牌：沒有意見就不要製造意見 ───────────────────")
+g = Fake(raw=99, params={})                      # 驅動不認得
+said, evs = run(g)
+chk("未知廠牌 → 跳過且不報警", said and not evs, evs)
+g = Fake(raw=99)
+g.fs_gcs_asked = 0
+g.fs_gcs_asked_at = 0.0
+g.request_fs_gcs(1000.0)
+chk("**也不送請求**（拿別家的參數名去問，只會被誤讀成「讀不到＝沒設定」）",
     not g.sent, g.sent)
+g = Fake(raw=None, params={})                    # 還沒收到心跳
+said, evs = run(g)
+chk("廠牌還不知道時**不下結論**（那是「還沒到」不是「沒有意見」）",
+    not said and not evs, (said, evs))
 
 print("\n── 一次就好：不週期重讀 ───────────────────────────────")
-g = Fake(params=None)
+g = Fake(raw=3, params=None)
 g.fs_gcs_asked = 0
 g.fs_gcs_asked_at = 0.0
 g.request_fs_gcs(1000.0)
