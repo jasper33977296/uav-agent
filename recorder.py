@@ -43,7 +43,7 @@ class Recorder:
     每則訊息前綴 8-byte big-endian 微秒時間戳。"""
 
     def __init__(self, path: str, max_mb: int = 512, keep: int = 20,
-                 armed_only: bool = True, is_uploaded=None):
+                 armed_only: bool = True, is_uploaded=None, on_discard=None):
         self.dir = path
         self.max_bytes = max_mb * 1024 * 1024
         self.keep = keep
@@ -52,6 +52,9 @@ class Recorder:
         #: 說出口**，不用來延後刪除——滾動的職責是保護那張卡，而卡滿了會讓
         #: 整台機出問題。但**刪掉一份從來沒有回傳成功的紀錄，一定要有人聽見**
         self.is_uploaded = is_uploaded
+        #: 刪掉一份沒回傳成功的檔案時呼叫（uploader.note_pruned）。
+        #: **log 不夠**：journald 會被清掉，而這是一個不可挽回的損失
+        self.on_discard = on_discard
         self._was_armed = False
         self.f = None
         self.name = None
@@ -170,10 +173,16 @@ class Recorder:
                 # 沒有名字的 inode——**看起來一切正常，錄的東西全部消失**
                 if old == self.name:
                     continue
+                path = os.path.join(self.dir, old)
                 if self.is_uploaded is not None and not self.is_uploaded(old):
                     log.warning("⚠ 機上錄製滾動刪除 %s，而它**從來沒有回傳"
                                 "成功**——這一趟的機上紀錄到此為止", old)
-                os.remove(os.path.join(self.dir, old))
+                    if self.on_discard is not None:
+                        try:
+                            self.on_discard(old, os.path.getsize(path))
+                        except Exception:
+                            log.exception("通報遺失失敗（不影響滾動）")
+                os.remove(path)
                 log.info("機上錄製滾動：刪除 %s", old)
         except Exception:
             log.exception("錄製滾動失敗（不影響轉發）")

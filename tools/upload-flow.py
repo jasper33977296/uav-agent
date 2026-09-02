@@ -59,9 +59,18 @@ class GS(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    lost = []           # 收到的「未回傳即被刪除」通報
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
+        if self.path.endswith("/abandoned"):
+            if GS.fail_next:
+                code, obj = GS.fail_next
+                GS.fail_next = None
+                return self._json(code, {"detail": obj})
+            GS.lost.append(body["name"])
+            return self._json(200, {"ok": True, "noted": True})
         name, sha = body["name"], body["sha256"]
         for k, v in GS.store.items():
             if v["sha256"] == sha:
@@ -222,6 +231,40 @@ r.feed(FRAME, armed=True)
 recorder.log.warning = orig
 chk("**刪掉一份從來沒有回傳成功的紀錄時，有人聽得見**",
     any("從來沒有回傳" in m for m in said), said)
+
+print("\n── 10. 送上去的狀態說得出「為什麼沒在傳」──────────────")
+state["armed"] = True
+write_file("20260902-140000.tlog", 120_000)
+u7 = make()
+u7._pass()
+st = u7.state()
+chk("份數與檔名都有（清單才列得出「只在機上」那幾列）",
+    st["pending"] == 1 and st["pending_files"] == ["20260902-140000.tlog"], st)
+chk("**blocked 帶著理由**（只送份數的話，「沒東西要傳」與「傳不動」同形）",
+    st["blocked"] == "armed（飛行中不傳）", st["blocked"])
+state["armed"] = False
+u7._pass()
+chk("傳完之後 blocked 是 None、份數歸零", u7.state()["blocked"] is None
+    and u7.state()["pending"] == 0, u7.state())
+u8 = make()
+chk("**剛啟動時不是「已同步」**（還沒判定過任何事）",
+    u8.state()["blocked"] == "尚未判定", u8.state()["blocked"])
+
+print("\n── 11. 未回傳即被刪除：報上去，而且報不成不會忘記 ──────")
+GS.lost.clear()
+u9 = make()
+GS.fail_next = (503, "地面站掛了")
+u9.note_pruned("20260101-000000.tlog", 4_000_000)
+u9._pass()
+chk("**報不成就留著**（那是一個不可挽回的損失，晚幾分鐘知道無妨）",
+    not GS.lost and len(u9._lost) == 1, (GS.lost, u9._lost))
+u10 = make()
+chk("而且重開之後還記得（進了狀態檔）", len(u10._lost) == 1, u10._lost)
+u10._pass()
+chk("地面站回來就報成功了", GS.lost == ["20260101-000000.tlog"], GS.lost)
+chk("報過就不再報", not u10._lost, u10._lost)
+chk("計數也對", u10.state()["abandoned"] == 0 and u9.abandoned == 1,
+    (u9.abandoned, u10.state()["abandoned"]))
 
 print("\n" + ("全部通過" if ok else "**有未通過項目**"))
 srv.shutdown()

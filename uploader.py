@@ -84,16 +84,25 @@ class Uploader(threading.Thread):
         self._stop = threading.Event()
         self._done = {}                     # 本地快取：檔名 → {bytes, sha256, ...}
         self._state_path = os.path.join(directory, ".uploaded.json")
-        self._blocked_since = None          # 上一次不能傳的理由（只在變化時記錄）
+        #: 上一次不能傳的理由（只在變化時記錄）。**初始不是 None**——
+        #: None 的意思是「可以傳而且沒在傳」＝已同步，而剛啟動時我們還沒
+        #: 判定過任何事。把「還沒看」說成「已同步」是這一頁最容易犯的謊
+        self._blocked_since = "尚未判定"
         self._next_try = 0.0                # 單調刻度：失敗後不要每 10 秒重試
         self._ground_since = None           # 單調刻度：從什麼時候開始在地面
         self.current = None                 # 正在傳的檔名
         self.progress = None                # 0..1
-        #: 關好了、還沒回傳成功的份數。**快取值**：`pending()` 要 listdir，
+        #: 關好了、還沒回傳成功的檔案。**快取值**：`pending()` 要 listdir，
         #: 而狀態快照是每拍送的（最高 5 Hz）——每拍掃一次目錄只是浪費。
         #: 由本執行緒每輪更新，**而且在守門之前更新**：這個數字最有用的時候
         #: 正是傳不動的時候
         self.backlog = 0
+        self.backlog_files: list[str] = []
+        #: 滾動刪掉時還沒回傳成功的檔案，等著報給地面站。**要報，因為那是
+        #: 永久的損失**：機上的滾動優先於保住紀錄（卡滿了會讓整台機出問題），
+        #: 但沒有人聽見的話，我們事後會以為那一趟的紀錄還在機上。
+        #: 存進狀態檔＝報成功之前不會因為重開而消失
+        self._lost: list[dict] = []
         self.files = 0
         self.bytes = 0
         self.failed = 0
@@ -112,8 +121,33 @@ class Uploader(threading.Thread):
             return name in self._done
         return self._done.get(name, {}).get("bytes") == size
 
-    def note_pruned(self, name: str) -> None:
+    def note_pruned(self, name: str, size: int = 0) -> None:
+        """錄製器滾動刪掉了一份**從來沒有回傳成功**的檔案。
+
+        **這要變成地面站的一則事件，不是機上的一行 log**：journald 會被清掉，
+        而事件流是留痕的地方。這裡只排隊，送在 `_pass()`（要鏈路通）。
+        """
         self.abandoned += 1
+        self._lost.append({"name": name, "bytes": size, "at": time.time()})
+        self._save()
+        log.warning("⚠ %s 已被滾動刪除且**從未回傳成功**——已排隊通報地面站", name)
+
+    def state(self) -> dict:
+        """送上意圖通道的那一份（協定 §4.2 的頂層欄位）。
+
+        **只讀快取，不碰檔案系統**——這個函式在主迴圈的每一拍上跑。
+
+        `blocked` 是「為什麼沒在傳」那句話的來源：**「沒有東西要傳」與
+        「傳不動」都是「沒在傳」，但一個是完成、一個是故障**。只送份數的話，
+        畫面分不出這兩件事，而它們要做的處置完全相反。
+        """
+        return {"pending": self.backlog,
+                "pending_files": self.backlog_files[:20],
+                "blocked": self._blocked_since,
+                "current": self.current,
+                "progress": (round(self.progress, 3)
+                             if self.progress is not None else None),
+                "abandoned": self.abandoned}
 
     def pending(self) -> list[str]:
         """關好了、還沒回傳成功的檔案，舊的排前面。"""
@@ -164,11 +198,13 @@ class Uploader(threading.Thread):
                 log.exception("錄製回傳這一輪出錯，續跑")
 
     def _pass(self):
-        self.backlog = len(self.pending())
+        self.backlog_files = self.pending()
+        self.backlog = len(self.backlog_files)
         ok, why = self._gate()
         if not ok:
             self.current = self.progress = None
             return
+        self._report_lost()
         if time.monotonic() < self._next_try:
             return
         for name in self.pending():
@@ -180,6 +216,39 @@ class Uploader(threading.Thread):
                 self._next_try = time.monotonic() + self.retry_s
                 return
         self.current = self.progress = None
+
+    def _report_lost(self):
+        """把「滾動刪掉了一份沒回傳成功的檔案」報上去。
+
+        **報不成就留著下次再報**：這件事沒有時效——它描述的是一個已經發生、
+        而且不可挽回的損失，晚幾分鐘知道不影響它的意義。
+        """
+        while self._lost:
+            it = self._lost[0]
+            body = json.dumps({"board_uid": self.board_uid_fn(),
+                               "name": it["name"], "bytes": it["bytes"],
+                               "at": it["at"]}).encode()
+            req = urllib.request.Request(
+                self.base + "/abandoned", data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S):
+                    pass
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    # 400/404＝地面站不接受這一則（舊版沒有這個端點、
+                    # 或不認得這塊板子）。**重試不會變好**，丟掉並說一次
+                    log.warning("通報 %s 遺失被拒（HTTP %d）——放棄這一則",
+                                it["name"], e.code)
+                    self._lost.pop(0)
+                    self._save()
+                    continue
+                return
+            except Exception:
+                return              # 鏈路問題，下一輪再說
+            log.info("已通報地面站：%s 未回傳即被刪除", it["name"])
+            self._lost.pop(0)
+            self._save()
 
     def _gate(self):
         """可以傳嗎。**理由要說得出來**——不然「沒在傳」與「傳不動」同形。"""
@@ -310,22 +379,30 @@ class Uploader(threading.Thread):
         self._done[name] = {"bytes": size, "sha256": sha, "stored_as": stored,
                             "at": time.time()}
         self._save()
-        self.backlog = max(0, self.backlog - 1)
+        self.backlog_files = [n for n in self.backlog_files if n != name]
+        self.backlog = len(self.backlog_files)
         if already:
             log.info("%s 地面站已經有了（sha 相符）——不重傳", name)
 
     def _load(self):
         try:
             with open(self._state_path) as f:
-                self._done = json.load(f)
+                blob = json.load(f)
         except (OSError, ValueError):
-            self._done = {}
+            blob = {}
+        # 舊格式（v0.6.0）整包就是 done 表。**認得舊格式**，不然升級當下
+        # 已經傳過的檔案會全部重算一次 sha 並重問地面站
+        if "done" in blob or "lost" in blob:
+            self._done = blob.get("done") or {}
+            self._lost = blob.get("lost") or []
+        else:
+            self._done, self._lost = blob, []
 
     def _save(self):
         try:
             tmp = self._state_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(self._done, f)
+                json.dump({"done": self._done, "lost": self._lost}, f)
             os.replace(tmp, self._state_path)     # 原子換檔
         except OSError:
             log.warning("寫不了回傳狀態檔——**不影響正確性**，"

@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.6.0"          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.7.0"          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -704,7 +704,8 @@ class Agent:
         self.recorder = recorder.Recorder(
             self.a.record_dir, max_mb=self.a.record_max_mb,
             keep=self.a.record_keep, armed_only=not self.a.record_disarmed,
-            is_uploaded=self.uploader.is_uploaded if self.uploader else None)
+            is_uploaded=self.uploader.is_uploaded if self.uploader else None,
+            on_discard=self.uploader.note_pruned if self.uploader else None)
         if self.uploader:
             self.uploader.start()
         self.backfill = Backfill(
@@ -1245,12 +1246,14 @@ class Agent:
             # 040 A3：正在換號。**放頂層與 rc_link 同理**——地面站的鏡像讀的是
             # 頂層欄位，放進 derived 會讓畫面永遠看不到它
             "reassigning": self.reassigning,
-            # 014：機上還有幾份錄製沒有回傳成功。**放頂層而不是 derived**——
-            # `derived` 是拿去與地面站自己算的做比對的（026 §9），塞一個
-            # 地面站算不出來的東西進去沒有意義。
-            # **這個數字是「自動回傳」唯一的誠實度量**：它一直不降，代表
-            # 守門一直沒開（還在飛？失聯？），而不是「沒有東西要傳」
-            "record_backlog": self.uploader.backlog if self.uploader else None,
+            # 014：機上錄製的回傳現況。**放頂層而不是 derived**——`derived`
+            # 是拿去與地面站自己算的做比對的（026 §9），塞一個地面站算不出來
+            # 的東西進去沒有意義。
+            #
+            # **只送份數不夠。** 「沒有東西要傳」與「傳不動」都是「沒在傳」，
+            # 但一個是完成、一個是故障，而它們要做的處置完全相反——所以
+            # `blocked` 帶著「為什麼沒在傳」那句話一起上去。
+            "record_upload": self.uploader.state() if self.uploader else None,
             "derived": {
                 "armed": bool(s.get("armed")),
                 "landed": s.get("landed_state"),

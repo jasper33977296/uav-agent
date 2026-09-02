@@ -279,10 +279,26 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 一份**從來沒有回傳成功**的錄製時會大聲警告：安靜地刪，我們就會在事後以為
 那趟飛行的紀錄還在機上。
 
+### 回傳現況會上報（v0.7.0 起）
+
+意圖協定的 `state` 帶一個頂層 `record_upload`：
+
+    {pending, pending_files, blocked, current, progress, abandoned}
+
+**只送份數不夠。** 「沒有東西要傳」與「傳不動」都是「沒在傳」，但一個是完成、
+一個是故障，而處置完全相反——所以 `blocked` 帶著**「為什麼沒在傳」那句話**
+一起上去（`armed（飛行中不傳）`／`落地靜置中（還有 12s）`／`地面站失聯`／
+`尚未判定`）。地面站的 `/captures` 頁就是照這句話寫的。
+
+**滾動刪掉一份從來沒回傳成功的檔案時，會 `POST /api/onboard-captures/abandoned`**
+——那是永久的損失，而只寫進機上的 log 等於沒說（journald 會被清掉）。
+報不成就留著下次再報，存進狀態檔，重開機也不會忘。
+
 設定：`RECORD_UPLOAD`（0＝退回人工 `scp`）、`RECORD_UPLOAD_KBPS`、
 `RECORD_UPLOAD_CHUNK_KB`、`RECORD_UPLOAD_SETTLE_S`。
-地面站那端：`GET /api/onboard-captures`（含**沒傳完的**），
-`GET /api/onboard-captures/{drone_id}/{name}` 下載。
+地面站那端：`GET /api/onboard-captures`（含**沒傳完的**與**已遺失的**）、
+`GET /api/onboard-captures/{drone_id}/{name}` 下載、
+`GET /api/onboard-captures/coverage?session_id=` 兩層覆蓋對照。
 
 ## 自駕儀驅動（026 B4-b，2026-09-01）
 
