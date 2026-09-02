@@ -20,7 +20,11 @@ Environment=MODEM_PORT=/dev/ttyUSB1
 # ── 地面失聯處置（飛安相關）────────────────────────────────
 # LINK_ACTION=none 可停用自動處置，只保留告警
 Environment=LINK_WARN_S=5
-Environment=LINK_ACTION_S=30
+# **不可以等於單飛上限（30）**：處置要等 LINK_ACTION_S 才開始評估，而單飛
+# 時間從失聯那一刻起算——兩者相等時，第一次評估當下單飛時間就已達上限，
+# 「任務中續飛」那條分支永遠走不到，選項 C 安靜地退化成「一律 RTL」。
+# 代理每次啟動都會警告這件事，而它警告了好幾個星期沒有人改。
+Environment=LINK_ACTION_S=10
 Environment=LINK_ACTION=rtl
 # ── 機上錄製與它的自動回傳（uav-system issues/014）──────────────
 # 錄的是「飛控送出的東西」（地面站錄的是「送到地面站的東西」）——
