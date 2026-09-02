@@ -96,7 +96,10 @@ ok &= case("飛手手飛 STABILIZE", "PILOT_CONTROL", "不介入",
            mode="STABILIZE", **AIR)
 ok &= case("飛手切的 LOITER（溯源＝pilot）", "PILOT_CONTROL", "不介入",
            mode="LOITER", _owner="pilot", **AIR)
-ok &= case("溯源不明的 LOITER", "PILOT_CONTROL", "不介入",
+# **溯源不明的 LOITER 現在算 HOLDING**（2026-09-02 使用者裁定：守門要讓
+# 操作員拿得回控制權），**但失聯處置仍然不介入**——那兩件事對「不知道」的
+# 正確反應相反：操作員主動要求時放行，沒有人在看時不自己動手。
+ok &= case("溯源不明的 LOITER（守門放行，但失聯不介入）", "HOLDING", "不介入",
            mode="LOITER", _owner=None, **AIR)
 
 print("\n── 地面與起飛 ─────────────────────────────────────────")

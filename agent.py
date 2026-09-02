@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.7.0"          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.8.0"          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -834,7 +834,22 @@ class Agent:
         req, ts = self.mode_req or (None, 0)
         # 10 秒：模式指令送出到心跳回報新模式之間的正常延遲遠小於此；
         # 放寬到這個量級是為了容忍 57600 上的重送與丟包
-        self.mode_owner = "us" if req == mode and time.time() - ts < 10 else "pilot"
+        fresh = req is not None and time.time() - ts < 10
+        if fresh and req == mode:
+            self.mode_owner = "us"
+        elif fresh:
+            # 我方剛要求了**別的**模式，而它變成這個 → 有人插手，那是飛手
+            self.mode_owner = "pilot"
+        else:
+            # **沒有依據就說沒有依據。** 代理剛啟動、飛行中重連、或飛手在
+            # 我方完全沒動作時切了模式——這三種情況我們都**不知道**是誰。
+            #
+            # 這一格原本直接寫死 `"pilot"`（而 docstring 早就寫著「留 None」）。
+            # 後果：暫停中只要代理重啟一次，那個 LOITER 就被判成飛手的，
+            # `flight_state()` 回 PILOT_CONTROL，而守門表裡那一格是 `set()`
+            # ——**地面站從此一個指令都下不了，直到有人手動切一次模式**。
+            # 2026-09-02 使用者實際被這個擋住。
+            self.mode_owner = None
 
     def _write(self, fd, data):
         try:
@@ -1246,6 +1261,10 @@ class Agent:
             # 040 A3：正在換號。**放頂層與 rc_link 同理**——地面站的鏡像讀的是
             # 頂層欄位，放進 derived 會讓畫面永遠看不到它
             "reassigning": self.reassigning,
+            # **這個 LOITER 是誰造成的**：us／pilot／None＝不知道。
+            # 它決定了守門讓不讓地面站動這台機，所以**它必須看得見**——
+            # 原本它只活在代理的記憶體裡，畫面上只看得到「指令被拒」
+            "mode_owner": self.mode_owner,
             # 014：機上錄製的回傳現況。**放頂層而不是 derived**——`derived`
             # 是拿去與地面站自己算的做比對的（026 §9），塞一個地面站算不出來
             # 的東西進去沒有意義。
@@ -1446,9 +1465,19 @@ class Agent:
             if mode == "AUTO" and s.get("mission_state") != 5:
                 return "FLYING_MISSION"     # 5＝MISSION_STATE_COMPLETE
             return "HOLDING"
-        if mode == "LOITER" and self.mode_owner == "us":
-            return "HOLDING"                # 地面站按的暫停
-        return "PILOT_CONTROL"              # 含溯源不明的 LOITER 與所有手飛模式
+        if mode == "LOITER" and self.mode_owner != "pilot":
+            # **溯源不明的 LOITER 也算 HOLDING**（2026-09-02 使用者裁定：
+            # 「先不知道誰做的沒關係，但起碼無人機狀態我要完全掌控」）。
+            #
+            # 三態的差別在這裡：`"us"`＝我方按的暫停、`None`＝不知道、
+            # `"pilot"`＝**確定**是飛手插手（我方剛要求了別的模式而它變成這個）。
+            # 只有第三種才鎖死——**「不知道」不該與「確定是飛手」同罰**，
+            # 而那正是原本的行為：判不出來就當飛手，然後什麼都不准。
+            #
+            # 手飛模式（STABILIZE／ALT_HOLD／ACRO）不受影響，它們走下面那行
+            # ——那些模式的桿位直接控制姿態，看到它們就確定人在飛。
+            return "HOLDING"
+        return "PILOT_CONTROL"              # 確定是飛手的 LOITER 與所有手飛模式
 
     def _mission_done_by_seq(self):
         """`mission_seq == mission_total` 的替代完成判定（039 複裁 C）。
@@ -1476,6 +1505,13 @@ class Agent:
                     "韌體不回報 mission_state，用的是替代判定）")
         return None
 
+    #: **「操作員主動要求」與「沒有人在看，我自己決定」對「不知道」的正確
+    #: 反應是相反的。** 守門那邊：溯源不明時放行，讓操作員拿得回控制權
+    #: （2026-09-02 使用者裁定）。失聯處置這邊：溯源不明時**不介入**——
+    #: 那正是 `mode_owner` 當初存在的理由，而且它的失敗模式最糟：
+    #: 飛手正用 LOITER 手飛、5G 抖一下，我們就在他手上送 RTL。
+    #:
+    #: 兩者共用 `flight_state()` 的 HOLDING，差別由這裡補上。
     def _loss_verdict(self, state, now):
         """回傳：字串＝立刻 RTL 的理由；False＝這個狀態永不介入；None＝再等一拍。"""
         # 不介入的四類：已經在自己回家／降落、飛手拿著、飛控 failsafe 正在跑、
@@ -1495,6 +1531,19 @@ class Agent:
             # 確認過的中間狀態**（可能已經 hold、可能已經上傳但還沒續飛），
             # 而接下來要下的每一步都需要地面站——它已經不在了
             return f"改航線序列進行中（{self.seq.get('step')}）且地面站失聯"
+        # **只有 LOITER 這一格有歧義。** GUIDED 與跑完的 AUTO 也會回 HOLDING，
+        # 但那兩個模式**人不可能用手飛**（桿位不控制姿態），所以溯源不明在
+        # 那裡不代表任何事——把它們一起擋掉會讓「任務跑完後失聯」變成不介入，
+        # 而那正是最需要 RTL 的一格
+        if (state == "HOLDING" and self.mode_owner is None
+                and self.mon.state.get("mode") == "LOITER"):
+            # **不知道這個 LOITER 是誰造成的 → 不自己動手。** 它可能是我方
+            # 的暫停（那 RTL 是對的），也可能是飛手正拿著遙控器在飛
+            # （那 RTL 是最不該做的事）。分不出來時，代價不對稱：
+            # 少做一次最多是飛機停在空中等人，多做一次是從飛手手上搶飛機。
+            log.warning("失聯處置：LOITER 但溯源不明 → 不介入"
+                        "（可能是飛手在飛；飛控自己的 failsafe 仍是後備）")
+            return False
         if state in ("HOLDING", "TAKING_OFF"):
             # 沒有任務可以跑完，停在空中等一個回不來的確認毫無意義
             return "無任務可續飛（暫停中、爬升中或任務已結束）"
