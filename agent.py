@@ -85,7 +85,13 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.3.0"          # 0.3：意圖通道（state）＋失聯處置選項 C
+AGENT_VERSION = "0.4.0"          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+#                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
+#                                 補傳改單調時鐘、FS_GCS 開機自檢
+# **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
+# 地面站顯示的版本與機上實際跑的程式沒有關係——`ui-spec.md` §0.2f 記著同一件
+# 事的教訓：事故還原的成本有相當部分來自「系統說不出自己是哪一版」。
+# 部署之後看得到版本變了，才算驗證過這次部署真的生效。
 
 
 def agent_uid() -> str | None:
