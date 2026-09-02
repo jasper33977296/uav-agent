@@ -85,7 +85,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.4.0"          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.4.1"          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -244,26 +244,34 @@ class Monitor:
                 pres, enab, heal, self._prearm_seen)
             # RC 遙控器在不在（039 複裁 A）。**沒回報就是 None**：把「不知道」
             # 當成「沒有 RC」會讓所有還沒驗證過這個欄位的機都起飛不了
-            rc = (bool(msg.onboard_control_sensors_health & SENSOR_RC_RECEIVER)
-                  if msg.onboard_control_sensors_present & SENSOR_RC_RECEIVER
-                  else None)
+            s["_rc_sys_status"] = (
+                bool(msg.onboard_control_sensors_health & SENSOR_RC_RECEIVER)
+                if msg.onboard_control_sensors_present & SENSOR_RC_RECEIVER
+                else None)
+            rc = self._derive_rc(s)
             # **不走 `_change`**：它把第一次讀到的值當成「還沒讀到」而不留痕，
             # 而這裡的 `None` 是一個真正的值（不知道）。用 `_change` 的話
             # 「不知道 → RC 掉線」這個轉換會安靜地過去——那正是最該留痕的一次
-            prev_rc = s.get("rc_link", "unset")
-            s["rc_link"] = rc
-            if prev_rc != "unset" and prev_rc != rc:
-                txt = ("遙控器已連線" if rc else
-                       "⚠ 遙控器離線——此時不得起飛／開始任務" if rc is False
-                       else "遙控器狀態不明（韌體停止回報）")
-                self.events.append((time.time(), "rc_link", txt))
-                log.info("狀態變化：%s", txt)
+            self._note_rc(s, rc)
             if s["battery_pct"] is not None:
                 for th in (20, 10, 5):
                     if s["battery_pct"] <= th:
                         self._change(f"batt_below_{th}", True,
                                      f"⚠ 電量低於 {th}%（{s['battery_pct']}%）")
                         break
+        elif t == "RC_CHANNELS":
+            # **第二個訊號來源**（uav-system 2026-09-02 實測後新增）：
+            # ArduPilot 4.7 **不設** SYS_STATUS 的 RC_RECEIVER present 位元，
+            # 但它有送這則（實測 4 Hz）。`chancount` 的規格定義是「正在接收的
+            # RC 通道總數；**沒有可用的 RC 通道時應為 0**」——**計數不是哨兵**，
+            # 所以 0 是真值，三態因此成立。
+            #
+            # 同一則訊息的 `rssi` 實測是 **255**＝無效，不是滿格。
+            # **一則訊息裡一個欄位可用、一個不可用**——這就是當初否決 rssi
+            # 的判斷為什麼是對的，而它現在有了實測佐證。
+            s["_rc_chancount"] = getattr(msg, "chancount", None)
+            s["_rc_chan_t"] = time.monotonic()
+            self._note_rc(s, self._derive_rc(s))
         elif t == "GPS_RAW_INT":
             s["gps_fix"] = GPS_FIX.get(msg.fix_type, msg.fix_type)
             # 就緒判定比的是數字（`fix < 3`），不是名字。存原始值而不是回頭
@@ -328,6 +336,44 @@ class Monitor:
                 self.events.append((now, "statustext",
                                     f"[sev{msg.severity}] {txt}"))
                 log.info("飛控訊息 [sev%d] %s", msg.severity, txt)
+
+    #: `RC_CHANNELS` 多久沒來就不再拿它下判斷。**「我們不再聽到」不等於
+    #: 「RC 在」**——留著一個過期的計數，等於用舊事實回答關於現在的問題。
+    #: 實測真機 4 Hz，5 秒＝漏 20 則才轉成「不知道」
+    RC_STALE_S = 5.0
+
+    def _derive_rc(self, s):
+        """RC 在不在。**三態**：True／False／None＝不知道。兩個來源分層：
+
+        1. `SYS_STATUS` 的 `RC_RECEIVER` 位元（PX4 有設，權威）
+        2. `RC_CHANNELS.chancount`（ArduPilot 4.7 走這條）
+
+        都沒有 → `None`，而 **`None` 不擋**（039 複裁 A）：把「不知道」當成
+        「沒有 RC」會讓所有還沒回報的機都起飛不了。
+        """
+        v = s.get("_rc_sys_status")
+        if v is not None:
+            s["rc_source"] = "sys_status"
+            return v
+        n, t0 = s.get("_rc_chancount"), s.get("_rc_chan_t")
+        if n is not None and t0 is not None and time.monotonic() - t0 <= self.RC_STALE_S:
+            s["rc_source"] = "rc_channels"
+            return n > 0
+        s["rc_source"] = None
+        return None
+
+    def _note_rc(self, s, rc):
+        """轉態留痕。**不走 `_change`**：它把第一次讀到的值當成「還沒讀到」
+        而不留痕，而這裡的 `None` 是一個真正的值（不知道）——用 `_change`
+        的話「不知道 → RC 掉線」會安靜地過去，那正是最該留痕的一次。"""
+        prev = s.get("rc_link", "unset")
+        s["rc_link"] = rc
+        if prev != "unset" and prev != rc:
+            txt = ("遙控器已連線" if rc else
+                   "⚠ 遙控器離線——此時不得起飛／開始任務" if rc is False
+                   else "遙控器狀態不明（收不到判定所需的訊息）")
+            self.events.append((time.time(), "rc_link", txt))
+            log.info("狀態變化：%s（來源 %s）", txt, s.get("rc_source"))
 
     def _change(self, key, val, message):
         if self.state.get(key) != val:

@@ -134,6 +134,49 @@ mon2.feed(sys_status(BIT, 0))        # 韌體開始回報，而且說 RC 掉了
 chk("**不知道 → 掉線 也留痕**（None 是值，不是「還沒讀到」）",
     len(mon2.events) == n1 + 1, mon2.events[-1][2] if mon2.events else None)
 
+print("\n── 分層來源：SYS_STATUS 沒有時退到 RC_CHANNELS ─────────")
+import time as _t
+import agent as _A
+
+mon = _A.Monitor.__new__(_A.Monitor)
+mon.events = []
+
+
+def derive(sys_bit=None, chancount=None, age=0.0):
+    s = {"_rc_sys_status": sys_bit}
+    if chancount is not None:
+        s["_rc_chancount"] = chancount
+        s["_rc_chan_t"] = _t.monotonic() - age
+    return mon._derive_rc(s), s.get("rc_source")
+
+
+chk("SYS_STATUS 有值時它說了算（優先）",
+    derive(sys_bit=True, chancount=0) == (True, "sys_status"),
+    "PX4 走這條")
+chk("**SYS_STATUS 沒有 → 退到 chancount**（ArduPilot 4.7 走這條）",
+    derive(chancount=8) == (True, "rc_channels"))
+chk("chancount=0 → False（規格：沒有可用通道時應為 0）",
+    derive(chancount=0) == (False, "rc_channels"))
+chk("兩個來源都沒有 → None", derive() == (None, None))
+
+print("\n── 過期：不再聽到 ≠ RC 還在 ────────────────────────────")
+chk("RC_CHANNELS 停了超過門檻 → 退回 None（不是沿用舊計數）",
+    derive(chancount=8, age=_A.Monitor.RC_STALE_S + 1) == (None, None),
+    "**用舊事實回答關於現在的問題，是這條規則最容易犯的錯**")
+chk("**反向驗證**：門檻內仍然有效",
+    derive(chancount=8, age=1.0) == (True, "rc_channels"))
+
+print("\n── 轉態留痕（含「不知道 → 掉線」那一格）────────────────")
+st = {}
+mon._note_rc(st, None)                      # 第一次讀到，不算轉態
+n0 = len(mon.events)
+mon._note_rc(st, False)                     # 不知道 → 掉線
+chk("**「不知道 → 掉線」有留痕**（最該被看見的一次轉換）",
+    len(mon.events) == n0 + 1 and "離線" in mon.events[-1][2],
+    mon.events[-1][2] if mon.events else "")
+mon._note_rc(st, False)
+chk("沒有變化就不重複記", len(mon.events) == n0 + 1)
+
 print("\n── 接到守門：三態各自的後果 ───────────────────────────")
 for label, rc, want in (("在線", True, True), ("掉線", False, False),
                         ("不知道", None, True)):
