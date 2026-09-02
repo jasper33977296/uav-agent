@@ -82,6 +82,15 @@ _WHY: dict[tuple[str, str], str] = {
     ("HOLDING", "pause"): "已經在暫停懸停中",
     ("READY", "pause"): "機還在地上，沒有東西可以暫停",
     ("NOT_READY", "abort"): "機還在地上，沒有東西可以中止",
+    # 改航線是**飛行中**的三步序列（暫停→上傳→續飛）。機在地上時沒有東西
+    # 可以暫停、也沒有東西可以續飛——**要換飛哪一份任務，直接上傳那一份**，
+    # 而上傳根本不經過本守門
+    ("NOT_READY", "change_route"): "機還在地上，沒有航線在飛、也沒有東西可以"
+                                   "暫停或續飛。要換飛哪一份任務，直接上傳那一份",
+    ("READY", "change_route"): "機還在地上，沒有航線在飛、也沒有東西可以"
+                               "暫停或續飛。要換飛哪一份任務，直接上傳那一份",
+    ("ARMED_GROUND", "change_route"): "還沒起飛，沒有航線在飛。"
+                                      "要換飛哪一份任務，直接上傳那一份",
     ("READY", "abort"): "機還在地上，沒有東西可以中止",
     ("ARMED_GROUND", "abort"): "機還在地上；要停下來請上鎖（disarm），"
                                "不是切懸停模式",
@@ -135,7 +144,18 @@ def check(state: str, action: str,
            or _WHY.get((state, "*"))
            or f"在 {state} 狀態下不允許 {action}")
     now_can = sorted(allowed)
-    tail = ("；現在可以做：" + "、".join(now_can)) if now_can else "；現在什麼都不做"
+    if state == "NOT_READY":
+        # **`NOT_READY` 的意思就是「它現在飛不了」**，所以照樣列出白名單裡的
+        # `start_mission` 是一句誤導：那個動作會在更後面被飛控的預檢擋下，
+        # 而使用者會照著我們的話去撞一次牆。
+        #
+        # 這條守門的紀律是「擋下要說得出**那現在能做什麼**」——而在這一格，
+        # 真正能做的事不是任何一個意圖，是**讓它就緒**。
+        tail = ("；但這台機現在的狀態是 NOT_READY（未就緒），"
+                "**先讓它就緒**——預檢／EKF／GPS 定位，畫面的「未就緒原因」"
+                "會列出卡在哪一項")
+    else:
+        tail = ("；現在可以做：" + "、".join(now_can)) if now_can else "；現在什麼都不做"
     return False, why + tail
 
 

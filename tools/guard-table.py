@@ -111,6 +111,18 @@ _, why_rc = guard.check("READY", "start_mission", False)
 chk("RC 拒絕的理由說得出現在能做什麼", "現在可以做" in why_rc, why_rc)
 chk("RC 拒絕的理由說得出是遙控器的問題", "遙控器" in why_rc)
 
+#: 「說得出下一步」的**判準，不是字串**。原本這裡寫死找「現在可以做」四個字，
+#: 於是 2026-09-02 把 `NOT_READY` 的尾句改成更可行動的「先讓它就緒」時，
+#: 這一格反而變紅——**測試在懲罰一個變好的訊息**。
+#:
+#: 那句改動的理由：`NOT_READY` 的意思就是「它現在飛不了」，照樣列出白名單裡的
+#: `start_mission` 是一句誤導（它會在飛控預檢那關被擋，而使用者會照著我們的話
+#: 去撞一次牆）。真正能做的事不是任何一個意圖，是**讓它就緒**。
+#:
+#: 所以判準改成「有沒有指出下一步」，而不是「有沒有那個字串」。
+_NEXT_STEP = ("現在可以做", "現在什麼都不做", "先讓它就緒",
+              "直接上傳那一份", "請先確認")
+
 print("\n── 白名單而不是黑名單 ─────────────────────────────────")
 allowed, why = guard.check("SOME_NEW_STATE", "rtl")
 chk("表上沒有的狀態 → 拒絕（不是放行）", not allowed, why)
@@ -126,7 +138,7 @@ for st in STATES:
             continue
         if not why:
             bad.append(f"{st}/{a} 沒有理由")
-        elif "現在可以做" not in why and "現在什麼都不做" not in why:
+        elif not any(k in why for k in _NEXT_STEP):
             bad.append(f"{st}/{a} 理由沒說現在能做什麼：{why}")
 chk("每一格拒絕都說得出現在能做什麼", not bad, bad[:3])
 
