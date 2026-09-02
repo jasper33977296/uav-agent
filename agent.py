@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.8.0"          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.9.0"          # 0.9：訊號記錄通道接上（研究資料原本沒在存）          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -684,7 +684,10 @@ class Agent:
         if self.a.modem_port:
             self.modem = ModemSampler(
                 self.a.modem_port, self.a.gs, self.a.backend_port,
-                self._position, self.a.modem_interval)
+                self._position, self.a.modem_interval,
+                # 記錄通道要說得出這批樣本是誰的。**多機時不能靠「主機」**
+                # ——那是排版設定不是身分（issues/040 A4）
+                drone_id_fn=lambda: self.drone_id)
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）

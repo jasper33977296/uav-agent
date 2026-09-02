@@ -13,6 +13,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -37,20 +38,51 @@ def _nr_sinr(idx):
     return None if idx in (None, 255) else idx / 2.0 - 23
 
 
+#: 記錄緩衝的上限（筆）。1 Hz 取樣 → 1800 筆＝半小時。
+#: **有上限而且滿了要說**：飛機上的記憶體有限，而真的斷超過半小時時，
+#: 最舊那段的價值最低（與 backfill.py 同一個取捨）。
+BUFFER_MAX = 1800
+#: 一次送幾筆。**一包太大時，5G 抖一下整包就白送**（backfill.py 學到的）。
+BATCH_MAX = 200
+#: 多久送一次記錄通道。即時通道 1 Hz 是給畫面看的；記錄不必那麼即時，
+#: 而**批次送比逐筆送省得多**——同樣的位元組數，少了 N 倍的 HTTP 開銷
+BATCH_EVERY_S = 10.0
+
+
 class ModemSampler(threading.Thread):
     daemon = True
 
-    def __init__(self, port, gs_host, gs_port, get_position, interval=1.0):
+    def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
+                 drone_id_fn=None):
         super().__init__(name="modem-sampler")
         self.port, self.interval = port, interval
-        self.url = f"http://{gs_host}:{gs_port}/api/link-metrics/live"
+        base = f"http://{gs_host}:{gs_port}/api/link-metrics"
+        self.url = f"{base}/live"          # 即時通道：只給畫面看，**不入庫**
+        self.batch_url = f"{base}/batch"   # 記錄通道：**唯一的入庫路徑**
         self.gs_host = gs_host
         self.get_position = get_position      # 由 agent 提供：當下的 lat/lon/alt
+        self.drone_id_fn = drone_id_fn
         self.ser = None
         self.samples = self.posted = self.errors = 0
         self.last = {}
         self._rtt_ms = None
         self._last_ping = 0.0
+        # ── 記錄通道（uav-system issues/021／doc/onboard-telemetry.md）──────
+        #
+        # **這條路以前不存在。** 採樣只往 `/live` 送，而那個端點的 docstring
+        # 第一行就寫著「**不寫資料庫**」——它只更新畫面。於是這套系統的研究
+        # 核心資料（5G 訊號時序）**從來沒有從真機被記錄過**：2026-09-02 實測
+        # `link_metrics` 最新一筆停在 08-13，而當天四趟飛行的訊號筆數全是 0。
+        # 記錄通道 `/batch` 一直是好的，唯一的呼叫者是 `fake-onboard-node.py`
+        # ——**一支假的測試節點**。
+        #
+        # 兩條通道分工不變（職責不重疊就不需要去重）：`/live` 逐筆即時、
+        # 送失敗不重試；`/batch` 緩衝、重送、由地面站回報收下了哪幾筆。
+        self.buf: deque = deque(maxlen=BUFFER_MAX)
+        self._seq = 0
+        self.stored = 0          # 地面站說寫進去了幾筆
+        self.dropped = 0         # 緩衝滿了被擠掉的（**要看得見**）
+        self._next_batch = 0.0
 
     # ── AT ────────────────────────────────────────────────────
     def _open(self):
@@ -182,6 +214,13 @@ class ModemSampler(threading.Thread):
                 out[k] = pos[k]
         self.samples += 1
         self.last = out
+        # **每一筆都進記錄緩衝。** `seq` 是必要的：地面站回 `accepted_seq`
+        # 告訴我們它收下了哪幾筆（**含它判定落在架次外而丟棄的**），
+        # 沒有序號就只能猜要刪哪幾筆
+        self._seq += 1
+        if len(self.buf) == self.buf.maxlen:
+            self.dropped += 1
+        self.buf.append({**out, "seq": self._seq})
         return out
 
     def post(self, sample):
@@ -205,9 +244,60 @@ class ModemSampler(threading.Thread):
                 log.warning("link-metrics 送出失敗（%s）", e)
         return False
 
+    def flush(self):
+        """把緩衝的樣本送進**記錄通道**。回傳送出去幾筆。
+
+        **這個端點是冪等的、可以安全重送**（它自己的 docstring 這樣寫），
+        所以我們的規則很簡單：送出去，然後**只刪掉地面站說它收下的那幾筆**。
+
+        `accepted_seq` 刻意**包含落在架次外而被丟棄的樣本**——不回報那些的話，
+        機上會永遠重送一批本來就不該保留的資料（backend 註解明載此意圖）。
+        """
+        if not self.buf:
+            return 0
+        chunk = list(self.buf)[:BATCH_MAX]
+        body = {"samples": chunk}
+        if self.drone_id_fn:
+            did = self.drone_id_fn()
+            if did:
+                body["drone_id"] = did
+        req = urllib.request.Request(
+            self.batch_url, data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                res = json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            # 4xx＝我們送錯了，重送不會變好；5xx／網路＝留著下次再送
+            detail = e.read()[:200].decode("utf-8", "replace")
+            log.warning("記錄通道 HTTP %s：%s", e.code, detail)
+            if 400 <= e.code < 500:
+                self.dropped += len(chunk)
+                for _ in range(min(len(chunk), len(self.buf))):
+                    self.buf.popleft()
+            return 0
+        except Exception as e:
+            if self.errors % 30 == 1:
+                log.warning("記錄通道送不出去（%s），緩衝 %d 筆", e, len(self.buf))
+            return 0
+        ok = set(res.get("accepted_seq") or [])
+        # **只刪它說收下的**。沒被收下的留著——那正是緩衝存在的理由
+        keep = [x for x in self.buf if x["seq"] not in ok]
+        self.buf.clear()
+        self.buf.extend(keep)
+        self.stored += int(res.get("stored") or 0)
+        if res.get("outside_session"):
+            # 架次外＝那時候飛機沒在飛，地面站照 issues/004 的規則丟掉。
+            # **這不是錯誤**，但要看得見，不然「送了 1000 筆只存了 40 筆」
+            # 會像是壞掉
+            log.info("記錄通道：入庫 %s、重複 %s、架次外丟棄 %s（緩衝剩 %d）",
+                     res.get("stored"), res.get("duplicate"),
+                     res.get("outside_session"), len(self.buf))
+        return len(ok)
+
     def run(self):
-        log.info("模組採樣啟動：%s → %s（每 %.1fs）", self.port, self.url,
-                 self.interval)
+        log.info("模組採樣啟動：%s → %s（每 %.1fs）；記錄通道 %s（每 %.0fs 一批）",
+                 self.port, self.url, self.interval, self.batch_url, BATCH_EVERY_S)
         while True:
             try:
                 s = self.sample()
@@ -215,6 +305,12 @@ class ModemSampler(threading.Thread):
                     # 即時通道送失敗不重試：下一秒的新樣本本來就會取代這一筆，
                     # 重試只會佔用本來就不夠的頻寬（backend 註解明載此意圖）
                     self.post(s)
+                # 記錄通道：批次、可重送。**與即時通道分開**——即時送失敗
+                # 就算了（下一秒有新的），記錄送失敗要留著
+                now = time.monotonic()
+                if now >= self._next_batch:
+                    self._next_batch = now + BATCH_EVERY_S
+                    self.flush()
             except Exception:
                 log.exception("採樣迴圈例外，吞掉續跑")
             time.sleep(self.interval)
@@ -222,6 +318,10 @@ class ModemSampler(threading.Thread):
     def stats(self):
         return {"samples": self.samples, "posted": self.posted,
                 "errors": self.errors,
+                # **入庫筆數要與送出筆數分開報。** 「送出去了」不等於
+                # 「記下來了」——這整個 bug 就是活在那兩者之間
+                "stored": self.stored, "buffered": len(self.buf),
+                "dropped": self.dropped,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
                 "pci": self.last.get("pci"), "cell_id": self.last.get("cell_id"),
