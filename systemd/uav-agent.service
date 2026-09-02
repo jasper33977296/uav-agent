@@ -22,6 +22,15 @@ Environment=MODEM_PORT=/dev/ttyUSB1
 Environment=LINK_WARN_S=5
 Environment=LINK_ACTION_S=30
 Environment=LINK_ACTION=rtl
+# ── 機上錄製與它的自動回傳（uav-system issues/014）──────────────
+# 錄的是「飛控送出的東西」（地面站錄的是「送到地面站的東西」）——
+# **5G 斷線期間，兩者相差的正是我們最想看的那一段**。
+# 回傳**只在地面進行、一解鎖立刻停**：一趟十分鐘的錄製約 4 MB，量不是問題，
+# 問題是它與遙測共用同一條 5G，而正在飛的那台優先。
+# RECORD_UPLOAD=0 可退回「落地後人工 scp」。
+Environment=RECORD_UPLOAD=1
+Environment=RECORD_UPLOAD_KBPS=256
+Environment=RECORD_UPLOAD_SETTLE_S=20
 
 ExecStart=/home/pi/uav-agent/venv/bin/python /home/pi/uav-agent/agent.py
 Restart=always

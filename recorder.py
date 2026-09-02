@@ -43,11 +43,16 @@ class Recorder:
     每則訊息前綴 8-byte big-endian 微秒時間戳。"""
 
     def __init__(self, path: str, max_mb: int = 512, keep: int = 20,
-                 armed_only: bool = True):
+                 armed_only: bool = True, is_uploaded=None):
         self.dir = path
         self.max_bytes = max_mb * 1024 * 1024
         self.keep = keep
         self.armed_only = armed_only
+        #: 「這一份回傳成功了沒」（uploader.is_uploaded）。**只用來把滾動刪除
+        #: 說出口**，不用來延後刪除——滾動的職責是保護那張卡，而卡滿了會讓
+        #: 整台機出問題。但**刪掉一份從來沒有回傳成功的紀錄，一定要有人聽見**
+        self.is_uploaded = is_uploaded
+        self._was_armed = False
         self.f = None
         self.name = None
         self.written = 0
@@ -59,6 +64,14 @@ class Recorder:
     def feed(self, raw: bytes, armed: bool) -> None:
         """一個 MAVLink 框架。**這個函式不准拋例外**——它在轉發的熱路徑上。"""
         try:
+            # **落地即換檔＝一趟飛行一個檔案。** armed_only 模式下這是順帶
+            # 發生的（下面那行就會關檔），但 RECORD_DISARMED=1 時不換的話，
+            # 檔案要等 512 MB 才會關——**而沒關好的檔案不會被自動回傳**
+            # （正在寫的那一份內容還會變，sha256 與續傳都無從談起），
+            # 於是「連未解鎖也錄」會安靜地連帶關掉自動回傳
+            if self._was_armed and not armed:
+                self._close()
+            self._was_armed = armed
             if self.armed_only and not armed:
                 self._close()
                 return
@@ -71,8 +84,7 @@ class Recorder:
             self.written += len(raw) + 8
             self.frames += 1
             if self.written >= self.max_bytes:
-                self._close()
-                self._rotate()
+                self._close()       # 下一個框架會開新檔，滾動在那裡做
         except Exception:
             # **只在第一次抱怨**：錄製壞掉時每個框架噴一行 log，會把真正的
             # 問題埋掉，而且 log 本身也會吃掉那張卡
@@ -113,6 +125,12 @@ class Recorder:
         self.written = 0
         log.info("機上錄製開始：%s（上限 %.0f MB，保留 %d 份）",
                  self.name, self.max_bytes / 1e6, self.keep)
+        # **滾動在開檔時做，不是只在「寫滿 512 MB 換檔」時做。** 原本掛在
+        # 換檔那條路上，而在真機上換檔幾乎不會發生：一趟十分鐘的飛行約 4 MB
+        # （UART 5.6 KB/s 的上限），512 MB 要飛二十小時才寫得滿。於是
+        # 「保留 20 份」從來沒有執行過——檔案一趟一份地無限累積，
+        # **而部署查核表上寫著「約 10 GB 上限」。那句話當時是假的。**
+        self._prune()
 
     def _close(self) -> None:
         if self.f is None:
@@ -126,15 +144,35 @@ class Recorder:
             pass
         self.f, self.name = None, None
 
-    def _rotate(self) -> None:
+    def _prune(self) -> None:
         """留最新的 `keep` 份，其餘刪掉。
 
         **卡滿了會讓整台機出問題**——包括代理自己（寫不了 log、補傳緩衝也
         存不下）。所以滾動不是清潔工作，是**保護飛行路徑**。
+
+        **自動回傳不會讓刪除變慢。** 保護那張卡的優先權高於保住一份紀錄；
+        但**刪掉一份從來沒有回傳成功的東西，一定要有人聽見**——安靜地刪掉，
+        我們就會在事後以為那趟飛行的紀錄還在機上。
         """
         try:
-            files = sorted(f for f in os.listdir(self.dir) if f.endswith(".tlog"))
+            # **依修改時間排，不是依檔名。** 檔名不是字典序遞增的：同一秒的
+            # 第二份叫 `X-2.tlog`，而 `-`(0x2d) < `.`(0x2e)，所以 `X-2.tlog`
+            # 排在 `X.tlog` **前面**——依檔名排會把最舊的那一份當成最新的、
+            # 留著它而刪掉真正新的。冷開機的 1970 檔名也是同一顆時鐘寫的
+            # mtime，兩者一致
+            files = [e.name for e in sorted(
+                (e for e in os.scandir(self.dir) if e.name.endswith(".tlog")),
+                key=lambda e: e.stat().st_mtime)]
             for old in files[:-self.keep] if len(files) > self.keep else []:
+                # **正在寫的那一份絕不刪。** 冷開機時檔名是 1970，排序上
+                # 會排在所有 2026 的檔案前面＝被當成最舊的一份；unlink 一個
+                # 開著的檔在 Linux 上不會報錯，只會讓後續的寫入流進一個
+                # 沒有名字的 inode——**看起來一切正常，錄的東西全部消失**
+                if old == self.name:
+                    continue
+                if self.is_uploaded is not None and not self.is_uploaded(old):
+                    log.warning("⚠ 機上錄製滾動刪除 %s，而它**從來沒有回傳"
+                                "成功**——這一趟的機上紀錄到此為止", old)
                 os.remove(os.path.join(self.dir, old))
                 log.info("機上錄製滾動：刪除 %s", old)
         except Exception:

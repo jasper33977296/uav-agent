@@ -205,6 +205,8 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `intent.py` | 意圖通道（WebSocket）：state 推送、intent 回執與判決 |
 | `route.py` | 改航線提案：續飛航點、過期重算 |
 | `backfill.py` | 失聯期間的機上緩衝與恢復後補傳 |
+| `recorder.py` | 機上原始層錄製：飛控送出的每一個框架落盤（tlog） |
+| `uploader.py` | 那份錄製的自動回傳：**只在地面傳、一解鎖立刻停** |
 | `modem.py` | 5G 模組 AT 採樣（獨立執行緒，不擋主迴圈） |
 | `uav-test.py` | 一次性診斷：請求串流並把飛控說得出來的東西全部攤開 |
 | `tools/link-loss-table.py` | 失聯處置的判定表（含反向驗證） |
@@ -220,9 +222,67 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/fs-gcs-check.py` | 飛控 GCS failsafe 的開機自檢（不變式與三種結論） |
 | `tools/backfill-flow.py` | 緩衝與補傳的邏輯（HTTP 用假的） |
 | `tools/backfill-live.py` | 補傳端到端：真代理 → 跑著的地面站 → 真入庫 |
+| `tools/recorder-flow.py` | 錄製器：armed 才錄、格式、滾動、失敗不拖垮轉發 |
+| `tools/upload-flow.py` | 回傳的**時機**：飛行中不傳、半路起飛就停、續傳、限速 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |
+
+## 機上錄製與自動回傳（uav-system issues/014）
+
+代理逐 byte 讀過飛控送出的每一個 MAVLink 框架（轉發要用），所以**多寫一份
+檔案是零額外 UART 頻寬、零額外 5G 頻寬**。檔案在 `RECORD_DIR`
+（預設 `/home/pi/uav-record`），格式與地面站那份、QGC、`mavlogdump.py` 相同。
+
+**它的價值不是備份。** 地面站錄的是「送到地面站的東西」，這裡錄的是
+「**飛控送出的東西**」——**5G 斷線期間，兩者相差的正是我們最想看的那一段**。
+
+> **界線：這支錄的是「MAVLink 看得到的一切」，不是「飛控知道的一切」。**
+> 飛控內部的 dataflash `.BIN`（數百 Hz 的 IMU、控制器內部量）在飛控自己的
+> SD 卡上，**過不了 57600**。機制存在（`LOG_BACKEND_TYPE` bit 1 的 MAVLink
+> logging backend 就是為伴飛電腦設計的），算術不允許。
+
+### 什麼時候傳（這個功能唯一危險的一格）
+
+**先算術，再政策。** 錄製檔的大小上限就是那條 UART：
+
+    5.6 KB/s（57600 8N1）× 600 s ＋ 每框架 8 byte 時間戳 ≈ **4 MB／十分鐘**
+
+**所以「什麼時候傳」不是量的問題**——4 MB 走 5G 是幾十秒的事。問題是它與
+遙測**共用同一條 5G**，而正在飛的那台機優先。與補傳（`backfill.py`）同一條
+紀律：**補歷史不該拖慢現在**。
+
+四道門，缺一不傳（`agent.py::_upload_gate`／`uploader.py`）：
+
+| 門 | 為什麼 |
+|---|---|
+| 飛機沒有 `armed` | 飛行中送幾 MB，等於拿正在飛的那台機的遙測，換一份已經安全落地的紀錄 |
+| 落地後靜置 `RECORD_UPLOAD_SETTLE_S` | 剛落地時人還在機旁、可能馬上再起飛；板凳測試的 arm/disarm 連續切換也不該每次都戳一輪 |
+| 地面站鏈路通 | 斷線時重試只是把時間花在必敗的事上 |
+| 拿得到 `board_uid` | 沒有身分就沒有歸屬（038／040 同一條規則） |
+
+**守門在每一塊之前檢查**，所以停手的延遲上限就是「送一塊要多久」——
+預設塊大小與限速相同（256 KB／256 KB/s）＝**最遲一秒後停手**。
+
+三個刻意的設計：
+
+* **只傳關好的檔案。** 正在寫的那一份不碰——內容還會變，sha256 與續傳都無從
+  談起。**落地即換檔**，所以一趟飛行就是一個檔案。
+* **可續傳，而且不靠自己記。** 進度的權威在地面站：宣告一次（帶 sha256）就
+  知道要從哪裡接。本地 `.uploaded.json` 只是省下重算 sha 的快取。
+  5G 在戶外會斷，**一次斷線就整份重來的話，鏈路愈差的那趟愈傳不回來**——
+  而那正是最值得看的一趟。
+* **傳完不刪本地檔。** 保留仍由錄製器的滾動負責（`RECORD_KEEP` 份）。
+  剛傳完就刪掉唯一的副本，是把「地面站那份一定沒問題」當成前提。
+
+**滾動刪除優先於保住紀錄**——卡滿了會讓整台機出問題，包括代理自己。但刪掉
+一份**從來沒有回傳成功**的錄製時會大聲警告：安靜地刪，我們就會在事後以為
+那趟飛行的紀錄還在機上。
+
+設定：`RECORD_UPLOAD`（0＝退回人工 `scp`）、`RECORD_UPLOAD_KBPS`、
+`RECORD_UPLOAD_CHUNK_KB`、`RECORD_UPLOAD_SETTLE_S`。
+地面站那端：`GET /api/onboard-captures`（含**沒傳完的**），
+`GET /api/onboard-captures/{drone_id}/{name}` 下載。
 
 ## 自駕儀驅動（026 B4-b，2026-09-01）
 

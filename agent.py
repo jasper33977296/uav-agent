@@ -78,6 +78,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 import guard
 import normalize
 import recorder
+import uploader
 import route
 from autopilot import get_driver
 from backfill import Backfill
@@ -86,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.5.0"          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.6.0"          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -453,6 +454,8 @@ class Agent:
         self.loss_acted = False
         self.loss_started = None
         self.modem = None
+        self.recorder = None      # 機上原始層錄製（014）
+        self.uploader = None      # 那份錄製的自動回傳（014）
 
     def connect_serial(self):
         while True:
@@ -688,9 +691,22 @@ class Agent:
         # 機上原始層：飛控送出的每一個框架都落盤。**零額外頻寬**——這些
         # 位元組本來就要讀（轉發要用）。5G 斷線期間地面站什麼都收不到，
         # 而這裡照樣看得見（issues/014）
+        # **回傳器先建**：錄製器滾動刪檔前要問它「這一份回傳了沒」，
+        # 而回傳器只需要一個 lambda 去讀錄製器當下在寫哪一個檔
+        if self.a.upload:
+            self.uploader = uploader.Uploader(
+                self.a.record_dir, self.a.gs, self.a.backend_port,
+                lambda: self.mon.state.get("board_uid"),
+                lambda: self.recorder.name if self.recorder else None,
+                self._upload_gate,
+                rate_kbs=self.a.upload_kbps, chunk_kb=self.a.upload_chunk_kb,
+                settle_s=self.a.upload_settle_s)
         self.recorder = recorder.Recorder(
             self.a.record_dir, max_mb=self.a.record_max_mb,
-            keep=self.a.record_keep, armed_only=not self.a.record_disarmed)
+            keep=self.a.record_keep, armed_only=not self.a.record_disarmed,
+            is_uploaded=self.uploader.is_uploaded if self.uploader else None)
+        if self.uploader:
+            self.uploader.start()
         self.backfill = Backfill(
             self.a.gs, self.a.backend_port,
             lambda: self.mon.state.get("board_uid"),
@@ -1229,6 +1245,12 @@ class Agent:
             # 040 A3：正在換號。**放頂層與 rc_link 同理**——地面站的鏡像讀的是
             # 頂層欄位，放進 derived 會讓畫面永遠看不到它
             "reassigning": self.reassigning,
+            # 014：機上還有幾份錄製沒有回傳成功。**放頂層而不是 derived**——
+            # `derived` 是拿去與地面站自己算的做比對的（026 §9），塞一個
+            # 地面站算不出來的東西進去沒有意義。
+            # **這個數字是「自動回傳」唯一的誠實度量**：它一直不降，代表
+            # 守門一直沒開（還在飛？失聯？），而不是「沒有東西要傳」
+            "record_backlog": self.uploader.backlog if self.uploader else None,
             "derived": {
                 "armed": bool(s.get("armed")),
                 "landed": s.get("landed_state"),
@@ -1250,6 +1272,29 @@ class Agent:
                 **normalize.derived(s),
             },
         })
+
+    def _upload_gate(self):
+        """機上錄製可以回傳了嗎（issues/014）。回 `(可以嗎, 為什麼不行)`。
+
+        **只在地面傳，一解鎖立刻停。** 與補傳（`backfill.py`）同一條紀律：
+        **補歷史不該拖慢現在**。差別在量級——補傳一筆 100 bytes，這裡一次
+        是幾 MB；飛行中送它，等於拿正在飛的那台機的遙測，去換一份已經安全
+        落地的紀錄。
+
+        **`armed` 用最後已知值判就夠了。** 它只會被新的心跳改掉，所以
+        「飛控失聯、而最後看到它是 armed」自然就會擋下上傳——不必為那一格
+        另外寫規則。反過來，從來沒看到過飛控（`armed is None`）時放行是對的：
+        那台機不在天上，而且也沒有遙測可以被排擠。
+
+        `gs_link_ok is None` ＝ 還沒建立過鏈路。**不放行**：那時送出去的
+        每一塊都會逾時，而逾時要等 60 秒。
+        """
+        if self.mon.state.get("armed"):
+            return False, "armed（飛行中不傳）"
+        if not self.gs_link_ok:
+            return False, ("地面站鏈路未建立" if self.gs_link_ok is None
+                           else "地面站失聯")
+        return True, None
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
@@ -1536,6 +1581,12 @@ class Agent:
     def report(self):
         s = self.mon.state
         hb_age = time.time() - self.mon.last_hb if self.mon.last_hb else None
+        # **錄製器的 flush 原本是死碼。** 檔案開著 64 KB 緩衝，代理若在飛行中
+        # 被 SIGKILL／掉電，尾巴那 64 KB（約十秒）就沒了——而**那十秒正是
+        # 我們留這份錄製的理由**（出事前最後那一段）。狀態列本來就每 10 秒
+        # 跑一次，順手在這裡落地。
+        if self.recorder:
+            self.recorder.flush()
         line = {
             "fc_heartbeat_age_s": round(hb_age, 1) if hb_age else None,
             "armed": s.get("armed"), "mode": s.get("mode"),
@@ -1551,6 +1602,8 @@ class Agent:
             "state": self.flight_state(),
             "intent": self.intent.stats() if self.intent else None,
             "backfill": self.backfill.stats() if self.backfill else None,
+            "record": self.recorder.stats() if self.recorder else None,
+            "upload": self.uploader.stats() if self.uploader else None,
             "modem": self.modem.stats() if self.modem else None,
         }
         log.info("狀態 %s", json.dumps(line, ensure_ascii=False))
@@ -1634,6 +1687,28 @@ def main():
     p.add_argument("--record-disarmed", action="store_true",
                    default=os.environ.get("RECORD_DISARMED", "0") != "0",
                    help="連未解鎖時也錄（預設否）")
+    #: 錄製的自動回傳（issues/014）。**預設開**：錄下來的東西如果要人 scp
+    #: 才拿得到，它就只對記得去拿的人存在——而想起來要去拿的時機通常是
+    #: 出事之後，那時卡上的滾動可能已經把它刪掉了。
+    #: 危險的不是「傳」而是「什麼時候傳」，那一格由 `_upload_gate()` 守
+    #: （只在地面、鏈路通、落地靜置過），所以預設開是安全的。
+    p.add_argument("--no-upload", dest="upload", action="store_false",
+                   default=os.environ.get("RECORD_UPLOAD", "1") != "0",
+                   help="停用錄製檔自動回傳（改回落地後人工 scp）")
+    #: **限速：地面站那條 5G 上可能還有別台機正在飛，而正在飛的那台優先。**
+    #: 一趟十分鐘的錄製約 4 MB（UART 5.6 KB/s 的上限），256 KB/s 下約 16 秒。
+    p.add_argument("--upload-kbps", type=int,
+                   default=int(os.environ.get("RECORD_UPLOAD_KBPS", 256)),
+                   help="回傳限速（KB/s）")
+    #: **塊大小同時決定了「起飛後多久停手」**：守門在每一塊之前檢查，所以
+    #: 停手的延遲上限就是送一塊要多久。預設與限速相同＝最遲一秒。
+    p.add_argument("--upload-chunk-kb", type=int,
+                   default=int(os.environ.get("RECORD_UPLOAD_CHUNK_KB", 256)),
+                   help="回傳的塊大小（KB）；與限速同值時＝解鎖後最遲一秒停手")
+    p.add_argument("--upload-settle-s", type=float,
+                   default=float(os.environ.get("RECORD_UPLOAD_SETTLE_S", 20)),
+                   help="落地後等多久才開始回傳（板凳上 arm/disarm 連續切換時"
+                        "不要每次都戳一輪上傳）")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",
@@ -1681,6 +1756,15 @@ def main():
              "；讀不到與讀到但不合會分開報",
              a.link_loss_max_solo_s, a.link_action_s)
     log.info("訊號採樣：%s", a.modem_port or "停用")
+    # **「什麼時候傳」是這個功能唯一危險的一格**，所以它要跟失聯處置那些
+    # 政策一樣，在啟動時就說出口——事後從行為反推是最貴的查法
+    log.info("機上錄製：%s（%s、%d MB 換檔、保留 %d 份）；自動回傳 %s",
+             a.record_dir, "armed 時才錄" if not a.record_disarmed else "**連未解鎖也錄**",
+             a.record_max_mb, a.record_keep,
+             f"限速 {a.upload_kbps} KB/s、塊 {a.upload_chunk_kb} KB、"
+             f"落地靜置 {a.upload_settle_s:.0f}s"
+             "（**只在地面、鏈路通時傳，一解鎖立刻停**）"
+             if a.upload else "**停用**（要人工 scp）")
     Agent(a).run()
 
 
