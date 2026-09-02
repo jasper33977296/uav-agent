@@ -77,6 +77,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import guard
 import normalize
+import recorder
 import route
 from autopilot import get_driver
 from backfill import Backfill
@@ -85,7 +86,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.4.2"          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.5.0"          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -684,6 +685,12 @@ class Agent:
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）
+        # 機上原始層：飛控送出的每一個框架都落盤。**零額外頻寬**——這些
+        # 位元組本來就要讀（轉發要用）。5G 斷線期間地面站什麼都收不到，
+        # 而這裡照樣看得見（issues/014）
+        self.recorder = recorder.Recorder(
+            self.a.record_dir, max_mb=self.a.record_max_mb,
+            keep=self.a.record_keep, armed_only=not self.a.record_disarmed)
         self.backfill = Backfill(
             self.a.gs, self.a.backend_port,
             lambda: self.mon.state.get("board_uid"),
@@ -718,6 +725,9 @@ class Agent:
                 self.telem.send(buf)          # 唯讀通道
                 self.cmd.send(buf)            # 指令通道也要看得到狀態與 ACK
                 self.mon.feed(msg)
+                # **餵在 mon.feed 之後**：armed 要用這一拍更新過的值，
+                # 否則解鎖的第一批框架會被判成「還沒 armed」而漏錄
+                self.recorder.feed(buf, bool(self.mon.state.get("armed")))
                 if msg.get_type() != "HEARTBEAT":
                     self.last_telem_rx = now
 
@@ -1613,6 +1623,17 @@ def main():
     p.add_argument("--no-sysid-auto-apply", dest="sysid_auto_apply",
                    action="store_false",
                    default=os.environ.get("SYSID_AUTO_APPLY", "1") != "0")
+    #: 機上原始層錄製（issues/014）。**預設只在 armed 時錄**——待機時的資料量
+    #: 大而價值低，與飛控自己 `LOG_DISARMED=0` 的選擇一致
+    p.add_argument("--record-dir",
+                   default=os.environ.get("RECORD_DIR", "/home/pi/uav-record"))
+    p.add_argument("--record-max-mb", type=int,
+                   default=int(os.environ.get("RECORD_MAX_MB", 512)))
+    p.add_argument("--record-keep", type=int,
+                   default=int(os.environ.get("RECORD_KEEP", 20)))
+    p.add_argument("--record-disarmed", action="store_true",
+                   default=os.environ.get("RECORD_DISARMED", "0") != "0",
+                   help="連未解鎖時也錄（預設否）")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",
