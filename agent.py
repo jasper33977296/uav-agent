@@ -358,6 +358,13 @@ class Agent:
         self.hello_sent = False
         self.drone_id = None
         self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
+        #: 配號（040）。`assigned_sysid` 是地面站的決定，`sysid_action` 是
+        #: keep／change。`reassigning` 非 None 時代表正在換號並重開飛控——
+        #: 它會被送上去，讓地面站不要把飛控消失當成失聯（設計 §3.3）
+        self.assigned_sysid = None
+        self.sysid_action = None
+        self.reassigning = None
+        self.reassign_tried = False
         self.backfill = None          # 斷線期間的取樣緩衝（C 層）
         #: intent_id → 送出去給人看的提案。**留在機上**：確認的時候不必讓
         #: 地面站把提案送回來，也就沒有「送回來的那份跟人看到的不一樣」的空間
@@ -681,6 +688,7 @@ class Agent:
         self._check_fs_gcs(now)
         self.request_streams_once()
         self.say_hello()
+        self._maybe_reassign(now)
         self._track_mode_owner()
         self._expire_seq(now)
         self._publish_state()
@@ -788,6 +796,10 @@ class Agent:
             "fw": self.mon.state.get("fw"),
             "vehicle_type": self.mon.state.get("vehicle_type"),
             "agent_version": AGENT_VERSION,
+            # **它現在用的號碼**（uav-system issues/040 A1）。地面站據此判斷
+            # 「它跑錯號碼了沒」——不送的話那頭只能配一個號給我們，
+            # 分不出「本來就用對了」與「不知道它用什麼」
+            "sysid": self.mon.state.get("sysid"),
         }
         try:
             req = urllib.request.Request(
@@ -798,12 +810,122 @@ class Agent:
                 res = json.loads(r.read() or b"{}")
             self.hello_sent = True
             self.drone_id = res.get("drone_id")
+            # 配號（040 A1／A3）。**只記下來，換號在 _maybe_reassign 裡做**——
+            # 註冊的回應處理不該順手重開飛控
+            self.assigned_sysid = res.get("assigned_sysid")
+            self.sysid_action = res.get("sysid_action")
+            if self.sysid_action == "change":
+                log.warning("⚠ 地面站配給這塊板子的號碼是 %s，我們現在用 %s：%s",
+                            self.assigned_sysid, self.mon.state.get("sysid"),
+                            res.get("sysid_reason"))
             log.info("已向地面站自報：%s（%s，board_uid=%s）", res.get("name"),
                      "**新建檔**" if res.get("created") else "既有記錄", uid)
             self._start_intent_link(uid, body)
         except Exception as e:
             # 失敗不設旗標＝下一拍重試。地面站可能還沒起來，或 5G 正好在抖。
             log.warning("自報身分失敗（%s），稍後重試", e)
+
+    #: 換號之後等飛控用新號碼回來的上限。超過就放棄並大聲說——**不要無限
+    #: 等一個不會回來的東西**，那會讓地面站的畫面永遠停在「換號中」
+    REASSIGN_TIMEOUT_S = 90.0
+    #: 可以換號的狀態。**只有這三個**：換號要重開飛控，而在天上重開飛控是
+    #: 不可想像的。用 flight_state() 而不是自己判 armed——全系統只有一份狀態定義
+    REASSIGN_OK_STATES = ("DISARMED", "NOT_READY", "READY")
+
+    def _maybe_reassign(self, now):
+        """地面站說「這個號碼不是配給你的」時，把它換過來（issues/040 A3）。
+
+        **這是本代理唯一會重開飛控的動作**，所以守門比其他地方都嚴：
+
+        * **只在地面**。`REASSIGN_OK_STATES` 三格，用 `flight_state()` 判——
+          全系統只有一份狀態定義，自己另外看一次 armed 會漂。
+        * **一個行程只試一次**。失敗就留給人，不要反覆重開飛控。
+        * **設了要讀回確認才重開**。ACK 是「我收到了」不是「我做到了」，
+          而這裡做錯的代價是重開一次飛控卻沒有換到號。
+        * **重開期間回報 `reassigning`**（設計 §3.3）。重開的是飛控不是 Pi，
+          所以意圖通道不會斷——地面站因此預期得到那塊板號會用新號碼回來，
+          **不會把舊號碼的消失當成失聯**。沒有這一格，換號動作本身就會觸發
+          039 的失聯處置：我們會為了修好身分而讓飛機以為地面站不見了。
+        """
+        if self.reassigning:
+            return self._watch_reassign(now)
+        if (self.sysid_action != "change" or self.reassign_tried
+                or not self.a.sysid_auto_apply):
+            return
+        want, have = self.assigned_sysid, self.mon.state.get("sysid")
+        if want is None or have is None or want == have:
+            return
+        st = self.flight_state()
+        if st not in self.REASSIGN_OK_STATES:
+            # **不要每拍抱怨**：這台機可能整趟飛行都在天上，換號等落地再說
+            if not getattr(self, "_reassign_wait_logged", False):
+                self._reassign_wait_logged = True
+                log.warning("要把 sysid %s 換成 %s，但現在是 %s——**等落地上鎖**"
+                            "（在天上重開飛控是不可想像的）", have, want, st)
+            return
+        self.reassign_tried = True
+        log.error("⚠ 換號：sysid %s → %s。**這會重開飛控**（機在地面且已上鎖）",
+                  have, want)
+        try:
+            # ⚠ **寫入的值域編碼是方言，而這裡只對 ArduPilot 驗過。**
+            # 讀取那一側已經走驅動（`decode_param`：PX4 把整數的位元組原樣塞進
+            # float32，ArduPilot 寫數值本身），**寫入沒有對應的 `encode_param`**。
+            # 不在這裡自己補一個 if：`autopilot/` 是上游的逐字複製品，
+            # 加東西會讓 `tools/driver-parity.py` 從此都是紅的，而那支護欄的
+            # 價值就在於它平常是綠的。**要補請補在上游**（uav-system 的
+            # `libs/autopilot`），下次同步就會拿到——與 `gcs_failsafe_params()`
+            # 同一條路徑。在那之前：**非 ArduPilot 機不要開自動換號**。
+            self.serial.mav.param_set_send(
+                have, 1, b"MAV_SYS_ID", float(want),
+                mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        except Exception:
+            log.exception("MAV_SYS_ID 送不出去，放棄換號")
+            return
+        try:      # 問回來才確認得了——PARAM_SET 之後機端不一定主動廣播
+            self.serial.mav.param_request_read_send(have, 1, b"MAV_SYS_ID", -1)
+        except Exception:
+            pass
+        self.reassigning = {"from": have, "to": want, "phase": "setting",
+                            "since": now}
+
+    def _watch_reassign(self, now):
+        """換號的後半段：確認參數 → 重開 → 等它用新號碼回來。"""
+        r = self.reassigning
+        cur = self.mon.state.get("sysid")
+        if now - r["since"] > self.REASSIGN_TIMEOUT_S:
+            log.error("⚠ 換號逾時（%s → %s，卡在 %s）——**放棄並留在原狀**。"
+                      "飛控可能沒吃這個參數，或重開後沒有回來；請人工確認",
+                      r["from"], r["to"], r["phase"])
+            self.reassigning = None
+            return
+        if r["phase"] == "setting":
+            # **讀回確認才重開**：ACK 是我收到了，不是我做到了。
+            # 每拍重問一次——57600 上單一封包丟失是真實風險
+            try:
+                self.serial.mav.param_request_read_send(
+                    r["from"], 1, b"MAV_SYS_ID", -1)
+            except Exception:
+                pass
+            got = (self.mon.state.get("params") or {}).get("MAV_SYS_ID")
+            if got is not None and int(got) == r["to"]:
+                log.warning("MAV_SYS_ID 已確認為 %s，重開飛控", r["to"])
+                try:
+                    self.serial.mav.command_long_send(
+                        r["from"], 1,
+                        mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                        0, 1, 0, 0, 0, 0, 0, 0)
+                except Exception:
+                    log.exception("重開指令送不出去")
+                    self.reassigning = None
+                    return
+                r["phase"], r["since"] = "rebooting", now
+            return
+        if r["phase"] == "rebooting" and cur == r["to"]:
+            log.warning("✓ 換號完成：飛控用 sysid %s 回來了", cur)
+            self.reassigning = None
+            self.sysid_action = "keep"
+            # **重新註冊**：讓地面站看到它現在用對號碼了（會拿到 keep）
+            self.hello_sent = False
 
     def _start_intent_link(self, uid, ident):
         """意圖通道（協定 §2）。**等註冊完才起**：地面站以 board_uid 認機，
@@ -1048,6 +1170,9 @@ class Agent:
             # `derived` 是整包原封鏡像的，位置放錯畫面就永遠是「不知道」。
             # **沒讀到就送 None**——不知道不擋，權威守門在這台機上
             "rc_link": s.get("rc_link"),
+            # 040 A3：正在換號。**放頂層與 rc_link 同理**——地面站的鏡像讀的是
+            # 頂層欄位，放進 derived 會讓畫面永遠看不到它
+            "reassigning": self.reassigning,
             "derived": {
                 "armed": bool(s.get("armed")),
                 "landed": s.get("landed_state"),
@@ -1435,6 +1560,13 @@ def main():
     p.add_argument("--seq-timeout-s", type=float,
                    default=float(os.environ.get("SEQ_TIMEOUT_S", 120.0)),
                    help="改航線序列多久沒進展就清掉序列旗標")
+    #: 040 A3：收到「這個號碼不是配給你的」時要不要自動換。**預設開**
+    #: （使用者裁定 sysid 由系統指派），但留一個關得掉的開關：**這是本代理
+    #: 唯一會重開飛控的動作**，現場調校時可能不希望它自己動。
+    #: 非 ArduPilot 機建議關掉——參數寫入的值域編碼還沒有跨廠牌驗過。
+    p.add_argument("--no-sysid-auto-apply", dest="sysid_auto_apply",
+                   action="store_false",
+                   default=os.environ.get("SYSID_AUTO_APPLY", "1") != "0")
     p.add_argument("--report-interval", type=float, default=10.0)
     p.add_argument("--state-file",
                    default=os.environ.get("STATE_FILE",
