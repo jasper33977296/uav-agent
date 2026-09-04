@@ -39,9 +39,19 @@ for st in STATES:
     print(f"{st:<16}{row}")
 
 print("\n── 不可退讓的幾格 ─────────────────────────────────────")
-# §5.4：飛手拿著就什麼都不做。這是最危險的一種分岔
-chk("PILOT_CONTROL 全部拒絕",
-    all(not guard.check("PILOT_CONTROL", a)[0] for a in ACTIONS))
+# §5.4：飛手拿著時系統**不主動介入**——但 2026-09-04 使用者裁定，
+# 操作員仍然叫得回它：`rtl`／`land` 放行，其餘一律拒絕。
+#
+# **這條的界線是「方向」不是「權限」**：rtl／land 把飛機帶回地面（飛手隨時
+# 可以切模式蓋掉），而 `abort` 把它切進 LOITER 停在原地——那才是接管。
+chk("PILOT_CONTROL 只放行 rtl／land",
+    {a for a in ACTIONS if guard.check("PILOT_CONTROL", a)[0]} == {"rtl", "land"},
+    sorted(a for a in ACTIONS if guard.check("PILOT_CONTROL", a)[0]))
+chk("**PILOT_CONTROL 仍然不准 abort**（那是接管，不是叫回來）",
+    not guard.check("PILOT_CONTROL", "abort")[0])
+chk("**PILOT_CONTROL 仍然不准 start_mission／pause／resume**",
+    not any(guard.check("PILOT_CONTROL", a)[0]
+            for a in ("start_mission", "pause", "resume", "change_route")))
 chk("DISCONNECTED 全部拒絕",
     all(not guard.check("DISCONNECTED", a)[0] for a in ACTIONS))
 # §3：禁止在飛行中重下 start_mission（會從頭開始飛）
