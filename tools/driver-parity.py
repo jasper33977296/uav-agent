@@ -19,8 +19,11 @@
 用法：python3 tools/driver-parity.py [uav-system 的路徑]
 """
 import hashlib
+import ast
+import copy
 import itertools
 import sys
+import time
 from pathlib import Path
 
 AGENT = Path(__file__).resolve().parent.parent
@@ -47,7 +50,14 @@ STATES = (None, "STANDBY", "ACTIVE", "CRITICAL", "EMERGENCY",
           "FLIGHT_TERMINATION")
 SENSORS = ([], ["GPS"], ["磁力計", "電池"])
 RAWS = (None, 3, 12)
-CASES = list(itertools.product(TRI, TRI, FIXES, STATES, SENSORS, RAWS))
+# 2026-09-04：機端也會收 `PreArm:` STATUSTEXT 了，所以「機上說了哪幾項」
+# 也是就緒判定的輸入之一——**含過期那一格**，因為兩邊的過期判準
+# （沒有再聽到就當它解決了）也必須一致，不只是格式一致
+_NOW = time.monotonic()
+MSGS = (None, {}, {"Battery 1 low voltage failsafe": _NOW},
+        {"RC not found": _NOW, "GPS: Bad fix": _NOW - 1},
+        {"很久沒再聽到的那一項": _NOW - 10_000})
+CASES = list(itertools.product(TRI, TRI, FIXES, STATES, SENSORS, RAWS, MSGS))
 
 # ArduPilot 的 custom_mode 是模式號；PX4 的是 main<<16|sub<<24 的 union。
 # 兩種編碼都掃，含表上沒有的值（那正是 decode 要老實回 MODE_n 的地方）
@@ -56,7 +66,7 @@ MODES_PX4 = [0] + [(m << 16) | (s << 24) for m in range(1, 9) for s in range(0, 
 
 
 def sweep_readiness(readiness_fn):
-    """readiness_fn(prearm, ekf, fix, mav_state, sensors, raw) → (ready, reasons)"""
+    """readiness_fn(prearm, ekf, fix, mav_state, sensors, raw, msgs) → (ready, reasons)"""
     return [readiness_fn(*c) for c in CASES]
 
 
@@ -71,11 +81,13 @@ from autopilot import get_driver as agent_get_driver              # noqa: E402
 import agent as agent_mod                                         # noqa: E402
 
 
-def _agent_readiness(prearm, ekf, fix, mav_state, sensors, raw):
-    return agent_norm.readiness({
-        "prearm_ok": prearm, "ekf_ok": ekf, "gps_fix_raw": fix,
-        "mav_state": mav_state, "sensors_unhealthy": sensors,
-        "autopilot_raw": raw})
+def _agent_readiness(prearm, ekf, fix, mav_state, sensors, raw, msgs):
+    st = {"prearm_ok": prearm, "ekf_ok": ekf, "gps_fix_raw": fix,
+          "mav_state": mav_state, "sensors_unhealthy": sensors,
+          "autopilot_raw": raw}
+    if msgs is not None:                     # None＝連這個鍵都沒有（舊版 state）
+        st["prearm_msgs"] = dict(msgs)
+    return agent_norm.readiness(st)
 
 
 agent_ready = sweep_readiness(_agent_readiness)
@@ -105,15 +117,47 @@ sys.path.insert(0, str(GS / "libs"))
 sys.path.insert(0, str(GS / "apps" / "backend"))
 
 from app.state import LiveState                                   # noqa: E402
+
+
+def _lift(path, cls, fn, consts):
+    """從原始碼裡取出一個方法來跑，不 import 整個模組。
+
+    `mavlink_rx` 會拉進 `db` → `asyncpg`，而這支工具刻意只靠標準庫（它要能
+    在任何一台機器上直接跑）。用 AST 取出**那一個方法**與它用到的模組常數，
+    比 stub 掉 asyncpg 誠實：找不到就爆，不會靜靜地測到一個假的東西。
+    """
+    tree = ast.parse(Path(path).read_text())
+    ns = {"time": time}                   # 取出來的方法要用的標準庫
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) in consts for t in node.targets):
+            exec(compile(ast.Module([node], []), path, "exec"), ns)
+        elif isinstance(node, ast.ClassDef) and node.name == cls:
+            for sub in node.body:
+                if isinstance(sub, ast.FunctionDef) and sub.name == fn:
+                    sub = copy.deepcopy(sub)
+                    sub.decorator_list = []
+                    exec(compile(ast.Module([sub], []), path, "exec"), ns)
+    missing = [c for c in consts if c not in ns] + ([fn] if fn not in ns else [])
+    if missing:                           # 搬過家就要知道，不要無聲跳過
+        sys.exit(f"**取不到 {path} 的 {missing}**——原始碼搬過家了，"
+                 f"這支工具要跟著改，不是把這一格拿掉")
+    return ns[fn]
+
+
+_gs_stx = _lift(GS / "apps" / "backend" / "app" / "mavlink_rx.py",
+                "MavlinkRx", "_stx_reassemble",
+                ("STX_CHUNK_LEN", "STX_STALE_S"))
 from autopilot import get_driver as gs_get_driver                  # noqa: E402
 from app import dialect as gs_dialect                              # noqa: E402
 
 
-def _gs_readiness(prearm, ekf, fix, mav_state, sensors, raw):
+def _gs_readiness(prearm, ekf, fix, mav_state, sensors, raw, msgs):
     st = LiveState()
     st.prearm_ok, st.ekf_ok = prearm, ekf
     st.gps_fix, st.mav_state = fix, mav_state
     st.sensors_unhealthy, st.autopilot_raw = sensors, raw
+    st.prearm_msgs = dict(msgs or {})
     return st.readiness()
 
 
@@ -151,8 +195,68 @@ poisoned[0] = (poisoned[0][0], ["故意寫錯"])
 chk("**反向驗證**：故意改一個原因字串，掃描抓得到",
     poisoned != gs_ready)
 # 三態的分界單獨釘一次——它是這次移植最容易搬錯的一格
-blank_a = _agent_readiness(None, None, None, None, [], 3)
+blank_a = _agent_readiness(None, None, None, None, [], 3, None)
 chk("空狀態＝ready None（不是 True，也不是 False）", blank_a[0] is None, blank_a)
+# 過期判準也要一起釘：同一組輸入，只差時間戳，結論必須不同
+fresh = _agent_readiness(False, None, None, None, [], 3, {"某項": time.monotonic()})
+stale = _agent_readiness(False, None, None, None, [], 3, {"某項": time.monotonic() - 10_000})
+chk("**過期會改變輸出**（不然上面那格等於沒測到過期）", fresh[1] != stale[1],
+    (fresh[1], stale[1]))
+chk("聽到就說得出是哪一項", any("某項" in r for r in fresh[1]), fresh[1])
+chk("過期後退回「還沒說是哪一項」而不是宣告已就緒",
+    fresh[0] is False and stale[0] is False
+    and any("還沒說是哪一項" in r for r in stale[1]), stale)
+
+print("\n── STATUSTEXT 分段重組：同一串框架，兩邊拼出同一句 ────")
+# **這一格是 2026-09-04 補上的，因為上面那個掃描抓不到它**：掃描餵的是
+# state dict，而分段重組發生在更上游（框架 → 整句）。代理原本沒有重組，
+# 50 字以上的預檢原因會被記成截斷的前半句，後半段又因為不再以 `PreArm:`
+# 開頭被整段丟掉——**輸出格式一致，內容卻是錯的**
+
+
+class _Stx:                               # 只帶重組看得到的三個欄位
+    def __init__(self, text, id=0, chunk_seq=0):
+        self.text, self.id, self.chunk_seq = text, id, chunk_seq
+
+
+def _chunks(sentence, cid=7):
+    """照 MAVLink2 的規則切段：滿 50 為續段，最後一段 <50。"""
+    n = agent_mod.Monitor.STX_CHUNK_LEN
+    segs = [sentence[i:i + n] for i in range(0, len(sentence), n)] or [""]
+    if len(segs[-1]) == n:                # 剛好整除：補一個空末段才收得了尾
+        segs.append("")
+    return [_Stx(seg, cid, i) for i, seg in enumerate(segs)]
+
+
+def _agent_join(frames):
+    tel = agent_mod.Monitor()
+    return [tel._stx_reassemble(f) for f in frames]
+
+
+def _gs_join(frames):
+    ent = {}
+    return [_gs_stx(None, ent, f) for f in frames]
+
+
+LONG = ("PreArm: EKF3 waiting for GPS configuration data and "
+        "compass calibration to finish before arming is allowed")
+STX_CASES = {
+    "短句（不分段，id=0）": [_Stx("PreArm: RC not found")],
+    "剛好 50 字": _chunks("P" * 50),
+    "長句（三段）": _chunks(LONG),
+    "亂序到達": list(reversed(_chunks(LONG))),
+}
+for label, frames in STX_CASES.items():
+    a, g = _agent_join(frames), _gs_join(frames)
+    chk(f"{label}：逐框架回傳相同", a == g, f"機端={a} 地面站={g}")
+whole = [x for x in _agent_join(_chunks(LONG)) if x is not None]
+chk("**長句拼得回原句**（不是只留前 50 字）", whole == [LONG],
+    whole)
+chk("**反向驗證**：不重組的話這一格會紅",
+    [f.text for f in _chunks(LONG)][0] != LONG)
+half = _agent_join(_chunks(LONG)[:2])
+chk("末段沒到就回 None——**寧可沒有原因也不吐半句**",
+    all(x is None for x in half), half)
 
 print("\n── 模式解讀：兩邊逐值相同 ─────────────────────────────")
 for raw, label in ((3, "ArduPilot"), (12, "PX4"), (None, "Unknown")):

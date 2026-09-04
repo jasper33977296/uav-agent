@@ -109,12 +109,31 @@ m2.feed(sys_status(present=GYRO, enabled=GYRO, health=GYRO))
 chk("**見過之後就一直信 health**：位元消失＝預檢未過，不是回到「不知道」",
     m2.state["prearm_ok"] is False, m2.state["prearm_ok"])
 d = N.derived(m2.state)
-# 2026-09-04：地面站那側現在說得出是哪一項預檢（從 `PreArm:` STATUSTEXT
-# 收集），而代理還沒有那個能力——**兩邊的退路字串必須一樣**，否則
-# `driver-parity` 會紅，而那個紅是對的。
+# 2026-09-04：沒聽到機上說是哪一項時，**要承認自己不知道**——
+# 不要讓「預檢未過」看起來像一句完整的原因
 chk("預檢未過會寫進原因，說得出是哪一家，**而且承認自己不知道是哪一項**",
     "ArduPilot 預檢未過（機上還沒說是哪一項）" in d["not_ready_reasons"],
     d["not_ready_reasons"])
+
+print("\n── 預檢原因：說得出是哪一項（2026-09-04）──────────────")
+import time as _t
+st = dict(m2.state)
+st["prearm_msgs"] = {"Battery 1 low voltage failsafe": _t.monotonic(),
+                     "RC not found": _t.monotonic()}
+d2 = N.derived(st)
+chk("**聽到機上說了就說出來**（不再只是「預檢未過」）",
+    any("Battery 1 low voltage failsafe" in r for r in d2["not_ready_reasons"]),
+    d2["not_ready_reasons"])
+chk("多項就列多項", sum("預檢未過：" in r for r in d2["not_ready_reasons"]) == 2,
+    d2["not_ready_reasons"])
+st["prearm_msgs"] = {"很久以前的那一項": _t.monotonic() - N.PREARM_TTL_S - 1}
+d3 = N.derived(st)
+chk("**過期的不算**——判準是「沒有再聽到」，飛控被擋住時會一直重講",
+    not any("很久以前" in r for r in d3["not_ready_reasons"]),
+    d3["not_ready_reasons"])
+chk("過期之後退回「還沒說是哪一項」，不是憑空消失",
+    any("機上還沒說是哪一項" in r for r in d3["not_ready_reasons"]),
+    d3["not_ready_reasons"])
 
 print("\n── 感測器異常：present 且 enabled 且不 health ──────────")
 m3 = A.Monitor()

@@ -87,7 +87,14 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.10.0"         # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land# 0.9：訊號記錄通道接上（研究資料原本沒在存）          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.11.0"         # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
+                                 # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land
+                                 # 0.9：訊號記錄通道接上（研究資料原本沒在存）
+                                 # 0.8：模式溯源三態（不知道 ≠ 飛手）
+                                 # 0.7：回傳現況上報（record_upload）＋遺失通報
+                                 # 0.6：機上錄製自動回傳
+                                 # 0.5：機上原始層錄製
+                                 # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -205,6 +212,39 @@ class Monitor:
         #: PREARM_CHECK 位元見過沒有（026 B4-b）。**黏性**：見過一次就信
         #: health 位元；從未見過＝韌體不回報，就緒判定退回次級訊號
         self._prearm_seen = False
+        #: STATUSTEXT 分段重組用（見 `_stx_reassemble`）
+        self._stx_buf = {}
+
+    #: STATUSTEXT `text` 欄位長度：滿 50＝還有下一段
+    STX_CHUNK_LEN = 50
+    #: 末段掉包時殘段逾時丟棄（秒）——**寧可整句丟掉也不吐半句**，
+    #: 半句預檢原因比沒有原因更糟：它看起來像完整答案
+    STX_STALE_S = 3.0
+
+    def _stx_reassemble(self, msg):
+        """回完整整句；分段未收完回 None。
+
+        MAVLink2 的 STATUSTEXT 把長訊息切成 50 字一段（同 `id`、`chunk_seq`
+        遞增）。**不重組就會把 50 字以上的預檢原因記成截斷的前半句**，而後
+        半段因為不再以 `PreArm:` 開頭會被整段丟掉——正好是最需要解釋的那幾
+        句最長。與地面站 `mavlink_rx._stx_reassemble` 同一套規則。
+        """
+        now = time.monotonic()
+        for k in [k for k, v in self._stx_buf.items()
+                  if now - v["t"] > self.STX_STALE_S]:
+            del self._stx_buf[k]
+        cid = getattr(msg, "id", 0) or 0
+        raw = msg.text or ""
+        if cid == 0:                      # 未分段（≤50 字，或舊韌體不切段）
+            return raw
+        seq = getattr(msg, "chunk_seq", 0) or 0
+        slot = self._stx_buf.setdefault(cid, {"parts": {}, "t": now})
+        slot["parts"][seq] = raw
+        slot["t"] = now
+        if len(raw) < self.STX_CHUNK_LEN:  # 末段（pymavlink 去尾 NUL 後 <50）
+            parts = self._stx_buf.pop(cid)["parts"]
+            return "".join(parts[k] for k in sorted(parts))
+        return None
 
     def feed(self, msg):
         t = msg.get_type()
@@ -333,11 +373,27 @@ class Monitor:
                            f"{(v >> 8) & 0xFF}"
                            + (f" ({kind})" if kind else f" (type {v & 0xFF})"))
         elif t == "STATUSTEXT":
-            txt = msg.text.strip()
+            whole = self._stx_reassemble(msg)
+            if whole is None:             # 還在收分段
+                return
+            txt = whole.strip()
             if txt:
                 self.events.append((now, "statustext",
                                     f"[sev{msg.severity}] {txt}"))
                 log.info("飛控訊息 [sev%d] %s", msg.severity, txt)
+                # **預檢失敗的原因，飛控本來就在講**——記下來，就緒判定才
+                # 說得出是哪一項。`prearm_ok is False` 只說得出「有一項沒過」。
+                #
+                # `PreArm:` 是被擋在解鎖之前，`Arm:` 是解鎖當下被拒——兩者都是
+                # 同一個問題的答案：「為什麼現在不能飛」。
+                #
+                # **與地面站 `mavlink_rx._statustext` 逐字相同的收集規則**：
+                # 兩份實作的輸出必須一樣（026 B4-d，`tools/driver-parity.py`）
+                for pfx in ("PreArm:", "Arm:"):
+                    if txt.startswith(pfx):
+                        s.setdefault("prearm_msgs", {})[
+                            txt[len(pfx):].strip()] = time.monotonic()
+                        break
 
     #: `RC_CHANNELS` 多久沒來就不再拿它下判斷。**「我們不再聽到」不等於
     #: 「RC 在」**——留著一個過期的計數，等於用舊事實回答關於現在的問題。

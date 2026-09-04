@@ -23,6 +23,8 @@
 
 本模組只負責前兩者的分界；「整個鍵不存在」由呼叫端決定（見 `agent.py`）。
 """
+import time
+
 from autopilot import autopilot_name, get_driver
 
 #: MAV_STATE（`mavlink_rx.py` 的 `_MAV_STATE`，逐字）
@@ -30,6 +32,24 @@ MAV_STATE = {0: "UNINIT", 1: "BOOT", 2: "CALIBRATING", 3: "STANDBY",
              4: "ACTIVE", 5: "CRITICAL", 6: "EMERGENCY", 7: "POWEROFF",
              8: "FLIGHT_TERMINATION"}
 FAILSAFE_STATES = ("CRITICAL", "EMERGENCY", "FLIGHT_TERMINATION")
+
+#: 預檢失敗原因多久沒再聽到就當它已經解決（秒）。**與地面站
+#: `state.PREARM_TTL_S` 逐字相同**——兩份實作漂了，`driver-parity` 就會紅。
+#: ArduPilot 實測約每分鐘重講一次，取 3 分鐘＝漏掉兩次也還算數。
+PREARM_TTL_S = 180.0
+
+
+def prearm_said(s: dict) -> list[str]:
+    """機上此刻還在講的預檢失敗原因（`agent.py` 從 STATUSTEXT 收進 state）。
+
+    **要過期，而判準是「沒有再聽到」不是「時間到了」**：ArduPilot 只在被擋住
+    時週期性重講，所以很久沒聽到多半代表那一項已經解決——把它繼續掛在畫面上，
+    就是拿一個已經不成立的理由擋人。
+    """
+    msgs = s.get("prearm_msgs") or {}
+    now = time.monotonic()
+    return [t for t, at in sorted(msgs.items(), key=lambda kv: -kv[1])
+            if now - at < PREARM_TTL_S]
 
 #: SYS_STATUS 的感測器位元 → 人話名（`mavlink_rx.py` 的 `_SENSOR_BITS`，逐字）。
 #: **名字是契約的一部分**：它們會出現在 `not_ready_reasons` 裡被逐字比對
@@ -94,15 +114,18 @@ def readiness(s: dict) -> tuple[bool | None, list]:
 
     reasons = []
     if prearm_ok is False:
-        reasons.append(
-            # **與地面站 `state.py::readiness()` 逐字相同**（026 B4-d 的契約：
-            # 同樣的輸入必須有同樣的輸出，`tools/driver-parity.py` 每次都比）。
-            # 2026-09-04 地面站那側改了這句——它現在說得出是哪一項預檢
-            # （從 `PreArm:` STATUSTEXT 收集），而**這裡還沒有那個能力**：
-            # 代理看得到那些 STATUSTEXT，只是還沒把它們記進 state。
-            # 在補上之前，兩邊的**退路字串**必須一樣，否則 parity 會紅——
-            # 而那個紅是對的，它說的就是「兩份實作開始漂了」。
-            f"{prearm_label(s.get('autopilot_raw'))} 預檢未過（機上還沒說是哪一項）")
+        # **與地面站 `state.py::readiness()` 逐字相同**（026 B4-d 的契約：
+        # 同樣的輸入必須有同樣的輸出，`tools/driver-parity.py` 每次都比）。
+        label = prearm_label(s.get("autopilot_raw"))
+        said = prearm_said(s)
+        if said:
+            # **說得出是哪一項就說**——「預檢未過」是一句不可行動的話，
+            # 而「Battery 1 low voltage failsafe」是一句可以去處理的話
+            reasons += [f"{label} 預檢未過：{t}" for t in said]
+        else:
+            # 沒聽到機上說（韌體不講、或它講過而我們是之後才接上的）。
+            # **要說出「不知道是哪一項」**，不要讓它看起來像一句完整的原因
+            reasons.append(f"{label} 預檢未過（機上還沒說是哪一項）")
     reasons += [f"感測器異常：{n}" for n in (s.get("sensors_unhealthy") or [])]
     if ekf_ok is False:
         reasons.append("EKF 未就緒")
