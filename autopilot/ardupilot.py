@@ -194,6 +194,20 @@ class ArduPilotDriver:
     def limits(self) -> dict[str, Limit]:
         return {"takeoff_alt_m": Limit(confidence="unverified")}
 
+    def battery_low_params(self) -> dict[str, str]:
+        """低電量門檻的參數名。
+
+        ArduPilot 用**電壓**（`BATT_LOW_VOLT`，伏特）與**剩餘容量**
+        （`BATT_LOW_MAH`，毫安時）——注意後者是 mAh 不是百分比，
+        而百分比是飛控自己用 `BATT_CAPACITY` 換算出來的。
+
+        ⚠ **`BATT_LOW_VOLT` 的預設值是給 3S 的（10.5V）。** 2026-09-02 在
+        本專案的 4S 機上實測到它還停在預設——那等於 2.63 V/cell，
+        **不是門檻設得太鬆，是設給另一種電池的**。呼叫端拿到值之後不該
+        直接相信它合理，那是部署查核表的事（`doc/failsafe-checklist.md`）。
+        """
+        return {"low_volt": "BATT_LOW_VOLT", "low_mah": "BATT_LOW_MAH"}
+
     def gcs_failsafe_params(self) -> dict[str, str]:
         """地面站失聯 failsafe 的參數名（issues/033 §1.3，2026-09-01 裁定）。
 

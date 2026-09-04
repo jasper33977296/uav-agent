@@ -51,6 +51,7 @@ class Fake(A.Agent):
         self.mode_req = None
         self.loss_warned = False
         self.loss_acted = False
+        self.takeover = None            # 接管紀錄（2026-09-04）：測判定不測留痕
         self.gs_link_ok = False
         self.last_gs_rx = 0.0
         self.serial = types.SimpleNamespace(

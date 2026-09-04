@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.9.0"          # 0.9：訊號記錄通道接上（研究資料原本沒在存）          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
+AGENT_VERSION = "0.10.0"         # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land# 0.9：訊號記錄通道接上（研究資料原本沒在存）          # 0.8：模式溯源三態（不知道 ≠ 飛手）          # 0.7：回傳現況上報（record_upload）＋遺失通報          # 0.6：機上錄製自動回傳          # 0.5：機上原始層錄製          # 0.4：驅動搬到機上（026 B4-b）、039 複裁六項
 #                                 （RC 前置／逐則回執／乾跑補送／電量未知不續飛）、
 #                                 補傳改單調時鐘、FS_GCS 開機自檢
 # **改了行為就要改這個字串。** 0.3 → 0.4 的八個 commit 一次都沒有動它，於是
@@ -453,6 +453,9 @@ class Agent:
         self.loss_warned = False
         self.loss_acted = False
         self.loss_started = None
+        #: 接管中的話，記著從什麼時候開始、失聯當下的狀態、以及期間做過什麼。
+        #: **不是一個布林值**：恢復時要交代得出來（見 `_check_gs_link`）
+        self.takeover = None
         self.modem = None
         self.recorder = None      # 機上原始層錄製（014）
         self.uploader = None      # 那份錄製的自動回傳（014）
@@ -526,6 +529,48 @@ class Agent:
         return get_driver(self.mon.state.get("autopilot_raw")
                           ).gcs_failsafe_params() or {}
 
+    def _batt_names(self):
+        """這台機的低電量門檻參數叫什麼——**向驅動要，不要寫死**（同 `_fs_gcs_names`）。"""
+        return get_driver(self.mon.state.get("autopilot_raw")
+                          ).battery_low_params() or {}
+
+    def _battery_verdict(self):
+        """接管期間：該不該因為電量回家。回 `(要回家嗎, 說得出口的理由)`。
+
+        **兩個判準任一觸發就回家；兩個都讀不到也回家**（2026-09-04 使用者裁定）。
+
+        為什麼要兩個：`battery_pct` 來自飛控的電流積分，而那個積分的刻度
+        （`BATT_AMP_PERVLT`）在本專案**沒有人驗過**——2026-09-02 實測畫面顯示
+        58%，而那顆電池的電壓已經接近見底。**只看百分比會在錯的時候放行。**
+        電壓比較誠實（雖然負載下會下垂），所以兩個並聯：任一說不行就不行。
+
+        **電壓門檻向飛控要**（`BATT_LOW_VOLT`），不自己編：編出來的數字與
+        飛控自己的設定不一致時，兩層會在不同時間點動作，而沒有人說得出為什麼。
+        讀不到就只剩百分比那條——而那要說出來。
+        """
+        s = self.mon.state
+        pct, volt = s.get("battery_pct"), s.get("voltage")
+        params = s.get("params") or {}
+        low_v = params.get((self._batt_names() or {}).get("low_volt", ""))
+        hits, known = [], []
+        if pct is not None:
+            known.append(f"電量 {pct}%")
+            if pct < self.a.link_loss_min_batt:
+                hits.append(f"電量 {pct}% 低於 {self.a.link_loss_min_batt}%")
+        if volt is not None and low_v:
+            known.append(f"電壓 {volt:.2f}V")
+            if volt <= low_v:
+                hits.append(f"電壓 {volt:.2f}V 已到飛控的低電量門檻 {low_v:.2f}V")
+        if not known:
+            # **不知道就回家。** 這與 `rc_link` 的 None 方向相反，而方向是由
+            # 「不知道時哪一邊會出事」決定的：不知道還剩多少電就繼續飛，
+            # 出事的是飛機（039 複裁 E 的同一條，這裡延伸到整個接管期間）
+            return True, ("電量與電壓都讀不到"
+                          + ("" if low_v else "（也讀不到飛控的電壓門檻）"))
+        if hits:
+            return True, "；".join(hits)
+        return False, "、".join(known) + " 都還在門檻上"
+
     def request_fs_gcs(self, now):
         """開機時問一次飛控的失聯 failsafe 設定（039，2026-09-01 裁定）。
 
@@ -537,7 +582,9 @@ class Agent:
         tgt = s.get("sysid")
         if tgt is None or self.fs_gcs_said:
             return
-        names = list(self._fs_gcs_names().values())
+        # 電池門檻一起要——**接管期間要用它判斷該不該回家**，而代理不該
+        # 自己編一個電壓數字（見驅動的 `battery_low_params` 說明）
+        names = list(self._fs_gcs_names().values()) + list(self._batt_names().values())
         if not names:
             return                               # 驅動沒有意見，不要製造意見
         got = s.get("params") or {}
@@ -1378,11 +1425,32 @@ class Agent:
                     log.warning("地面站鏈路恢復（中斷 %.0f 秒）", dur)
                     self.mon.events.append(
                         (now, "gs_link", f"地面站鏈路恢復（中斷 {dur:.0f}s）"))
+                    # **接管結束要交代做過什麼。** 「我不在的時候發生了什麼」
+                    # 是操作員回來第一個要問的問題，而唯一答得出來的是代理
+                    if self.takeover:
+                        acts = self.takeover["acts"]
+                        log.warning("**接管結束**（%.0f 秒）：%s", dur,
+                                    "；".join(acts) if acts else "期間沒有動作")
+                        self.mon.events.append(
+                            (now, "takeover",
+                             f"代理接管結束（{dur:.0f}s）："
+                             + ("；".join(acts) if acts else "期間沒有動作")))
+                        self.takeover = None
                 self.loss_warned = self.loss_acted = False   # 解除警戒
                 self._solo_logged = False
                 self.loss_started = None
             else:
                 self.loss_started = self.last_gs_rx
+                # **接管開始**（2026-09-04 使用者定義）：原本連著、而且在飛，
+                # 然後意外斷線。從這一刻到連線恢復為止，代理是唯一的決策者
+                # ——所以它做的每一件事都要留痕，恢復時人才看得到發生過什麼
+                if self.mon.state.get("armed"):
+                    st0 = self.flight_state()
+                    self.takeover = {"since": now, "state": st0, "acts": []}
+                    log.warning("⚠ **代理接管**（失聯時狀態 %s）"
+                                "——到連線恢復為止由代理決定", st0)
+                    self.mon.events.append(
+                        (now, "takeover", f"代理接管（失聯時 {st0}）"))
             return
 
         if ok:
@@ -1557,19 +1625,12 @@ class Agent:
             log.error("失聯處置遇到未列入的狀態 %s → 不動作", state)
             return False
         # ── FLYING_MISSION：跑完再 RTL，但有兩個上限 ──────────────
-        batt = self.mon.state.get("battery_pct")
-        # **讀不到電量＝不准續飛**（039 複裁 E，2026-08-31 使用者裁定）。
-        # 原本這裡是 `batt is not None and ...`——電量未知時整項檢查被跳過，
-        # 等於把「不知道」當成「電量充足」。而這條規則存在的前提就是知道還剩
-        # 多少電：前提不成立時不該假設它成立。
-        # **注意這與 rc_link 的 None 方向相反**，兩者不是同一種「不知道」：
-        # RC 那個 None 是「這台韌體沒回報過這個欄位」＝擋了就永遠不能起飛；
-        # 這個 None 是「續飛所依賴的事實現在讀不到」＝不擋就在無人監看下
-        # 帶著未知電量繼續飛。方向由「不知道時哪一邊會出事」決定，不是慣例
-        if batt is None:
-            return "讀不到電量——不知道還剩多少電就不續飛（複裁 E）"
-        if batt < self.a.link_loss_min_batt:
-            return f"電量 {batt}% 低於 {self.a.link_loss_min_batt}%"
+        # **電量：兩個判準任一觸發就回家，兩個都讀不到也回家**
+        # （2026-09-04 使用者裁定；039 複裁 E 的延伸）。判定與理由都在
+        # `_battery_verdict` 裡——那裡也說明了為什麼不能只看百分比。
+        go_home, why = self._battery_verdict()
+        if go_home:
+            return why
         # 用 is None 而不是 `or`：loss_started 是 epoch 秒數，`or` 會把
         # 合法的 0.0 當成未設定——測試就是這樣抓到的（單飛上限永不觸發）
         base = now if self.loss_started is None else self.loss_started
@@ -1599,6 +1660,8 @@ class Agent:
 
     def _do_link_loss_action(self, now, age, mode, why):
         self.loss_acted = True
+        if self.takeover is not None:
+            self.takeover["acts"].append(f"{self.a.link_action.upper()}（{why}）")
         want = self.a.link_action.upper()
         code = COPTER_MODE_ID.get(want)
         if code is None:

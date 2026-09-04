@@ -95,7 +95,14 @@ def readiness(s: dict) -> tuple[bool | None, list]:
     reasons = []
     if prearm_ok is False:
         reasons.append(
-            f"{prearm_label(s.get('autopilot_raw'))} 預檢未過（arming checks）")
+            # **與地面站 `state.py::readiness()` 逐字相同**（026 B4-d 的契約：
+            # 同樣的輸入必須有同樣的輸出，`tools/driver-parity.py` 每次都比）。
+            # 2026-09-04 地面站那側改了這句——它現在說得出是哪一項預檢
+            # （從 `PreArm:` STATUSTEXT 收集），而**這裡還沒有那個能力**：
+            # 代理看得到那些 STATUSTEXT，只是還沒把它們記進 state。
+            # 在補上之前，兩邊的**退路字串**必須一樣，否則 parity 會紅——
+            # 而那個紅是對的，它說的就是「兩份實作開始漂了」。
+            f"{prearm_label(s.get('autopilot_raw'))} 預檢未過（機上還沒說是哪一項）")
     reasons += [f"感測器異常：{n}" for n in (s.get("sensors_unhealthy") or [])]
     if ekf_ok is False:
         reasons.append("EKF 未就緒")

@@ -102,6 +102,11 @@ class UnknownDriver:
         # 誤讀成「讀不到＝沒設定」）
         return {}
 
+    def battery_low_params(self):
+        # 同上：不知道的廠牌不猜參數名。呼叫端讀不到電壓門檻時只剩百分比
+        # 那一條判準，**而那件事要說出來**，不能靜靜地少用一個判準
+        return {}
+
     def capabilities(self, ctx=None):
         r = "非 MAVLink 或未知自駕儀，不支援指令"
         return {k: "unsupported" for k in CAP_KEYS}, {k: r for k in CAP_KEYS}

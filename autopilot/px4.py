@@ -143,6 +143,19 @@ class Px4Driver:
         # B3 一致性測試實測後才會升成 sitl。
         return {"takeoff_alt_m": Limit(confidence="unverified")}
 
+    def battery_low_params(self) -> dict[str, str]:
+        """低電量門檻的參數名。
+
+        PX4 用的是**比例**（`BAT_LOW_THR`，0–1 的小數，預設 0.15）與
+        每 cell 電壓（`BAT_V_EMPTY`／`BAT_V_CHARGED`）。**與 ArduPilot 不只是
+        改名**：ArduPilot 的 `BATT_LOW_VOLT` 是整包電壓，PX4 的
+        `BAT_V_EMPTY` 是**單 cell** ——同一個數字在兩家差 cell 數倍。
+        呼叫端要照這個語意讀。
+
+        ⚠ **未在真的 PX4 上覆核過**（本專案的實機是 ArduPilot 4.7）。
+        """
+        return {"low_pct_frac": "BAT_LOW_THR", "empty_volt_per_cell": "BAT_V_EMPTY"}
+
     def gcs_failsafe_params(self) -> dict[str, str]:
         """地面站失聯 failsafe 的參數名（issues/033 §1.3）。
 
