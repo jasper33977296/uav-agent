@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.12.0"         # 0.12：訊號只在離地時記（停在地面不入庫）
+AGENT_VERSION = "0.13.0"         # 0.13：--board-uid（只給模擬器；飛控報不出板號時）
                                  # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
                                  # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land
                                  # 0.9：訊號記錄通道接上（研究資料原本沒在存）
@@ -205,7 +205,11 @@ class Monitor:
     飛安決策留給飛控自己的 failsafe 與地面站，代理只負責看見與轉述。
     """
 
-    def __init__(self):
+    def __init__(self, sim_board_uid=None):
+        #: `--board-uid`：**只在飛控自己報不出板子身分時頂上，而且只在明確
+        #: 指定時存在**。不給＝維持原行為（沒有 uid 就不註冊）。見 `_board_uid`。
+        self.sim_board_uid = sim_board_uid
+        self._sim_uid_logged = False
         self.state = {}
         self.last_hb = 0.0
         self.counts = defaultdict(int)
@@ -364,8 +368,8 @@ class Monitor:
             # 板子身分（uav-system issues/038）。**代理原本只轉發不解**——
             # 但註冊要以 board_uid 為鍵，所以自己也得看得懂。
             uid2 = bytes(getattr(msg, "uid2", b"") or b"").rstrip(b"\x00")
-            s["board_uid"] = uid2.hex() if uid2 else (
-                f"{msg.uid:016x}" if getattr(msg, "uid", 0) else None)
+            s["board_uid"] = self._board_uid(uid2.hex() if uid2 else (
+                f"{msg.uid:016x}" if getattr(msg, "uid", 0) else None))
             v = getattr(msg, "flight_sw_version", 0) or 0
             if v:
                 kind = {255: "official", 128: "rc", 64: "beta",
@@ -434,6 +438,44 @@ class Monitor:
             self.events.append((time.time(), "rc_link", txt))
             log.info("狀態變化：%s（來源 %s）", txt, s.get("rc_source"))
 
+    def _board_uid(self, real):
+        """飛控報出來的板子身分 → 實際要用的值。**沒有旗標時原樣回傳。**
+
+        `--board-uid` 存在的唯一理由是模擬器：ArduPilot SITL 的
+        `AUTOPILOT_VERSION` 回 `uid=0`、`uid2` 全零（2026-09-07 實測，
+        `COMMAND_ACK` 是 0＝它有回答，只是沒有身分可報），算出來的
+        `board_uid` 因此是 `None`。於是 `say_hello()` 每一拍都在
+        「還沒問到板子身分」那一行退掉 → 永遠不註冊 → 意圖通道不起 →
+        地面站判 `unmanaged` → command 服務全部 403。**模擬器在本系統的規則
+        下永遠不可能被指揮**，任何走 command 的端到端測試都因此跑不了。
+
+        **不做成靜默 fallback，這是刻意的。** 沒有旗標就維持原行為——
+        **實體環境沒有 uid 就是不往下走**，那正是 issues/038 的核心（資料被
+        記在錯的記錄名下）。真機的 `AUTOPILOT_VERSION` 請求本來就可能失敗
+        （ArduPilot 不主動送，要開口問），若那時自動編一個身分出來，一架真
+        飛機的架次就會記進一筆虛構的板子底下——而且是靜默發生的。
+
+        **飛控報得出來就一定用真的**：拿這個旗標指著一台真機也搶不走它的身分。
+
+        值請用固定且自我識別的字串（例如 `sitl-ardu-10`）：地面站的
+        `ensure_drone_by_board` 以 uid 為鍵冪等建檔，每次換一個新值等於每次
+        長出一筆新的機體記錄，架次會散在好幾筆底下。
+        """
+        if not self.sim_board_uid:
+            return real
+        if real:
+            if not self._sim_uid_logged:
+                self._sim_uid_logged = True
+                log.warning("飛控報得出板子身分（%s），忽略 --board-uid %s"
+                            "——真的永遠優先", real, self.sim_board_uid)
+            return real
+        if not self._sim_uid_logged:
+            self._sim_uid_logged = True
+            log.warning("⚠ 飛控沒有回報板子身分，改用 --board-uid「%s」。"
+                        "**這是模擬身分，不是真板子**——這筆機體記錄底下的資料"
+                        "不代表任何一架實體飛機", self.sim_board_uid)
+        return self.sim_board_uid
+
     def _change(self, key, val, message):
         if self.state.get(key) != val:
             prev = self.state.get(key)
@@ -446,7 +488,7 @@ class Monitor:
 class Agent:
     def __init__(self, a):
         self.a = a
-        self.mon = Monitor()
+        self.mon = Monitor(sim_board_uid=getattr(a, "board_uid", None))
         self.telem = Link("telemetry(14540)", a.gs, a.telemetry_port)
         self.cmd = Link("command(14541)", a.gs, a.command_port)
         self.serial = None
@@ -1811,6 +1853,11 @@ class Agent:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dev", default=os.environ.get("FC_DEV", "/dev/ttyAMA0"))
+    # **只給模擬器用**：飛控報不出板子身分時改用這個值。不給＝維持原行為，
+    # 沒有 uid 就不註冊——實體環境唯一正確的行為（見 Monitor._board_uid）
+    p.add_argument("--board-uid", default=os.environ.get("BOARD_UID"),
+                   help="飛控沒有回報板子身分時改用這個值（只給 SITL；"
+                        "飛控報得出來時一律用真的）")
     p.add_argument("--baud", type=int,
                    default=int(os.environ.get("FC_BAUD", 57600)))
     p.add_argument("--gs", default=os.environ.get("GS_HOST", "10.141.2.21"))
