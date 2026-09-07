@@ -87,7 +87,9 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.13.0"         # 0.13：--board-uid（只給模擬器；飛控報不出板號時）
+AGENT_VERSION = "0.14.0"         # 0.14：取樣率修正（設定 1Hz 實際只有 0.38Hz）＋蒐集與傳送分家
+                                 # 0.13：--board-uid（只給模擬器；飛控報不出板號時）
+                                 # 0.12：訊號只在離地時記（停在地面不入庫）
                                  # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
                                  # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land
                                  # 0.9：訊號記錄通道接上（研究資料原本沒在存）
@@ -834,6 +836,10 @@ class Agent:
                 # 記錄通道要說得出這批樣本是誰的。**多機時不能靠「主機」**
                 # ——那是排版設定不是身分（issues/040 A4）
                 drone_id_fn=lambda: self.drone_id,
+                # **蒐集與傳送分開**（2026-09-07 使用者裁定）：取樣可以密，
+                # 即時通道每秒一次就夠。畫面要的是「現在好不好」，記錄要的
+                # 是密度——綁在一起等於讓畫面的需求決定研究資料的解析度
+                live_interval=self.a.modem_live_interval,
                 # 2026-09-07 使用者裁定：**停在地面上就不要記**。
                 # 即時通道照送（起飛前要看得到訊號好不好），停的是入庫那條
                 airborne_fn=self.airborne)
@@ -1872,6 +1878,9 @@ def main():
     p.add_argument("--modem-port", default=os.environ.get("MODEM_PORT",
                                                           "/dev/ttyUSB1"),
                    help="5G 模組的 AT 埠；設為空字串可停用訊號採樣")
+    p.add_argument("--modem-live-interval", type=float,
+                   default=float(os.environ.get("MODEM_LIVE_INTERVAL", 1.0)),
+                   help="即時通道多久送一次（秒）。取樣可以更密，這只管畫面")
     p.add_argument("--modem-interval", type=float,
                    default=float(os.environ.get("MODEM_INTERVAL", 1.0)))
     # ── 地面失聯處置（飛安相關，預設值刻意保守）──────────────────

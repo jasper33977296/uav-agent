@@ -53,9 +53,17 @@ class ModemSampler(threading.Thread):
     daemon = True
 
     def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
-                 drone_id_fn=None, airborne_fn=None):
+                 drone_id_fn=None, airborne_fn=None, live_interval=1.0):
         super().__init__(name="modem-sampler")
         self.port, self.interval = port, interval
+        #: 即時通道多久送一次（2026-09-07 使用者裁定：**蒐集可以密，傳送每秒
+        #: 一次就夠**）。畫面看的是「現在訊號好不好」，不需要比人眼更快；
+        #: 而記錄通道要的是密度，兩者的需求本來就不同，綁在一起等於讓畫面的
+        #: 需求決定研究資料的解析度。
+        self.live_interval = live_interval
+        self._next_live = 0.0
+        #: 最近幾次取樣的時間點，用來算**實際**取樣率（見 `stats`）
+        self._ticks = deque(maxlen=32)
         base = f"http://{gs_host}:{gs_port}/api/link-metrics"
         self.url = f"{base}/live"          # 即時通道：只給畫面看，**不入庫**
         self.batch_url = f"{base}/batch"   # 記錄通道：**唯一的入庫路徑**
@@ -97,11 +105,30 @@ class ModemSampler(threading.Thread):
         return self.ser
 
     def _at(self, cmd, wait=0.5):
+        """送一個 AT 指令並讀回應。**`wait` 是逾時上限，不是固定等待。**
+
+        原本是 `write` 之後無條件 `time.sleep(wait)` 再讀——不管數據機多快回。
+        2026-09-07 實測 FM160：三個指令合計實際回覆 **49 毫秒**，而程式等了
+        **1.6 秒**，97% 是白等的。那 0.5／0.7／0.4 是「猜一個夠久的數字」，
+        猜保守了 30 倍。
+
+        改成讀到 `OK`／`ERROR` 為止。逾時上限保留原值，所以**最壞情況不變**，
+        只是不再為了最壞情況付出每一次的代價。
+        """
         s = self._open()
         s.reset_input_buffer()
         s.write((cmd + "\r\n").encode())
-        time.sleep(wait)
-        return s.read(s.in_waiting or 1).decode("utf-8", "replace")
+        deadline = time.monotonic() + wait
+        buf = b""
+        while time.monotonic() < deadline:
+            n = s.in_waiting
+            if n:
+                buf += s.read(n)
+                if b"OK" in buf or b"ERROR" in buf:
+                    break
+            else:
+                time.sleep(0.005)
+        return buf.decode("utf-8", "replace")
 
     # ── 解析 ──────────────────────────────────────────────────
     def _parse_cesq(self, txt):
@@ -312,11 +339,14 @@ class ModemSampler(threading.Thread):
         log.info("模組採樣啟動：%s → %s（每 %.1fs）；記錄通道 %s（每 %.0fs 一批）",
                  self.port, self.url, self.interval, self.batch_url, BATCH_EVERY_S)
         while True:
+            t_start = time.monotonic()
             try:
                 s = self.sample()
-                if s:
-                    # 即時通道送失敗不重試：下一秒的新樣本本來就會取代這一筆，
-                    # 重試只會佔用本來就不夠的頻寬（backend 註解明載此意圖）
+                self._ticks.append(t_start)
+                # **即時通道節流**：畫面每秒一筆就夠，取樣可以更密。
+                # 送失敗不重試——下一筆本來就會取代它（backend 註解明載此意圖）
+                if s and t_start >= self._next_live:
+                    self._next_live = t_start + self.live_interval
                     self.post(s)
                 # 記錄通道：批次、可重送。**與即時通道分開**——即時送失敗
                 # 就算了（下一秒有新的），記錄送失敗要留著
@@ -326,11 +356,22 @@ class ModemSampler(threading.Thread):
                     self.flush()
             except Exception:
                 log.exception("採樣迴圈例外，吞掉續跑")
-            time.sleep(self.interval)
+            # **睡「還差多少」，不是固定睡滿。** 原本是工作完再睡 interval，
+            # 於是週期＝工作時間＋interval：設定 1.0s、實際量到 2.61s
+            # （2026-09-07）。工作很快時這個錯誤看不出來，正是它活這麼久的原因。
+            time.sleep(max(0.0, self.interval - (time.monotonic() - t_start)))
 
     def stats(self):
+        # **實際取樣率要報出來。** 系統原本沒有任何地方說得出自己多久取一次，
+        # 於是「設定 1Hz、實際 0.38Hz」躺了很久沒人發現——唯一看得出來的地方
+        # 是 link_metrics 的時間戳差，而那張表當時根本沒有真資料
+        hz = None
+        if len(self._ticks) >= 2:
+            span = self._ticks[-1] - self._ticks[0]
+            if span > 0:
+                hz = round((len(self._ticks) - 1) / span, 2)
         return {"samples": self.samples, "posted": self.posted,
-                "errors": self.errors,
+                "errors": self.errors, "hz": hz,
                 # **入庫筆數要與送出筆數分開報。** 「送出去了」不等於
                 # 「記下來了」——這整個 bug 就是活在那兩者之間
                 "stored": self.stored, "buffered": len(self.buf),
