@@ -87,7 +87,8 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.11.0"         # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
+AGENT_VERSION = "0.12.0"         # 0.12：訊號只在離地時記（停在地面不入庫）
+                                 # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
                                  # 0.10：失聯接管（電量兩判準）＋ PILOT_CONTROL 放行 rtl/land
                                  # 0.9：訊號記錄通道接上（研究資料原本沒在存）
                                  # 0.8：模式溯源三態（不知道 ≠ 飛手）
@@ -790,7 +791,10 @@ class Agent:
                 self._position, self.a.modem_interval,
                 # 記錄通道要說得出這批樣本是誰的。**多機時不能靠「主機」**
                 # ——那是排版設定不是身分（issues/040 A4）
-                drone_id_fn=lambda: self.drone_id)
+                drone_id_fn=lambda: self.drone_id,
+                # 2026-09-07 使用者裁定：**停在地面上就不要記**。
+                # 即時通道照送（起飛前要看得到訊號好不好），停的是入庫那條
+                airborne_fn=self.airborne)
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）
@@ -1569,15 +1573,7 @@ class Agent:
             return "READY" if fix in ("3D", "DGPS", "RTK_FLOAT", "RTK_FIXED") \
                 else "NOT_READY"
 
-        landed = s.get("landed_state")
-        if landed is None:
-            # 韌體不回報 landed_state：退回用高度與地速判「在地上」。
-            # **寧可判成飛行中**——判錯成「在地上」會漏掉該做的處置，
-            # 判錯成「飛行中」最多是多做一次
-            alt, spd = s.get("alt_rel_m"), s.get("groundspeed_ms")
-            landed = ("on_ground" if (alt is not None and alt < 1.0
-                                      and spd is not None and spd < 0.5)
-                      else "in_air")
+        landed = self._landed()
 
         mode = s.get("mode")
         if mode in SELF_RECOVERING:
@@ -1741,6 +1737,29 @@ class Agent:
                                     f"⚠ 地面失聯 {age:.0f}s（{why}）→ 下達 {want}"))
         except Exception:
             log.exception("失聯處置送出失敗")
+
+    def _landed(self):
+        """在地上還是在天上。`landed_state` 優先，韌體不回報就退回高度＋地速。
+
+        **寧可判成飛行中**——判錯成「在地上」會漏掉該做的處置，判錯成
+        「飛行中」最多是多做一次。訊號記錄沿用同一個方向：不知道有沒有離地
+        時照錄，因為**飛行中的量測補不回來**，多錄幾筆地面資料則刪得掉。
+
+        這裡是「在不在地上」的**唯一定義**：狀態機與訊號記錄共用它。
+        兩份實作一定會漂，而漂掉的那天沒有人會發現。
+        """
+        s = self.mon.state
+        landed = s.get("landed_state")
+        if landed is not None:
+            return landed
+        alt, spd = s.get("alt_rel_m"), s.get("groundspeed_ms")
+        return ("on_ground" if (alt is not None and alt < 1.0
+                                and spd is not None and spd < 0.5)
+                else "in_air")
+
+    def airborne(self):
+        """離地了沒（2026-09-07 使用者裁定：**只有飛離地面才記訊號**）。"""
+        return self._landed() != "on_ground"
 
     def _position(self):
         """給訊號採樣綁進同一筆樣本。**沒有定位就回 None，不填 0,0**——

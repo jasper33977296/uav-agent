@@ -53,7 +53,7 @@ class ModemSampler(threading.Thread):
     daemon = True
 
     def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
-                 drone_id_fn=None):
+                 drone_id_fn=None, airborne_fn=None):
         super().__init__(name="modem-sampler")
         self.port, self.interval = port, interval
         base = f"http://{gs_host}:{gs_port}/api/link-metrics"
@@ -62,6 +62,12 @@ class ModemSampler(threading.Thread):
         self.gs_host = gs_host
         self.get_position = get_position      # 由 agent 提供：當下的 lat/lon/alt
         self.drone_id_fn = drone_id_fn
+        #: 離地了沒（2026-09-07 使用者裁定：**只有飛離地面才記訊號**）。
+        #: None＝沒接＝一律記（舊行為），呼叫端沒給就不要自作主張少記東西
+        self.airborne_fn = airborne_fn
+        #: 因為停在地面而沒有記的筆數。**要看得見**——原本「送出去」與
+        #: 「記下來」之間的落差是無聲的，那正是訊號資料斷了三週沒人發現的原因
+        self.on_ground = 0
         self.ser = None
         self.samples = self.posted = self.errors = 0
         self.last = {}
@@ -214,9 +220,16 @@ class ModemSampler(threading.Thread):
                 out[k] = pos[k]
         self.samples += 1
         self.last = out
-        # **每一筆都進記錄緩衝。** `seq` 是必要的：地面站回 `accepted_seq`
-        # 告訴我們它收下了哪幾筆（**含它判定落在架次外而丟棄的**），
-        # 沒有序號就只能猜要刪哪幾筆
+        # **停在地面上就不記**（2026-09-07 使用者裁定）。即時通道在上面已經
+        # 送過了——起飛前要看得到訊號好不好，那是畫面不是紀錄。
+        #
+        # 判準用代理的 `airborne()`（`landed_state` 優先，退回高度＋地速），
+        # **不知道就照記**：飛行中的量測補不回來，多記幾筆地面資料刪得掉。
+        if self.airborne_fn is not None and not self.airborne_fn():
+            self.on_ground += 1
+            return out
+        # `seq` 是必要的：地面站回 `accepted_seq` 告訴我們它收下了哪幾筆
+        # （**含它判定落在架次外而丟棄的**），沒有序號就只能猜要刪哪幾筆
         self._seq += 1
         if len(self.buf) == self.buf.maxlen:
             self.dropped += 1
@@ -321,7 +334,7 @@ class ModemSampler(threading.Thread):
                 # **入庫筆數要與送出筆數分開報。** 「送出去了」不等於
                 # 「記下來了」——這整個 bug 就是活在那兩者之間
                 "stored": self.stored, "buffered": len(self.buf),
-                "dropped": self.dropped,
+                "dropped": self.dropped, "on_ground": self.on_ground,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
                 "pci": self.last.get("pci"), "cell_id": self.last.get("cell_id"),
