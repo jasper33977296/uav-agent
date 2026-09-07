@@ -87,7 +87,19 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.17.1"         # 0.17.1：啟動訊息把換檔條件全部列出來（原本只講尺寸上限）
+AGENT_VERSION = "0.18.0"         # 0.18.0：交換參數時把序列埠讓出來（地面站才讀得到參數）
+
+#: 讀寫參數期間把遙測串流讓開多久（秒）。**每收到一則參數訊息就重新計時**，
+#: 所以地面站連續問的時候線路會一直保持安靜，最後一則之後 `PARAM_QUIET_S`
+#: 自動恢復。
+#:
+#: 3 秒的來由：小於 `tick()` 裡「心跳在但遙測停了」的 5 秒門檻——**不能讓
+#: 自己的看門狗把這個暫停當成故障**，在交換到一半時把串流開回來。
+PARAM_QUIET_S = 3.0
+
+#: 會觸發讓路的訊息型別。讀與寫都算：兩者都要等飛控回一則 `PARAM_VALUE`，
+#: 而塞不進去的正是那一則。
+PARAM_MSGS = {"PARAM_REQUEST_READ", "PARAM_REQUEST_LIST", "PARAM_SET"}
                                  # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
                                  # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
                                  # 0.15：（已撤回）電量判準改成單一來源——前提是門檻設錯，而它沒錯
@@ -500,6 +512,18 @@ class Agent:
         self.serial = None
         self.last_stream_req = 0.0
         self.streams_requested = False
+        #: 參數交換讓路（v0.18.0）。**問題不在轉發，在頻寬**：飛控到 Pi 是
+        #: 57600 的序列埠，上面跑著約 27 種 4Hz 串流（實測 98 msg/s，約線路
+        #: 容量六成）。ArduPilot 送 `PARAM_VALUE` 前檢查 `HAVE_PAYLOAD_SPACE`，
+        #: **沒空間就安靜丟掉，而且單筆讀取不排隊重試**——所以切模式會成功
+        #: （`COMMAND_ACK` 小，塞得進去），讀參數永遠拿不到回覆。
+        #:
+        #: 這也是機上 `set-fc-params.py` 要求「先停掉代理再跑」的原因：
+        #: 那正是把串流關掉、把線路讓出來。這裡把同一件事做成自動的，
+        #: 代價從「停整個代理」降到「安靜三秒」。
+        self.quiet_until = 0.0        # >now 代表串流正讓路中
+        self.quiet_since = 0.0        # 這一輪讓路是什麼時候開始的（報表用）
+        self.quiet_blocked = 0.0      # 上次因為 armed 而拒絕讓路的時間
         self.caps_requested = False
         # 飛控 GCS failsafe 的開機自檢（uav-system 039，2026-09-01 裁定「開」）。
         # **一次就好，不週期重讀**——參數不會自己變，會變是因為有人去改，
@@ -834,6 +858,50 @@ class Agent:
         self.streams_requested = True
         self.request_streams()
 
+    def param_quiet(self, now: float):
+        """有人在跟飛控談參數 → 把序列埠讓出來（見 `quiet_until` 的說明）。
+
+        **解鎖中一律不讓路。** 讓路的代價是遙測停幾秒，而飛行中的遙測是
+        操作員唯一看得見的東西——為了讀一個參數把它關掉，是拿飛安換方便。
+        地面站那一側本來就拒絕在解鎖中寫參數；讀取沒有擋，所以這一道要在
+        這裡補上。擋下來的結果是參數讀不到，那是**誠實的失敗**：畫面會說
+        飛控沒有回覆，而不是悄悄關掉遙測。
+        """
+        if self.mon.state.get("armed"):
+            # 一分鐘只唸一次：地面站可能連續重試，日誌不該被洗版
+            if now - self.quiet_blocked > 60:
+                self.quiet_blocked = now
+                log.warning("解鎖中，不讓串流——參數要在地面改（飛行中的遙測"
+                            "不拿來換一個參數）")
+            return
+        first = now >= self.quiet_until
+        self.quiet_until = now + PARAM_QUIET_S
+        if first:
+            self.quiet_since = now
+            try:
+                tgt = self.mon.state.get("sysid", 1)
+                # 只送這一則就夠：`MAV_DATA_STREAM_ALL` + start_stop=0 把所有
+                # 串流率歸零。**不逐則送 SET_MESSAGE_INTERVAL(-1)**——那是
+                # 27 則帶 sleep 的迴圈，光關就要半秒，而我們要的是立刻空出來
+                self.serial.mav.request_data_stream_send(
+                    tgt, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 0, 0)
+                log.info("參數交換：串流讓路（最多 %.0fs，或最後一則參數訊息"
+                         "之後 %.0fs）", PARAM_QUIET_S, PARAM_QUIET_S)
+            except Exception as e:
+                # 讓不出來就算了，別讓它變成飛行操作的故障
+                log.warning("串流讓路失敗：%s", e)
+                self.quiet_until = 0.0
+
+    def param_quiet_end(self, now: float):
+        """讓路時間到 → 把串流開回來。**這件事不准漏做**，所以它在 `tick()`
+        的主線上，不掛在任何 try 裡面的分支。"""
+        if not self.quiet_until or now < self.quiet_until:
+            return
+        held = now - self.quiet_since
+        self.quiet_until = 0.0
+        log.info("參數交換結束：恢復串流（讓路 %.1fs）", held)
+        self.request_streams()
+
     def request_streams(self):
         """請求／重新請求遙測串流。舊式與新式兩條路都走。"""
         tgt = self.mon.state.get("sysid", 1)
@@ -938,6 +1006,7 @@ class Agent:
 
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
+        self.param_quiet_end(now)
         self.request_board_id()
         self.request_fs_gcs(now)
         self._check_fs_gcs(now)
@@ -955,7 +1024,11 @@ class Agent:
         # 這裡重送請求，而不是只在啟動時送一次。
         hb_ok = (now - self.mon.last_hb) < 5.0
         telem_stale = (now - self.last_telem_rx) > 5.0
-        if hb_ok and telem_stale and (now - self.last_stream_req) > 10.0:
+        # **讓路期間不要被自己的看門狗開回來。** 遙測停了正是我們要的，
+        # 那不是故障；`PARAM_QUIET_S` 已經取得比這裡的 5 秒門檻短，
+        # 這一條是雙保險（連續問參數會一直把 quiet_until 往後推）
+        quiet = now < self.quiet_until
+        if hb_ok and telem_stale and not quiet and (now - self.last_stream_req) > 10.0:
             log.warning("心跳在但遙測停了 %.0f 秒，重新請求串流",
                         now - self.last_telem_rx)
             self.request_streams()
@@ -982,6 +1055,12 @@ class Agent:
         for m in msgs:
             if m.get_type() != "BAD_DATA":
                 self._note_mode_request(m)
+                # 參數訊息經過這裡 → 把序列埠讓出來（v0.18.0）。
+                # **偵測而不是另開一條控制通道**：地面站送的本來就是標準
+                # MAVLink，我們是那條路徑上的必經之地，順手看一眼就有了
+                # ——與 `_note_mode_request` 同一個做法
+                if m.get_type() in PARAM_MSGS:
+                    self.param_quiet(time.time())
                 self._write(fd, m.get_msgbuf())
 
     def _note_mode_request(self, m):
@@ -1862,6 +1941,9 @@ class Agent:
             "tx_telemetry": self.telem.tx, "tx_command": self.cmd.tx,
             "rx_from_gs": self.telem.rx + self.cmd.rx,
             "fwd_to_fc": self.fwd_to_fc,
+            # 讓路中要**說出來**：這段期間遙測是我方刻意停的，不是故障。
+            # 沒有這一格，地面站看到的就只是「資料突然變舊」——與失聯同形
+            "param_quiet": time.time() < self.quiet_until,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
             "gs_link_ok": self.gs_link_ok,
             "state": self.flight_state(),
