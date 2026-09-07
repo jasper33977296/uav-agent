@@ -237,15 +237,22 @@ flip = (isinstance(a._loss_verdict(a.flight_state(), 10.0), str)
 print(f"{'✓' if flip else '✗'} 只改模式歸屬，LOITER 的處置由 RTL 翻成不介入")
 ok &= flip
 
-# ── 電量判準：只看飛控回報的剩餘電量（2026-09-07 使用者裁定）──────────
-# **這一段是補的，不是原本就有的。** 原本判準有兩條（電量＋電壓），而
-# 上面那張表只餵 `battery_pct`——**電壓那條從來沒有被任何測試碰過**，
-# 所以把它整條拿掉時一片綠。一個飛安判準在程式裡活了三天而零覆蓋。
-print("\n── 電量判準（單一來源：飛控回報的剩餘電量）──────────")
+# ── 電量判準：兩條都要有直接測試 ──────────────────────────────────
+# **這一段是補的，不是原本就有的。** 判準有兩條（電量＋電壓），而上面那張
+# 表只餵 `battery_pct`——**電壓那條從來沒有被任何測試碰過**。2026-09-07 把
+# 整條電壓判準拿掉時一片綠，才發現這件事。判準後來裝回來了（電池確認 4S，
+# 14.0V 本來就是對的），但**覆蓋率留著**：兩條各自都要能單獨翻轉結論。
+print("\n── 電量判準（電量＋電壓，任一觸發就回家）──────────")
+
+LOW = {"BATT_LOW_VOLT": 14.0}          # 4S：3.5 V/格，實機值
 
 
 def verdict(**st):
     st.setdefault("landed_state", "in_air")
+    # **一定要給 autopilot_raw**：`_batt_names()` 向驅動要參數名，不知道是
+    # 哪一家就回空表，電壓判準會被**靜默跳過**——第一版漏了這格，於是
+    # 「只有電壓低」那一格紅了，而紅的原因是測試沒設好，不是程式錯
+    st.setdefault("autopilot_raw", 3)          # ArduPilot
     return Fake(**st)._battery_verdict()
 
 
@@ -255,22 +262,26 @@ def vchk(label, cond, note=""):
     print(f"{'✓' if cond else '✗'} {label}{('｜' + str(note)) if note else ''}")
 
 
-go, why = verdict(battery_pct=8)
-vchk("電量低於門檻 → 回家", go and "8%" in why, why)
-go, why = verdict(battery_pct=80)
-vchk("電量足夠 → 不介入", not go, why)
+go, why = verdict(battery_pct=8, voltage=15.5, params=LOW)
+vchk("**只有電量低** → 回家", go and "8%" in why, why)
+go, why = verdict(battery_pct=80, voltage=12.37, params=LOW)
+vchk("**只有電壓低** → 回家（這一格原本零覆蓋）",
+     go and "12.37" in why, why)
+go, why = verdict(battery_pct=80, voltage=15.5, params=LOW)
+vchk("兩個都夠 → 不介入", not go, why)
 go, why = verdict()
-vchk("**讀不到電量 → 回家**（不知道時出事的是飛機）", go, why)
+vchk("**兩個都讀不到 → 回家**（不知道時出事的是飛機）", go, why)
+go, why = verdict(battery_pct=80, voltage=15.5, autopilot_raw=None)
+vchk("**不知道是哪家自駕儀 → 電壓判準被跳過，而且要說出來**",
+     not go and "只驗了電量" in why, why)
 
-# **電壓不該再影響結論。** 拿掉之後若有人把它加回來（或某條路徑仍在讀
-# `BATT_LOW_VOLT`），這一格會紅
-low = {"BATT_LOW_VOLT": 14.0}
-a1, _ = verdict(battery_pct=80, voltage=12.37, params=low)
-a2, _ = verdict(battery_pct=80, voltage=16.80, params=low)
-vchk("**電壓再低也不再翻轉結論**（12.37V vs 16.80V 同一個答案）",
-     a1 is False and a2 is False, (a1, a2))
-b1, _ = verdict(battery_pct=8, voltage=16.80, params=low)
-vchk("**反向驗證**：電壓再高也救不了低電量", b1 is True)
+# 反向驗證：兩條各自都要能單獨翻轉結論，否則等於只有一條在作用
+flip_v = verdict(battery_pct=80, voltage=12.37, params=LOW)[0] is True \
+    and verdict(battery_pct=80, voltage=15.50, params=LOW)[0] is False
+vchk("**反向驗證**：只動電壓就能翻轉結論", flip_v)
+flip_p = verdict(battery_pct=8, voltage=15.5, params=LOW)[0] is True \
+    and verdict(battery_pct=80, voltage=15.5, params=LOW)[0] is False
+vchk("**反向驗證**：只動電量就能翻轉結論", flip_p)
 
 print("\n" + ("全部通過" if ok else "**有未通過項目**"))
 sys.exit(0 if ok else 1)
