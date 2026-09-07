@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.18.0"         # 0.18.0：交換參數時把序列埠讓出來（地面站才讀得到參數）
+AGENT_VERSION = "0.18.2"         # 0.18.2：讓路不能關 PARAMS 串流——飛控的參數回覆就是從那裡送的
 
 #: 讀寫參數期間把遙測串流讓開多久（秒）。**每收到一則參數訊息就重新計時**，
 #: 所以地面站連續問的時候線路會一直保持安靜，最後一則之後 `PARAM_QUIET_S`
@@ -100,6 +100,20 @@ PARAM_QUIET_S = 3.0
 #: 會觸發讓路的訊息型別。讀與寫都算：兩者都要等飛控回一則 `PARAM_VALUE`，
 #: 而塞不進去的正是那一則。
 PARAM_MSGS = {"PARAM_REQUEST_READ", "PARAM_REQUEST_LIST", "PARAM_SET"}
+
+#: 讓路時要關掉的串流。**逐條列，不用 MAV_DATA_STREAM_ALL**——ALL 會連
+#: ArduPilot 送參數回覆用的 PARAMS 串流一起關掉，那正好把要讓路給它的
+#: 東西擋死（0.18.1 實測）。這裡列的都是遙測，沒有一條與參數有關。
+QUIET_STREAMS = [
+    mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS,
+    mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
+    mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS,
+    mavutil.mavlink.MAV_DATA_STREAM_RAW_CONTROLLER,
+    mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+    mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
+    mavutil.mavlink.MAV_DATA_STREAM_EXTRA2,
+    mavutil.mavlink.MAV_DATA_STREAM_EXTRA3,
+]
                                  # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
                                  # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
                                  # 0.15：（已撤回）電量判準改成單一來源——前提是門檻設錯，而它沒錯
@@ -522,6 +536,9 @@ class Agent:
         #: 那正是把串流關掉、把線路讓出來。這裡把同一件事做成自動的，
         #: 代價從「停整個代理」降到「安靜三秒」。
         self.quiet_until = 0.0        # >now 代表串流正讓路中
+        self.quiet_rx0 = 0            # 讓路開始時的收訊計數（驗證真的靜下來）
+        self.quiet_types = {}         # 讓路期間收到的型別（診斷）
+        self.fc_msgs = 0              # 從飛控收到的訊息總數
         self.quiet_since = 0.0        # 這一輪讓路是什麼時候開始的（報表用）
         self.quiet_blocked = 0.0      # 上次因為 armed 而拒絕讓路的時間
         self.caps_requested = False
@@ -880,11 +897,29 @@ class Agent:
             self.quiet_since = now
             try:
                 tgt = self.mon.state.get("sysid", 1)
-                # 只送這一則就夠：`MAV_DATA_STREAM_ALL` + start_stop=0 把所有
-                # 串流率歸零。**不逐則送 SET_MESSAGE_INTERVAL(-1)**——那是
-                # 27 則帶 sleep 的迴圈，光關就要半秒，而我們要的是立刻空出來
-                self.serial.mav.request_data_stream_send(
-                    tgt, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 0, 0)
+                # **兩條路都要關，因為 request_streams() 兩條路都開了。**
+                # 第一版只送 REQUEST_DATA_STREAM(ALL, 0)，讓路確實發生了
+                # （日誌有、3.1 秒也對），但參數還是讀不到——因為 ArduPilot
+                # 的 `SET_MESSAGE_INTERVAL` 存的是**每則訊息自己的間隔**，
+                # 與 stream group 的速率是兩套；把 group 歸零不會動到它們，
+                # WANTED 那 17 則照樣以 4Hz 流著，線路一樣是滿的。
+                # **不能用 MAV_DATA_STREAM_ALL 歸零**（0.18.1 踩到）：
+                # ArduPilot 的參數回覆是從它自己的 PARAMS 串流送出去的，
+                # 而 ALL 會把 PARAMS 也一起關掉——於是「讓路」反而讓飛控
+                # 永遠送不出 PARAM_VALUE。實測：讓路期間唯一收到的
+                # PARAM_VALUE 是 STAT_RUNTIME（index 65535＝飛控自己定期
+                # 存檔時的廣播），我方問的 LAND_SPEED 一次都沒回來。
+                #
+                # 所以逐一關掉「遙測」那幾條，**PARAMS 不動**。
+                for sid_ in QUIET_STREAMS:
+                    self.serial.mav.request_data_stream_send(tgt, 1, sid_, 0, 0)
+                for msgid in WANTED:
+                    # interval = -1：停送這一則（0 是「回到預設速率」，不是停）
+                    self.serial.mav.command_long_send(
+                        tgt, 1, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                        msgid, -1, 0, 0, 0, 0, 0)
+                self.quiet_rx0 = self.fc_msgs
+                self.quiet_types = {}
                 log.info("參數交換：串流讓路（最多 %.0fs，或最後一則參數訊息"
                          "之後 %.0fs）", PARAM_QUIET_S, PARAM_QUIET_S)
             except Exception as e:
@@ -899,7 +934,13 @@ class Agent:
             return
         held = now - self.quiet_since
         self.quiet_until = 0.0
-        log.info("參數交換結束：恢復串流（讓路 %.1fs）", held)
+        # **讓路期間飛控送了幾則**：讓路有沒有真的讓出來，只有這個數字說得準。
+        # 第一版看日誌以為成功了（有讓路、時間也對），其實線路一樣是滿的
+        rx = self.fc_msgs - self.quiet_rx0
+        log.info("參數交換結束：恢復串流（讓路 %.1fs，期間飛控送了 %d 則＝"
+                 "%.1f/s）%s", held, rx, rx / max(held, 0.1),
+                 "　型別：" + ", ".join(f"{k}×{v}" for k, v in
+                                       sorted(self.quiet_types.items())))
         self.request_streams()
 
     def request_streams(self):
@@ -988,6 +1029,19 @@ class Agent:
             for msg in (self.fc_parser.parse_buffer(data) or []) if data else []:
                 if msg.get_type() == "BAD_DATA":
                     continue
+                self.fc_msgs += 1
+                if self.quiet_until:      # 讓路期間把型別記下來（診斷用）
+                    t = msg.get_type()
+                    self.quiet_types[t] = self.quiet_types.get(t, 0) + 1
+                if msg.get_type() == "PARAM_VALUE":
+                    # **是誰的答案要分得出來。** 代理自己開機時也讀參數
+                    # （FS_GCS_*／BATT_*），那些 PARAM_VALUE 與地面站要的
+                    # 長得一樣——不印出參數名，就會把代理的答案當成地面站的
+                    pid = msg.param_id
+                    pid = pid.decode() if isinstance(pid, bytes) else pid
+                    log.info("飛控回 PARAM_VALUE：%s = %g（第 %s/%s 筆）",
+                             pid.strip("\x00"), msg.param_value,
+                             msg.param_index, msg.param_count)
                 buf = msg.get_msgbuf()
                 self.telem.send(buf)          # 唯讀通道
                 self.cmd.send(buf)            # 指令通道也要看得到狀態與 ACK
@@ -1060,6 +1114,12 @@ class Agent:
                 # MAVLink，我們是那條路徑上的必經之地，順手看一眼就有了
                 # ——與 `_note_mode_request` 同一個做法
                 if m.get_type() in PARAM_MSGS:
+                    log.info("轉送參數訊息到飛控：%s（來源 sys=%d comp=%d，"
+                             "target sys=%s comp=%s，%s）",
+                             m.get_type(), m.get_srcSystem(), m.get_srcComponent(),
+                             getattr(m, "target_system", "?"),
+                             getattr(m, "target_component", "?"),
+                             getattr(m, "param_id", ""))
                     self.param_quiet(time.time())
                 self._write(fd, m.get_msgbuf())
 
