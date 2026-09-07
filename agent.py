@@ -87,7 +87,8 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.14.0"         # 0.14：取樣率修正（設定 1Hz 實際只有 0.38Hz）＋蒐集與傳送分家
+AGENT_VERSION = "0.15.0"         # 0.15：失聯接管的電量判準改成單一來源（飛控回報的剩餘電量）
+                                 # 0.14：取樣率修正（設定 1Hz 實際只有 0.38Hz）＋蒐集與傳送分家
                                  # 0.13：--board-uid（只給模擬器；飛控報不出板號時）
                                  # 0.12：訊號只在離地時記（停在地面不入庫）
                                  # 0.11：預檢原因收集（說得出是哪一項）＋ STATUSTEXT 分段重組
@@ -638,39 +639,39 @@ class Agent:
     def _battery_verdict(self):
         """接管期間：該不該因為電量回家。回 `(要回家嗎, 說得出口的理由)`。
 
-        **兩個判準任一觸發就回家；兩個都讀不到也回家**（2026-09-04 使用者裁定）。
+        **判準只有一個：飛控回報的剩餘電量**（2026-09-07 使用者裁定）。
+        讀不到就回家。
 
-        為什麼要兩個：`battery_pct` 來自飛控的電流積分，而那個積分的刻度
-        （`BATT_AMP_PERVLT`）在本專案**沒有人驗過**——2026-09-02 實測畫面顯示
-        58%，而那顆電池的電壓已經接近見底。**只看百分比會在錯的時候放行。**
-        電壓比較誠實（雖然負載下會下垂），所以兩個並聯：任一說不行就不行。
+        ## 原本有兩個，為什麼拿掉電壓那條
 
-        **電壓門檻向飛控要**（`BATT_LOW_VOLT`），不自己編：編出來的數字與
-        飛控自己的設定不一致時，兩層會在不同時間點動作，而沒有人說得出為什麼。
-        讀不到就只剩百分比那條——而那要說出來。
+        原本是「電量與電壓任一觸發就回家」。電壓門檻向飛控要
+        （`BATT_LOW_VOLT`），不自己編。2026-09-07 發現該機的 `BATT_LOW_VOLT`
+        是 14.0 V 而實際電壓 12.37 V——飛控因此**永遠停在低電壓 failsafe、
+        永遠不讓解鎖**。使用者裁定拿掉電壓判準，改以剩餘電量為準。
+
+        ## 這條路徑現在押在一個沒校正過的數字上——要知道這件事
+
+        `battery_pct` 是飛控用 `BATT_AMP_PERVLT` 把電流積分算出來的，
+        **那個刻度本專案從來沒有人驗過**：2026-09-02 實測畫面顯示 58%，
+        而那顆電池的電壓已經接近見底。電壓比較誠實（雖然負載下會下垂），
+        原本並聯就是為了擋住這種「百分比在錯的時候放行」。
+
+        拿掉之後，**這個判斷的可信度等於那次校正的可信度**。耗電量校正
+        （`scripts/calibrate-battery.py`）做完之前，這條路徑的保護力是未知的。
+
+        `BATT_LOW_VOLT` 仍然照舊向飛控要並留在 state 裡——**它不再參與判斷，
+        但診斷時要看得到**（今天就是靠它才找出解不了鎖的原因）。
         """
         s = self.mon.state
-        pct, volt = s.get("battery_pct"), s.get("voltage")
-        params = s.get("params") or {}
-        low_v = params.get((self._batt_names() or {}).get("low_volt", ""))
-        hits, known = [], []
-        if pct is not None:
-            known.append(f"電量 {pct}%")
-            if pct < self.a.link_loss_min_batt:
-                hits.append(f"電量 {pct}% 低於 {self.a.link_loss_min_batt}%")
-        if volt is not None and low_v:
-            known.append(f"電壓 {volt:.2f}V")
-            if volt <= low_v:
-                hits.append(f"電壓 {volt:.2f}V 已到飛控的低電量門檻 {low_v:.2f}V")
-        if not known:
+        pct = s.get("battery_pct")
+        if pct is None:
             # **不知道就回家。** 這與 `rc_link` 的 None 方向相反，而方向是由
             # 「不知道時哪一邊會出事」決定的：不知道還剩多少電就繼續飛，
             # 出事的是飛機（039 複裁 E 的同一條，這裡延伸到整個接管期間）
-            return True, ("電量與電壓都讀不到"
-                          + ("" if low_v else "（也讀不到飛控的電壓門檻）"))
-        if hits:
-            return True, "；".join(hits)
-        return False, "、".join(known) + " 都還在門檻上"
+            return True, "讀不到飛控回報的剩餘電量"
+        if pct < self.a.link_loss_min_batt:
+            return True, f"電量 {pct}% 低於 {self.a.link_loss_min_batt}%"
+        return False, f"電量 {pct}% 還在門檻上"
 
     def request_fs_gcs(self, now):
         """開機時問一次飛控的失聯 failsafe 設定（039，2026-09-01 裁定）。

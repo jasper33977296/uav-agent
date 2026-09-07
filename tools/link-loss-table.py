@@ -237,5 +237,40 @@ flip = (isinstance(a._loss_verdict(a.flight_state(), 10.0), str)
 print(f"{'✓' if flip else '✗'} 只改模式歸屬，LOITER 的處置由 RTL 翻成不介入")
 ok &= flip
 
+# ── 電量判準：只看飛控回報的剩餘電量（2026-09-07 使用者裁定）──────────
+# **這一段是補的，不是原本就有的。** 原本判準有兩條（電量＋電壓），而
+# 上面那張表只餵 `battery_pct`——**電壓那條從來沒有被任何測試碰過**，
+# 所以把它整條拿掉時一片綠。一個飛安判準在程式裡活了三天而零覆蓋。
+print("\n── 電量判準（單一來源：飛控回報的剩餘電量）──────────")
+
+
+def verdict(**st):
+    st.setdefault("landed_state", "in_air")
+    return Fake(**st)._battery_verdict()
+
+
+def vchk(label, cond, note=""):
+    global ok
+    ok &= bool(cond)
+    print(f"{'✓' if cond else '✗'} {label}{('｜' + str(note)) if note else ''}")
+
+
+go, why = verdict(battery_pct=8)
+vchk("電量低於門檻 → 回家", go and "8%" in why, why)
+go, why = verdict(battery_pct=80)
+vchk("電量足夠 → 不介入", not go, why)
+go, why = verdict()
+vchk("**讀不到電量 → 回家**（不知道時出事的是飛機）", go, why)
+
+# **電壓不該再影響結論。** 拿掉之後若有人把它加回來（或某條路徑仍在讀
+# `BATT_LOW_VOLT`），這一格會紅
+low = {"BATT_LOW_VOLT": 14.0}
+a1, _ = verdict(battery_pct=80, voltage=12.37, params=low)
+a2, _ = verdict(battery_pct=80, voltage=16.80, params=low)
+vchk("**電壓再低也不再翻轉結論**（12.37V vs 16.80V 同一個答案）",
+     a1 is False and a2 is False, (a1, a2))
+b1, _ = verdict(battery_pct=8, voltage=16.80, params=low)
+vchk("**反向驗證**：電壓再高也救不了低電量", b1 is True)
+
 print("\n" + ("全部通過" if ok else "**有未通過項目**"))
 sys.exit(0 if ok else 1)
