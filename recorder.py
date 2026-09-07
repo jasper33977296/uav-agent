@@ -43,7 +43,8 @@ class Recorder:
     每則訊息前綴 8-byte big-endian 微秒時間戳。"""
 
     def __init__(self, path: str, max_mb: int = 512, keep: int = 20,
-                 armed_only: bool = True, is_uploaded=None, on_discard=None):
+                 armed_only: bool = True, is_uploaded=None, on_discard=None,
+                 rotate_min: float = 30.0):
         self.dir = path
         self.max_bytes = max_mb * 1024 * 1024
         self.keep = keep
@@ -55,6 +56,16 @@ class Recorder:
         #: 刪掉一份沒回傳成功的檔案時呼叫（uploader.note_pruned）。
         #: **log 不夠**：journald 會被清掉，而這是一個不可挽回的損失
         self.on_discard = on_discard
+        #: 待機時多久換一次檔（分鐘）。**只在未解鎖時輪替**——飛行中換檔會
+        #: 破壞「一趟飛行一個檔案」那個性質，而那是回放與比對的前提。
+        #:
+        #: 為什麼非有不可：檔案是在「解鎖→上鎖」那個邊界關的，而**開機就錄**
+        #: 之後，一台從頭到尾沒解鎖的機永遠不會有那個邊界，檔案要寫滿
+        #: `max_mb` 才關。實測 3.8 KB/s → 512 MB 要 37 小時，也就是待機
+        #: 一整天那份錄製永遠不關、**永遠不會被自動回傳**（沒關好的檔案
+        #: 內容還會變，sha256 與續傳都無從談起）。
+        self.rotate_s = max(0.0, rotate_min * 60.0)
+        self._opened_at = 0.0
         self._was_armed = False
         self.f = None
         self.name = None
@@ -78,6 +89,12 @@ class Recorder:
             if self.armed_only and not armed:
                 self._close()
                 return
+            # **時間輪替只在未解鎖時做。** 飛行中換檔會把一趟飛行切成兩份，
+            # 而「一趟飛行一個檔案」是回放與兩層比對的前提（014）。
+            # 用單調時鐘：這台 Pi 的 RTC 沒有電池，牆鐘開機後會大幅跳一次
+            if (not armed and self.f is not None and self.rotate_s
+                    and time.monotonic() - self._opened_at >= self.rotate_s):
+                self._close()
             if self.f is None:
                 self._open()
             if self.f is None:
@@ -110,6 +127,7 @@ class Recorder:
 
     # ── 內部 ────────────────────────────────────────────────────
     def _open(self) -> None:
+        self._opened_at = time.monotonic()
         os.makedirs(self.dir, exist_ok=True)
         # **檔名用開檔當下的時間**。這台 Pi 的 RTC 沒有電池，冷開機時牆鐘從
         # 1970 起算——所以檔名可能是 1970，而那**不是 bug，是誠實**：

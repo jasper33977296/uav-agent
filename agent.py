@@ -87,7 +87,8 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.16.0"         # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
+AGENT_VERSION = "0.17.0"         # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
+                                 # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
                                  # 0.15：（已撤回）電量判準改成單一來源——前提是門檻設錯，而它沒錯
                                  # 0.14：取樣率修正（設定 1Hz 實際只有 0.38Hz）＋蒐集與傳送分家
                                  # 0.13：--board-uid（只給模擬器；飛控報不出板號時）
@@ -883,6 +884,7 @@ class Agent:
         self.recorder = recorder.Recorder(
             self.a.record_dir, max_mb=self.a.record_max_mb,
             keep=self.a.record_keep, armed_only=not self.a.record_disarmed,
+            rotate_min=self.a.record_rotate_min,
             is_uploaded=self.uploader.is_uploaded if self.uploader else None,
             on_discard=self.uploader.note_pruned if self.uploader else None)
         if self.uploader:
@@ -1954,9 +1956,21 @@ def main():
                    default=int(os.environ.get("RECORD_MAX_MB", 512)))
     p.add_argument("--record-keep", type=int,
                    default=int(os.environ.get("RECORD_KEEP", 20)))
+    #: **開機就錄，不是解鎖才錄**（2026-09-07 使用者裁定）。
+    #:
+    #: 原本預設只在 armed 時錄，於是地面待機那段機上完全沒有紀錄——而兩層
+    #: 收集（014）的價值來自「機上那份」與「地面那份」的差；機上在地面時是
+    #: 空的，等於兩層只有一層。
+    #:
+    #: 傳送策略不受影響：`uploader` 的四道門本來就是「沒 armed 才傳」，
+    #: 所以錄製變連續之後，**飛行中照樣不佔 5G，落地靜置後才續傳**。
     p.add_argument("--record-disarmed", action="store_true",
-                   default=os.environ.get("RECORD_DISARMED", "0") != "0",
-                   help="連未解鎖時也錄（預設否）")
+                   default=os.environ.get("RECORD_DISARMED", "1") != "0",
+                   help="連未解鎖時也錄（預設是——開機就錄）")
+    p.add_argument("--record-rotate-min", type=float,
+                   default=float(os.environ.get("RECORD_ROTATE_MIN", 30)),
+                   help="待機時多久換一次檔（分鐘）。**飛行中不輪替**——"
+                        "一趟飛行一個檔案是回放與兩層比對的前提")
     #: 錄製的自動回傳（issues/014）。**預設開**：錄下來的東西如果要人 scp
     #: 才拿得到，它就只對記得去拿的人存在——而想起來要去拿的時機通常是
     #: 出事之後，那時卡上的滾動可能已經把它刪掉了。
