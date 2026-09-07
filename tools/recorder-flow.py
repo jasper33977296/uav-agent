@@ -139,5 +139,36 @@ r5.feed(b"\xfd\x09\x00" + b"\x00" * 20, armed=False)
 chk("**反向驗證**：rotate_min=0 就不輪替（不是無條件換檔）",
     r5.name == n5, (n5, r5.name))
 
+# ── 啟動訊息要把「換檔條件」全部列出來 ──────────────────────────
+# 2026-09-07：加了時間輪替，但啟動訊息只寫「512 MB 換檔」——於是機上日誌
+# 看不出輪替開著。而**在真機上尺寸那條幾乎永遠不會觸發**（3.9 KB/s 要 37
+# 小時），也就是說：真正在管事的那一條沒被說出來，這行訊息在誤導排查的人。
+print("\n── 啟動訊息：換檔條件不能只講其中一條 ────────────────")
+import io as _io
+import logging as _lg
+
+
+def opening_line(**kw):
+    buf = _io.StringIO()
+    h = _lg.StreamHandler(buf)
+    lg = _lg.getLogger("recorder")
+    lg.addHandler(h)
+    lg.setLevel(_lg.INFO)
+    try:
+        r = recorder.Recorder(_tf.mkdtemp(), **kw)
+        r.feed(b"\xfd\x09\x00" + b"\x00" * 20, armed=True)
+    finally:
+        lg.removeHandler(h)
+    return buf.getvalue()
+
+
+line = opening_line(armed_only=False, rotate_min=30)
+chk("有輪替時，訊息說得出「待機滿 N 分鐘」", "30 分鐘" in line, line.strip())
+chk("落地那條也講（它是最常觸發的那一條）", "落地" in line, line.strip())
+chk("尺寸上限照舊講", "MB" in line, line.strip())
+
+off = opening_line(armed_only=False, rotate_min=0)
+chk("**沒有輪替時不許謊稱有**", "分鐘" not in off, off.strip())
+
 print("\n" + ("全部通過" if ok else "**有未通過項目**"))
 sys.exit(0 if ok else 1)

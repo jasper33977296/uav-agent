@@ -87,7 +87,8 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.17.0"         # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
+AGENT_VERSION = "0.17.1"         # 0.17.1：啟動訊息把換檔條件全部列出來（原本只講尺寸上限）
+                                 # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
                                  # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
                                  # 0.15：（已撤回）電量判準改成單一來源——前提是門檻設錯，而它沒錯
                                  # 0.14：取樣率修正（設定 1Hz 實際只有 0.38Hz）＋蒐集與傳送分家
@@ -2042,9 +2043,19 @@ def main():
     log.info("訊號採樣：%s", a.modem_port or "停用")
     # **「什麼時候傳」是這個功能唯一危險的一格**，所以它要跟失聯處置那些
     # 政策一樣，在啟動時就說出口——事後從行為反推是最貴的查法
-    log.info("機上錄製：%s（%s、%d MB 換檔、保留 %d 份）；自動回傳 %s",
+    # **換檔條件要全部列出來。** 原本只寫尺寸上限，於是 2026-09-07 加了時間
+    # 輪替之後，機上日誌看不出它開著——排查的人會以為只有 512 MB 那條在管，
+    # 而在真機上尺寸那條幾乎永遠不會觸發（3.9 KB/s 要 37 小時）。
+    # **實際在管事的那一條沒被說出來，等於這行訊息在誤導人。**
+    log.info("機上錄製：%s（%s、%s、保留 %d 份）；自動回傳 %s",
              a.record_dir, "armed 時才錄" if not a.record_disarmed else "**連未解鎖也錄**",
-             a.record_max_mb, a.record_keep,
+             f"換檔：落地時、寫滿 {a.record_max_mb} MB、"
+             + (f"或待機滿 {a.record_rotate_min:.0f} 分鐘"
+                if a.record_rotate_min > 0 else "**待機不輪替**")
+             + ("（不輪替的話，一台從頭到尾沒解鎖的機檔案永遠不關，"
+                "而沒關好的檔案不會被自動回傳）"
+                if a.record_disarmed and a.record_rotate_min <= 0 else ""),
+             a.record_keep,
              f"限速 {a.upload_kbps} KB/s、塊 {a.upload_chunk_kb} KB、"
              f"落地靜置 {a.upload_settle_s:.0f}s"
              "（**只在地面、鏈路通時傳，一解鎖立刻停**）"

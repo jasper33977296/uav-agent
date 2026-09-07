@@ -144,8 +144,11 @@ class Recorder:
             self.name = f"{base}-{n}.tlog"
         self.f = open(os.path.join(self.dir, self.name), "ab", buffering=1 << 16)
         self.written = 0
-        log.info("機上錄製開始：%s（上限 %.0f MB，保留 %d 份）",
-                 self.name, self.max_bytes / 1e6, self.keep)
+        log.info("機上錄製開始：%s（換檔：落地時、寫滿 %.0f MB%s；保留 %d 份）",
+                 self.name, self.max_bytes / 1e6,
+                 f"、或待機滿 {self.rotate_s / 60:.0f} 分鐘"
+                 if self.rotate_s else "",
+                 self.keep)
         # **滾動在開檔時做，不是只在「寫滿 512 MB 換檔」時做。** 原本掛在
         # 換檔那條路上，而在真機上換檔幾乎不會發生：一趟十分鐘的飛行約 4 MB
         # （UART 5.6 KB/s 的上限），512 MB 要飛二十小時才寫得滿。於是
