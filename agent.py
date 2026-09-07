@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.18.2"         # 0.18.2：讓路不能關 PARAMS 串流——飛控的參數回覆就是從那裡送的
+AGENT_VERSION = "0.18.4"         # 0.18.4：拿掉「代理重送參數」——那是為了一個被推翻的假設做的
 
 #: 讀寫參數期間把遙測串流讓開多久（秒）。**每收到一則參數訊息就重新計時**，
 #: 所以地面站連續問的時候線路會一直保持安靜，最後一則之後 `PARAM_QUIET_S`
@@ -1114,12 +1114,6 @@ class Agent:
                 # MAVLink，我們是那條路徑上的必經之地，順手看一眼就有了
                 # ——與 `_note_mode_request` 同一個做法
                 if m.get_type() in PARAM_MSGS:
-                    log.info("轉送參數訊息到飛控：%s（來源 sys=%d comp=%d，"
-                             "target sys=%s comp=%s，%s）",
-                             m.get_type(), m.get_srcSystem(), m.get_srcComponent(),
-                             getattr(m, "target_system", "?"),
-                             getattr(m, "target_component", "?"),
-                             getattr(m, "param_id", ""))
                     self.param_quiet(time.time())
                 self._write(fd, m.get_msgbuf())
 
