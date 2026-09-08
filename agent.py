@@ -87,7 +87,13 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.19.2"         # 0.19.2：前導環形——偵測到斷線之前那幾秒也補得回來
+AGENT_VERSION = "0.20.0"         # 0.20.0：L2 自主重綁（我送得到、他回不來）
+#: 「我送得到、他回不來」持續這麼久就重綁 UDP 來源埠。20 秒遠長於一次
+#: 尋常的抖動，又遠短於一趟飛行——真的壞掉時不該讓操作員等到落地。
+REBIND_AFTER_S = 20.0
+#: 兩次重綁至少隔這麼久。換埠是廉價的，但**沒完沒了地換就只是在製造雜訊**
+#: ——真正沒救的時候（例如整條 5G 掛了）要看得出來是沒救，不是一直在試。
+REBIND_COOLDOWN_S = 60.0
 #: 多久沒被地面站確認過就當上行不通。即時通道每秒送一次、HTTP 逾時 3 秒，
 #: 8 秒容得下兩次連續逾時，又接近原本 `link_warn_s`（5 秒）的偵測延遲
 #: ——**這段延遲是有代價的**：補傳只在判定不通之後才開始取樣，
@@ -204,9 +210,54 @@ class Link:
 
     def __init__(self, name, host, port):
         self.name, self.addr = name, (host, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setblocking(False)
+        self.rebinds = 0
+        self.sock = None
+        self._open()
         self.tx = self.rx = self.tx_err = 0
+
+    def _open(self) -> None:
+        old = self.sock
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setblocking(False)
+        # **顯式 bind 只是為了拿得到埠號**（核心在第一次 send 時本來也會給
+        # 一個臨時埠）。埠號要看得見：診斷「地面站以為的埠」對不對得上
+        # 「我實際綁的埠」時，那是唯一直接的證據
+        s.bind(("", 0))
+        self.sock = s
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
+
+    @property
+    def port(self) -> int:
+        try:
+            return self.sock.getsockname()[1]
+        except OSError:
+            return 0
+
+    def rebind(self) -> None:
+        """換一個來源埠（L2 自主重綁，issues/047 項次 6）。
+
+        **這是在修「路上那份位址對映」，不是在修我自己。** 代理綁的是臨時埠，
+        而路上會改寫來源埠（2026-09-07 實測：機上綁 54342、到岸變 47995）。
+        對映壞掉時，地面站照它看到的位址回送，封包**真的有到 Pi**，
+        只是打在沒有人聽的埠上（`/proc/net/snmp` 的 `NoPorts` 在漲）。
+
+        代理沒辦法「告訴地面站我的埠」——**它不知道自己被改寫成什麼**。
+        能做的是換一個新的來源埠，逼路上重建一次對映；地面站本來就會從
+        收到的封包重新學（`MavRouter._recv` → `d["addr"]`），所以不必通知它。
+
+        當下的人工解法是重啟整個代理，那會連帶中斷錄製、意圖通道與飛控轉發
+        ——**換 socket 只影響這一條 UDP，而且沒有狀態要保留**。
+        """
+        before = self.port
+        self._open()
+        self.rebinds += 1
+        log.warning("%s 重綁來源埠 %d → %d（第 %d 次）：地面站送得到我、"
+                    "我卻收不到它——路上的位址對映壞了",
+                    self.name, before, self.port, self.rebinds)
 
     def send(self, data):
         try:
@@ -604,6 +655,7 @@ class Agent:
         #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
         #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
         self.uplink_seen = 0.0
+        self._rebind_t = 0.0          # 上次重綁（單調），冷卻用
         self.loss_warned = False
         self.loss_acted = False
         self.loss_started = None
@@ -1624,6 +1676,10 @@ class Agent:
                 # （gs_link_ok=false）與「它的資料沒回來」（uplink_ok=false）
                 # ——那是兩種完全不同的處置，而 9/7 那次是前者
                 "uplink_ok": self.uplink_ok,
+                # 我實際綁的來源埠與重綁次數。**地面站那邊有它以為的埠**
+                # （peers.json），兩個擺在一起才看得出對不對得上
+                "udp_ports": [self.telem.port, self.cmd.port],
+                "udp_rebinds": self.telem.rebinds,
                 # 026 B4-b：驅動算出來的正規化欄位（協定 §4.2）。
                 # **判斷用 mode_verb、顯示用 mode_name**；`ready` 三態。
                 # 地面站認得這個廠牌時會拿自己算的來對，不一致就報警——
@@ -1779,6 +1835,33 @@ class Agent:
 
         if ok:
             return
+
+        # ── L2 自主重綁（issues/047 項次 6）─────────────────────────
+        #
+        # **觸發條件是兩個旗標的組合，不是任何一個單獨的值**：
+        #
+        #   gs_link_ok=False  我收不到地面站
+        #   uplink_ok=True    但地面站說它收得到我
+        #
+        # 這個組合只有一種解釋：**IP 路徑是通的，壞的是回程的位址對映**。
+        # 那正是 2026-09-07 那次的指紋——機上綁 54342、路上改寫成 47995，
+        # 地面站照它看到的回送，封包真的有到 Pi 但打在沒人聽的埠上。
+        #
+        # 反過來說，地面站真的掛了的時候 `uplink_ok` 也會是 False（沒有確認
+        # 回來），所以那種情況不會誤觸——**換埠救不了一台關機的地面站**。
+        #
+        # 換完不必通知地面站：它本來就從收到的封包重新學回程位址
+        # （`MavRouter._recv` → `d["addr"]`，那是 L0，早就在了）。
+        # 代理也**無法**通知——它不知道自己被改寫成什麼埠。
+        if (self.uplink_ok and age >= REBIND_AFTER_S
+                and time.monotonic() - self._rebind_t >= REBIND_COOLDOWN_S):
+            self._rebind_t = time.monotonic()
+            self.telem.rebind()
+            self.cmd.rebind()
+            self.mon.events.append(
+                (now, "gs_link",
+                 f"自主重綁 UDP 來源埠（失聯 {age:.0f}s，但地面站收得到我"
+                 f"——回程位址對映壞了）"))
 
         armed = self.mon.state.get("armed")
         mode = self.mon.state.get("mode")
@@ -2060,6 +2143,10 @@ class Agent:
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
             "gs_link_ok": self.gs_link_ok,
             "uplink_ok": self.uplink_ok,
+            # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
+            # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
+            "udp": {"telem": self.telem.port, "cmd": self.cmd.port,
+                    "rebinds": self.telem.rebinds},
             "state": self.flight_state(),
             "intent": self.intent.stats() if self.intent else None,
             "backfill": self.backfill.stats() if self.backfill else None,
