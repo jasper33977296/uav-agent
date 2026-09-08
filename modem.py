@@ -49,12 +49,23 @@ BATCH_MAX = 200
 BATCH_EVERY_S = 10.0
 
 
+#: 地面站說「我最後收到你的遙測是 N 秒前」，N 要小於這個值才算「我的資料有到」。
+#: 遙測實測約 97 則/秒，正常時這個年齡遠小於 1 秒；5 秒與畫面判定「資料變舊」
+#: 的門檻一致。
+UPLINK_FRESH_S = 5.0
+
+
 class ModemSampler(threading.Thread):
     daemon = True
 
     def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
-                 drone_id_fn=None, airborne_fn=None, live_interval=1.0):
+                 drone_id_fn=None, airborne_fn=None, live_interval=1.0,
+                 on_uplink_ok=None):
         super().__init__(name="modem-sampler")
+        #: **地面站確認「我收到你的遙測了」時呼叫**（issues/047 項次 6）。
+        #: 這條每秒一次的通道是機上唯一能問到「我送的東西有沒有到」的地方
+        #: ——順路帶回來，不必另開一個請求。
+        self.on_uplink_ok = on_uplink_ok
         self.port, self.interval = port, interval
         #: 即時通道多久送一次（2026-09-07 使用者裁定：**蒐集可以密，傳送每秒
         #: 一次就夠**）。畫面看的是「現在訊號好不好」，不需要比人眼更快；
@@ -270,8 +281,12 @@ class ModemSampler(threading.Thread):
             headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=3) as r:
-                if r.status == 204:
+                # 204 是舊版後端（沒有回應內容）；200 帶著上行確認。
+                # **兩種都算送出成功**——不能因為地面站是舊版就說鏈路壞了
+                if r.status in (200, 204):
                     self.posted += 1
+                    if r.status == 200 and self.on_uplink_ok:
+                        self._report_uplink(r)
                     return True
                 log.warning("link-metrics 回 %s", r.status)
         except urllib.error.HTTPError as e:
@@ -283,6 +298,23 @@ class ModemSampler(threading.Thread):
             if self.errors % 30 == 1:
                 log.warning("link-metrics 送出失敗（%s）", e)
         return False
+
+    def _report_uplink(self, r) -> None:
+        """把地面站回報的「我最後收到你的遙測是多久以前」轉給代理。
+
+        **只有夠新才算確認。** 這條 HTTP 通得過只證明 IP 路徑在，
+        不證明 UDP 遙測有被收下——所以要看的是地面站說的那個年齡，
+        不是「我 POST 成功了」。回應壞掉或缺欄位時什麼都不做：
+        **沒有確認** 與 **確認說很舊** 都會讓代理那邊自然逾時，
+        而在這裡瞎猜一個值會製造一個假的確認。
+        """
+        try:
+            age = (json.loads(r.read() or b"{}").get("uplink")
+                   or {}).get("telem_age_s")
+        except Exception:                                  # noqa: BLE001
+            return
+        if age is not None and float(age) <= UPLINK_FRESH_S:
+            self.on_uplink_ok()
 
     def flush(self):
         """把緩衝的樣本送進**記錄通道**。回傳送出去幾筆。

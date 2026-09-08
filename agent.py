@@ -87,7 +87,12 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.18.4"         # 0.18.4：拿掉「代理重送參數」——那是為了一個被推翻的假設做的
+AGENT_VERSION = "0.19.0"         # 0.19.0：上行確認獨立於「我聽得到地面站」
+#: 多久沒被地面站確認過就當上行不通。即時通道每秒送一次、HTTP 逾時 3 秒，
+#: 8 秒容得下兩次連續逾時，又接近原本 `link_warn_s`（5 秒）的偵測延遲
+#: ——**這段延遲是有代價的**：補傳只在判定不通之後才開始取樣，
+#: 所以斷線最初的幾秒不會被補回來（要根治得讓環形緩衝一直取樣）。
+UPLINK_STALE_S = 8.0
 
 #: 讀寫參數期間把遙測串流讓開多久（秒）。**每收到一則參數訊息就重新計時**，
 #: 所以地面站連續問的時候線路會一直保持安靜，最後一則之後 `PARAM_QUIET_S`
@@ -596,6 +601,9 @@ class Agent:
         self.fc_parser.robust_parsing = True
         self.last_gs_rx = 0.0
         self.gs_link_ok = None
+        #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
+        #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
+        self.uplink_seen = 0.0
         self.loss_warned = False
         self.loss_acted = False
         self.loss_started = None
@@ -974,7 +982,11 @@ class Agent:
                 live_interval=self.a.modem_live_interval,
                 # 2026-09-07 使用者裁定：**停在地面上就不要記**。
                 # 即時通道照送（起飛前要看得到訊號好不好），停的是入庫那條
-                airborne_fn=self.airborne)
+                airborne_fn=self.airborne,
+                # **上行確認**（issues/047 項次 6）：地面站在這條每秒一次的
+                # 回應裡告訴我們「我最後收到你的遙測是多久以前」。那是機上
+                # 唯一問得到「我送的東西有沒有到」的地方
+                on_uplink_ok=self.mark_uplink_ok)
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）
@@ -1003,7 +1015,10 @@ class Agent:
             self.a.gs, self.a.backend_port,
             lambda: self.mon.state.get("board_uid"),
             lambda: self.mon.state,
-            lambda: bool(self.gs_link_ok))
+            # **補傳看的是「我的資料有沒有到」，不是「我聽不聽得到地面站」**
+            # （issues/047 項次 6，2026-09-08 實測）。還沒被確認過（None）
+            # 時當作不通——那時緩衝是對的，反正鏈路一確認就會補完
+            lambda: bool(self.uplink_ok))
         self.backfill.start()
         fd = self.serial.port.fileno()
         log.info("轉發目標：%s:%d（遙測）／%s:%d（指令）",
@@ -1602,6 +1617,10 @@ class Agent:
                 # 地面站失聯是**代理這一側看到的事實**，與地面站自己看到的
                 # 不一定同時發生——兩邊不一致本身就是要報警的事（狀態機 §6.4）
                 "gs_link_ok": self.gs_link_ok,
+                # **兩個旗標都要送**：地面站才分得出「你指揮不動它」
+                # （gs_link_ok=false）與「它的資料沒回來」（uplink_ok=false）
+                # ——那是兩種完全不同的處置，而 9/7 那次是前者
+                "uplink_ok": self.uplink_ok,
                 # 026 B4-b：驅動算出來的正規化欄位（協定 §4.2）。
                 # **判斷用 mode_verb、顯示用 mode_name**；`ready` 三態。
                 # 地面站認得這個廠牌時會拿自己算的來對，不一致就報警——
@@ -1628,10 +1647,47 @@ class Agent:
         """
         if self.mon.state.get("armed"):
             return False, "armed（飛行中不傳）"
-        if not self.gs_link_ok:
-            return False, ("地面站鏈路未建立" if self.gs_link_ok is None
-                           else "地面站失聯")
+        # **看上行**：回傳是「我要送一個大檔上去」，成不成立取決於我送得出去
+        # 沒有，不取決於我聽不聽得到地面站（issues/047 項次 6）
+        if not self.uplink_ok:
+            return False, ("上行還沒確認" if self.uplink_ok is None
+                           else "上行不通")
         return True, None
+
+    def mark_uplink_ok(self) -> None:
+        """地面站確認收到我的遙測了（由 `modem.py` 的即時通道回應觸發）。"""
+        self.uplink_seen = time.monotonic()
+
+    @property
+    def uplink_ok(self):
+        """**我送出去的東西有沒有到地面站。** None ＝還沒被確認過。
+
+        ## 為什麼不能沿用 `gs_link_ok`（2026-09-08 實測）
+
+        `gs_link_ok` 問的是「**我聽不聽得到地面站**」——它由收到的封包更新，
+        而那些封包來自地面站的心跳服務。停掉地面站送出的方向 72 秒，代理的
+        `tx_telemetry` 從 585800 漲到 588911（約 97 則/秒，**一路都送得出去**），
+        `gs_link_ok` 卻是 false。於是它一邊把遙測送進地面站的資料庫，
+        一邊緩衝同一段時間的資料、暫停錄製回傳。
+
+        兩個問題各有各的用途，**不要再合併**：
+
+        | 誰在問 | 要的是 |
+        |---|---|
+        | 失聯接管（第三層防線）| `gs_link_ok`——操作員還指揮不指揮得動我 |
+        | 補傳緩衝、錄製回傳 | `uplink_ok`——我的資料有沒有到 |
+
+        接管那條**維持原狀**：指令送不到就是失去控制，那個判斷本來就是對的。
+
+        ## 逾時的兩種情形都對
+
+        * POST 送不出去 → 拿不到新的確認 → 轉 False（IP 路徑真的斷了）
+        * POST 成功但地面站說遙測很舊 → 也不更新 → 轉 False
+          （HTTP 通、UDP 遙測沒到——**只看 POST 成不成功會漏掉這種**）
+        """
+        if not self.uplink_seen:
+            return None
+        return (time.monotonic() - self.uplink_seen) < UPLINK_STALE_S
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
@@ -2000,6 +2056,7 @@ class Agent:
             "param_quiet": time.time() < self.quiet_until,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
             "gs_link_ok": self.gs_link_ok,
+            "uplink_ok": self.uplink_ok,
             "state": self.flight_state(),
             "intent": self.intent.stats() if self.intent else None,
             "backfill": self.backfill.stats() if self.backfill else None,
