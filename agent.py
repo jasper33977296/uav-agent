@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.19.0"         # 0.19.0：上行確認獨立於「我聽得到地面站」
+AGENT_VERSION = "0.19.1"         # 0.19.1：沒解鎖就不補傳（與地面站的即時閘門一致）
 #: 多久沒被地面站確認過就當上行不通。即時通道每秒送一次、HTTP 逾時 3 秒，
 #: 8 秒容得下兩次連續逾時，又接近原本 `link_warn_s`（5 秒）的偵測延遲
 #: ——**這段延遲是有代價的**：補傳只在判定不通之後才開始取樣，

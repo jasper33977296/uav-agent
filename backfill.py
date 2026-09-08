@@ -15,6 +15,13 @@
 * **環形有上限**（預設 30 分鐘）。滿了丟最舊的，不是無限長大：
   記憶體在飛機上是有限的，而且真的斷一小時以上時，最舊那段的價值最低。
 * **只在鏈路不通時累積**。通的時候即時遙測本來就送得到，緩衝只是浪費。
+  「通不通」看的是 `uplink_ok`（地面站說它收到我的遙測了），**不是
+  「我聽不聽得到地面站」**——後者是 2026-09-08 實測抓到的錯誤來源。
+* **只在 armed 時累積**（2026-09-08）。地面站的即時路徑只在
+  `armed and session_id` 時才寫 telemetry 表（`main.py:152`），
+  補傳卻無條件寫——同一個「飛機停在地上什麼都沒發生」的狀態，走即時路是
+  不記錄、走補傳路變成記錄，**差別只在於當時鏈路有沒有斷**。實測一次
+  72 秒的中斷就補進 59 筆停機坪資料。兩條路對「什麼值得記錄」要有同一個答案。
 * **補傳走背景、低優先**。它與即時轉發共用同一條 5G，而即時的優先。
 * **時間用單調時鐘記，送出前才換算成牆鐘**（2026-08-31）。牆鐘會被 NTP 調，
   而這台 Pi 的 RTC 沒有電池——開機時系統時間是 1970，靠 5G 上的 NTP 修正。
@@ -76,6 +83,9 @@ class Backfill(threading.Thread):
         #: ——不然「已補傳 N 筆」會是一句謊話，而唯一的痕跡在別人的 log 裡
         self.rejected = 0
         self.dropped = 0              # 我方主動放棄的（送了也不會被接受）
+        #: 因為沒解鎖而沒取樣的次數。**要看得見**——不然「斷線了卻沒補回
+        #: 任何東西」會像故障，而它其實是正確行為
+        self.skipped_ground = 0
         self._next_try = 0.0          # 單調刻度：失敗後不要每 0.2 秒重試
 
     def stop(self):
@@ -84,7 +94,8 @@ class Backfill(threading.Thread):
     def stats(self) -> dict:
         return {"buffered": len(self.buf), "sampled": self.sampled,
                 "sent": self.sent, "failed": self.failed,
-                "rejected": self.rejected, "dropped": self.dropped}
+                "rejected": self.rejected, "dropped": self.dropped,
+                "skipped_ground": self.skipped_ground}
 
     # ── 取樣 ───────────────────────────────────────────────────
     def _sample(self, mono: float) -> None:
@@ -255,7 +266,13 @@ class Backfill(threading.Thread):
             if not link_ok:
                 if mono - self._last_sample >= SAMPLE_S:
                     self._last_sample = mono
-                    self._sample(mono)
+                    # **沒解鎖就不補**（2026-09-08）：地面站的即時路徑在
+                    # 這種狀態下本來就不寫任何東西，補傳沒有理由比它更積極。
+                    # `armed is None`＝從來沒看到過飛控，那時也沒有東西好補
+                    if self.state_fn().get("armed"):
+                        self._sample(mono)
+                    else:
+                        self.skipped_ground += 1
                 continue
             # 鏈路通了：**先把缺口補完，補完就把 stayed_armed 歸零**
             if self.buf:
