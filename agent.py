@@ -87,7 +87,7 @@ from modem import ModemSampler
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.19.1"         # 0.19.1：沒解鎖就不補傳（與地面站的即時閘門一致）
+AGENT_VERSION = "0.19.2"         # 0.19.2：前導環形——偵測到斷線之前那幾秒也補得回來
 #: 多久沒被地面站確認過就當上行不通。即時通道每秒送一次、HTTP 逾時 3 秒，
 #: 8 秒容得下兩次連續逾時，又接近原本 `link_warn_s`（5 秒）的偵測延遲
 #: ——**這段延遲是有代價的**：補傳只在判定不通之後才開始取樣，
@@ -1018,7 +1018,10 @@ class Agent:
             # **補傳看的是「我的資料有沒有到」，不是「我聽不聽得到地面站」**
             # （issues/047 項次 6，2026-09-08 實測）。還沒被確認過（None）
             # 時當作不通——那時緩衝是對的，反正鏈路一確認就會補完
-            lambda: bool(self.uplink_ok))
+            lambda: bool(self.uplink_ok),
+            # 斷線的界線用**最後一次被地面站確認**的時刻，不是偵測到的時刻
+            # ——後者晚了一整個 UPLINK_STALE_S
+            confirmed_fn=lambda: self.uplink_seen)
         self.backfill.start()
         fd = self.serial.port.fileno()
         log.info("轉發目標：%s:%d（遙測）／%s:%d（指令）",

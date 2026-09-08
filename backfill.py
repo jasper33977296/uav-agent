@@ -47,6 +47,13 @@ SAMPLE_S = 1.0
 BUFFER_S = 1800.0
 #: 一次補傳最多幾筆。分批送：一包太大時，5G 抖一下整包就白送
 BATCH = 300
+
+#: 前導環形保留幾筆（秒）。**偵測到斷線之前的那幾秒也要補得回來**：
+#: 判定「上行不通」本身需要時間（agent 的 `UPLINK_STALE_S`，約 8 秒），
+#: 而在那之前資料其實已經沒有送到了。一直取樣進這個小環形，斷線成立時
+#: 把「最後一次被確認之後」的那幾筆一起放進待送佇列。
+#: 60 秒遠大於偵測延遲，成本是 60 個 dict。
+LEAD_S = 60.0
 #: 牆鐘顯然還沒同步的門檻（2020-09-13）。小於它就是「時鐘還沒被校正過」。
 #:
 #: **這台 Pi 的 RTC 沒有電池**：journal 實測每次開機都是
@@ -64,13 +71,23 @@ class Backfill(threading.Thread):
     按 SAMPLE_S 節流，所以主迴圈的頻率變化不會改變資料密度。
     """
 
-    def __init__(self, gs: str, port: int, board_uid_fn, state_fn, link_ok_fn):
+    def __init__(self, gs: str, port: int, board_uid_fn, state_fn, link_ok_fn,
+                 confirmed_fn=None):
         super().__init__(daemon=True)
+        #: () → 上次「地面站確認收到我的遙測」的單調時刻（沒有就 0）。
+        #: **界線用它，不用「偵測到斷線的時刻」**——後者晚了整整一個偵測
+        #: 延遲，而那段時間的資料其實已經在掉了
+        self.confirmed_fn = confirmed_fn or (lambda: 0.0)
         self.url = f"http://{gs}:{port}/api/telemetry/backfill"
         self.board_uid_fn = board_uid_fn
         self.state_fn = state_fn
         self.link_ok_fn = link_ok_fn
         self.buf: deque = deque(maxlen=int(BUFFER_S / SAMPLE_S))
+        #: 前導環形：**不管鏈路通不通都一直取樣**，只是通的時候不送。
+        #: 斷線成立的那一刻，把裡面「最後一次被確認之後」的幾筆補進 `buf`
+        self.lead: deque = deque(maxlen=int(LEAD_S / SAMPLE_S))
+        self._was_ok = True
+        self.lead_in = 0              # 靠這條救回來幾筆（要看得見）
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.sampled = 0
@@ -95,10 +112,11 @@ class Backfill(threading.Thread):
         return {"buffered": len(self.buf), "sampled": self.sampled,
                 "sent": self.sent, "failed": self.failed,
                 "rejected": self.rejected, "dropped": self.dropped,
-                "skipped_ground": self.skipped_ground}
+                "skipped_ground": self.skipped_ground,
+                "lead_in": self.lead_in}
 
     # ── 取樣 ───────────────────────────────────────────────────
-    def _sample(self, mono: float) -> None:
+    def _row(self, mono: float) -> dict:
         s = self.state_fn() or {}
         # **沒有位置就不取樣**：0,0 是自駕儀的「不知道」哨兵，而補傳的資料
         # 會直接進 telemetry 表——填一個假位置比缺一筆嚴重得多
@@ -120,7 +138,15 @@ class Backfill(threading.Thread):
             "flight_mode": s.get("mode"),
             "armed": bool(s.get("armed")),
         }
+        return row
+
+    def _enqueue(self, row: dict) -> None:
+        """放進待送佇列。**同一個 `_m` 不放兩次**——斷線成立那一刻會從前導
+        環形補一批進來，而那批可能與當下這一筆重疊；批次內重複的時間戳
+        地面站的去重擋不掉（它比對的是資料庫裡已有的列，不是同一批內部）。"""
         with self._lock:
+            if self.buf and self.buf[-1]["_m"] >= row["_m"]:
+                return
             self.buf.append(row)
         self.sampled += 1
         # armed 只要在這段期間曾經是 True，就記著——D 層用它判斷
@@ -129,6 +155,43 @@ class Backfill(threading.Thread):
             self.stayed_armed = True
         elif self.stayed_armed is None:
             self.stayed_armed = False
+
+    def tick(self, mono: float) -> bool:
+        """走一拍取樣。回「鏈路通不通」——通才輪到補傳去清佇列。
+
+        **這一段獨立成方法是為了讓測試打得到出貨的那一份**
+        （`scripts/test-backfill-lead.py`）。原本測試自己複製了一份迴圈邏輯，
+        那種測試會在被測的程式改動時安靜地變成測另一個東西。
+        """
+        link_ok = self.link_ok_fn()
+        # **斷線成立的那一刻，把前導環形裡「最後一次被確認之後」的補進來。**
+        # 判定上行不通本身要花時間（約 8 秒），而在那之前資料已經在掉了
+        # ——用偵測時刻當界線就是每次都少補那幾秒，而那幾秒正是狀態在變化的
+        # 那幾秒（鏈路開始壞的時候，飛機多半正在做什麼）
+        if self._was_ok and not link_ok:
+            since = self.confirmed_fn() or 0.0
+            back = [r for r in list(self.lead) if r["_m"] > since]
+            for r in back:
+                self._enqueue(r)
+            if back:
+                self.lead_in += len(back)
+                log.info("斷線成立：從前導環形補回 %d 筆（最後一次被確認"
+                         "是 %.1f 秒前）", len(back), mono - since)
+        self._was_ok = link_ok
+
+        if mono - self._last_sample >= SAMPLE_S:
+            self._last_sample = mono
+            # **沒解鎖就不補**（2026-09-08）：地面站的即時路徑在這種狀態下
+            # 本來就不寫任何東西，補傳沒有理由比它更積極。
+            # `armed is None`＝從來沒看到過飛控，那時也沒有東西好補
+            if self.state_fn().get("armed"):
+                row = self._row(mono)
+                self.lead.append(row)          # 通不通都留一份在前導環形
+                if not link_ok:
+                    self._enqueue(row)
+            elif not link_ok:
+                self.skipped_ground += 1
+        return link_ok
 
     # ── 補傳 ───────────────────────────────────────────────────
     def _batch(self, rows: list) -> list:
@@ -262,17 +325,7 @@ class Backfill(threading.Thread):
             mono = time.monotonic()
             if not self.board_uid_fn():
                 continue                      # 還沒註冊，補傳沒有收件人
-            link_ok = self.link_ok_fn()
-            if not link_ok:
-                if mono - self._last_sample >= SAMPLE_S:
-                    self._last_sample = mono
-                    # **沒解鎖就不補**（2026-09-08）：地面站的即時路徑在
-                    # 這種狀態下本來就不寫任何東西，補傳沒有理由比它更積極。
-                    # `armed is None`＝從來沒看到過飛控，那時也沒有東西好補
-                    if self.state_fn().get("armed"):
-                        self._sample(mono)
-                    else:
-                        self.skipped_ground += 1
+            if not self.tick(mono):
                 continue
             # 鏈路通了：**先把缺口補完，補完就把 stayed_armed 歸零**
             if self.buf:
