@@ -23,19 +23,38 @@ import serial
 log = logging.getLogger("uav-agent.modem")
 
 
+# ── NR 索引 → dB（2026-09-09 用模組自報的值域定案）────────────────────
+#
+# `AT+CESQ=?` 會把每個參數的合法值域報出來，這台回：
+#
+#     (0-63,99),(0-7,99),(0-96,255),(0-49,255),(0-34,255),(0-97,255),
+#     (0-126,255),(0-126,255),(0-127,255)
+#
+# 前 6 個正好是 TS 27.007 的標準參數（E-UTRA rsrq 0-34、rsrp 0-97 對得上），
+# 所以後 3 個是 NR 擴充，而且**重複同一個 rsrq→rsrp 的順序**——原本靠物理
+# 可能性反推的欄位順序，到這裡才算有憑據。
+#
+# **上限把公式釘死。** 值 0 是「低於下限」，值 1 是最低那一格：
+#   RSRP 上限 126 → 值1=-156、值126=-31   ⇒ idx - 157
+#   RSRQ 上限 126 → 值1=-43 、值126=19.5  ⇒ idx/2 - 43.5
+#   SINR 上限 127 → 值1=-23 、值127=40    ⇒ idx/2 - 23.5
+#
+# 原本三個都少減一格（-156／-43／-23），也就是**每一個值都樂觀了一格**。
+
+
 def _nr_rsrp(idx):
-    """3GPP TS 38.133：NR SS-RSRP 索引 → dBm。0..127 → -156..-31。"""
-    return None if idx in (None, 255) else idx - 156
+    """NR SS-RSRP 索引 → dBm。1..126 → -156..-31（步進 1）。"""
+    return None if idx in (None, 255) else idx - 157
 
 
 def _nr_rsrq(idx):
-    """NR SS-RSRQ 索引 → dB。0..127 → -43..+20（步進 0.5）。"""
-    return None if idx in (None, 255) else idx / 2.0 - 43
+    """NR SS-RSRQ 索引 → dB。1..126 → -43..+19.5（步進 0.5）。"""
+    return None if idx in (None, 255) else idx / 2.0 - 43.5
 
 
 def _nr_sinr(idx):
-    """NR SS-SINR 索引 → dB。0..127 → -23..+40（步進 0.5）。"""
-    return None if idx in (None, 255) else idx / 2.0 - 23
+    """NR SS-SINR 索引 → dB。1..127 → -23..+40（步進 0.5）。"""
+    return None if idx in (None, 255) else idx / 2.0 - 23.5
 
 
 #: 記錄緩衝的上限（筆）。1 Hz 取樣 → 1800 筆＝半小時。
@@ -146,12 +165,14 @@ class ModemSampler(threading.Thread):
         """+CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>[,<nr...>]
 
         FM160 在標準 6 個之後多回 3 個 NR 值，**順序原廠文件未載**。
-        用物理可能性反推（2026-08-24 實測值 65,93,103）：
-          假設 rsrq,rsrp,sinr → -10.5dB / -63dBm / +28.5dB  三者皆合理 ✓
-          假設 rsrp,rsrq,sinr → RSRQ = +3.5dB               不可能 ✗
-          假設 sinr,rsrp,rsrq → RSRQ = +8.5dB               不可能 ✗
-        只有第一種讓三個值同時落在合法值域，故採之。原始字串仍存進 raw，
-        日後拿到原廠文件可回頭重算。
+        2026-08-24 先用物理可能性反推出 rsrq,rsrp,sinr（另外兩種排法會讓
+        RSRQ 落在 +3.5／+8.5 dB，不可能）。
+
+        2026-09-09 拿到憑據：`AT+CESQ=?` 自報的值域是
+        `…,(0-34,255),(0-97,255),(0-126,255),(0-126,255),(0-127,255)`
+        ——前面那對正是 E-UTRA 的 rsrq,rsrp，後面三個**重複同一個順序**。
+        另外 `AT+GTCCINFO?` 的具名欄位 ss_rsrq／ss_rsrp／ss_sinr 也對得上
+        （SINR 索引完全相同；RSRP／RSRQ 差固定一格，見 modem_raw.py）。
         """
         m = re.search(r"\+CESQ:\s*([\d,\s]+)", txt)
         if not m:
@@ -164,10 +185,14 @@ class ModemSampler(threading.Thread):
             out["sinr"] = _nr_sinr(v[8])
             out["nr_mode"] = "SA"
         elif len(v) >= 6:                      # 只有 LTE 欄位
+            # TS 27.007 §8.69：<rsrp> 0..97（0=<-140、97=≥-44）、
+            # <rsrq> 0..34（0=<-19.5、34=≥-3）。**值 0 是「低於下限」**，
+            # 值 1 才是最低那一格——RSRQ 原本寫 -19.5，值1 會算成 -19、
+            # 值34 算成 -2.5，整條刻度樂觀了半格（與 NR 那三個同一種錯）
             if v[5] != 255:
-                out["rsrp"] = v[5] - 141       # LTE RSRP 索引換算
+                out["rsrp"] = v[5] - 141
             if v[4] != 255:
-                out["rsrq"] = v[4] / 2.0 - 19.5
+                out["rsrq"] = v[4] / 2.0 - 20
         return out
 
     # **GTCCINFO 不在機上解。** 2026-09-09 抓到：這裡原本把 PCI 當十進位讀
