@@ -170,40 +170,17 @@ class ModemSampler(threading.Thread):
                 out["rsrq"] = v[4] / 2.0 - 19.5
         return out
 
-    def _parse_gtccinfo(self, txt):
-        """Fibocom FM350 AT Commands Manual V2.10 §11.1.15 的 NR service cell：
-
-            <IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<narfcn>,
-            <physicalcellId>,<band>,<bandwidth>,<ss_sinr>,<rxlev>,<ss_rsrp>,<ss_rsrq>
-
-        **tac/cellid/narfcn 是十六進位，其餘是十進位。** 手冊沒明寫進位，是由兩
-        份實測資料互相印證出來的：T-Mobile US 的 narfcn `7EFAE`=519086 落在 n41
-        值域而其 band 欄是 5041；我方 `AFDA0`=720288 落在 n79 值域而 band 欄是
-        5079。兩邊都自洽，且 band 欄的「5」前綴代表 NR（5041→n41、5079→n79）。
-
-        只取有把握的欄位。`ss_*` 三個索引值不在這裡換算——CESQ 是 3GPP 標準
-        指令、換算有明文規範，優先用它；這裡的數值僅作為交叉驗證留在 raw。
-        """
-        m = re.search(r"NR service cell:\s*\n\s*([0-9A-Fa-f,]+)", txt)
-        if not m:
-            return {}
-        f = m.group(1).strip().split(",")
-        if len(f) < 10:
-            return {}
-        out = {}
-        try:
-            out["cell_id"] = int(f[5], 16)          # NCI（36 bit）
-            out["pci"] = int(f[7], 10)              # 0..1007
-            band = f[8]
-            if band.startswith("5") and len(band) >= 3:
-                out["band"] = "n" + band[1:].lstrip("0")   # 5079 → n79
-            out["raw_narfcn"] = int(f[6], 16)
-        except ValueError:
-            return {}                                # 格式不如預期就整批不填
-        # 合理性把關：解析對了但值不合法，寧可不填也不要餵髒資料下去
-        if not (0 <= out.get("pci", -1) <= 1007):
-            out.pop("pci", None)
-        return out
+    # **GTCCINFO 不在機上解。** 2026-09-09 抓到：這裡原本把 PCI 當十進位讀
+    # （`int(f[7], 10)`），而那一欄跟 tac/cellid/narfcn 一樣是**十六進位**。
+    # 現場 PCI 是 `85`＝0x85＝133，十進位讀成 85 **不會報錯、只會安靜地錯**
+    # ——反而是 09-07 那個含字母的 `8D` 讓它丟例外、整批不填，於是由地面站
+    # 補上正確的 141。錯得無聲的那一種，比錯得大聲的危險。
+    #
+    # 根因不是進位，是**同一個字串有兩份解析**（這裡一份、
+    # `apps/backend/app/modem_raw.py` 一份），而且地面站那份只補 null、
+    # 不覆蓋機上填的——於是錯的那份贏了。「機上是第一手」這個理由本身
+    # 就是陷阱：**兩邊解的是同一個原始字串，沒有誰比較第一手**，
+    # 第一手的是 raw 本身。所以機上只負責把 raw 原樣送上去，解碼只留一份。
 
     def _ping_rtt(self):
         """真的量一次 RTT，而不是拿 HTTP 往返充數（那含伺服器處理時間）。"""
@@ -223,8 +200,8 @@ class ModemSampler(threading.Thread):
             raw["CESQ"] = cesq.strip()
             out.update(self._parse_cesq(cesq))
             cc = self._at("AT+GTCCINFO?", 0.7)
+            # **原樣送上去，不在這裡解**（見上面那段）
             raw["GTCCINFO"] = cc.strip()
-            out.update(self._parse_gtccinfo(cc))
             cops = self._at("AT+COPS?", 0.4)
             raw["COPS"] = cops.strip()
             m = re.search(r'\+COPS:\s*\d+,\d+,"([^"]+)",(\d+)', cops)
@@ -248,8 +225,6 @@ class ModemSampler(threading.Thread):
             self._last_ping = now
             self._rtt_ms = self._ping_rtt()
         out["rtt_ms"] = self._rtt_ms
-        if "raw_narfcn" in out:
-            raw["narfcn"] = out.pop("raw_narfcn")   # schema 沒有這欄，收進 raw
         out["raw"] = raw
         out["time"] = datetime.now(timezone.utc).isoformat()   # 必須含時區
         pos = self.get_position() or {}
@@ -410,5 +385,6 @@ class ModemSampler(threading.Thread):
                 "dropped": self.dropped, "on_ground": self.on_ground,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
+                # pci／cell_id／band 由地面站從 raw 解（唯一一份解碼）
                 "pci": self.last.get("pci"), "cell_id": self.last.get("cell_id"),
                 "band": self.last.get("band")}

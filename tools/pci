@@ -1,0 +1,84 @@
+#!/home/pi/uav-agent/venv/bin/python
+"""看 5G 模組現在掛在哪個細胞上。
+
+    ./pci          看一次
+    ./pci -w       每 2 秒看一次（Ctrl-C 停）
+
+**用 /dev/ttyUSB2，不是 ttyUSB1**——ttyUSB1 是 uav-agent 在用的那個，
+兩邊同時下 AT 指令，回應會交錯，agent 那邊會讀到半截的字串。
+"""
+import re, sys, time
+
+# 讓 ./pci -w | tee log 這種用法也看得到東西（管線是全緩衝的）
+import serial
+
+sys.stdout.reconfigure(line_buffering=True)
+
+PORT = "/dev/ttyUSB2"
+
+
+def at(s, cmd, wait=0.8):
+    s.reset_input_buffer()
+    s.write(cmd.encode() + b"\r")
+    time.sleep(wait)
+    return s.read(800).decode("utf-8", "replace")
+
+
+def once(s):
+    cc = at(s, "AT+GTCCINFO?")
+    m = re.search(r"NR service cell:\s*\n\s*([0-9A-Fa-f,]+)", cc)
+    if not m:
+        print("讀不到 NR 服務細胞（沒註冊上？）")
+        print(cc.strip().replace("\r", ""))
+        return
+    f = m.group(1).split(",")
+    # Fibocom FM350 手冊 §11.1.15：
+    # 是否服務細胞, rat, mcc, mnc, tac, cellid, narfcn, PCI, band,
+    # 頻寬, ss_sinr, rxlev, ss_rsrp, ss_rsrq
+    # **PCI 跟 tac／cellid／narfcn 一樣是十六進位。**
+    # 這一欄全是數字的時候（例如 85），十進位讀不會報錯、只會安靜地錯——
+    # 0x85 是 133。2026-09-09 就是這樣讀錯的
+    pci = int(f[7], 16)
+    band = "n" + f[8][1:].lstrip("0") if f[8].startswith("5") else f[8]
+    print(f"PCI      {pci}")
+    print(f"Cell ID  {int(f[5], 16)}  (0x{f[5]})")
+    print(f"TAC      {int(f[4], 16)}  (0x{f[4]})")
+    print(f"Band     {band}   NR-ARFCN {int(f[6], 16)}")
+    print(f"PLMN     {f[2]} {f[3]}")
+    if len(f) >= 14:
+        print(f"（GTCCINFO 自報）SINR {int(f[10])/2-23:+.1f} dB  "
+              f"RSRP {int(f[12])-156} dBm  RSRQ {int(f[13])/2-43:+.1f} dB")
+
+    v = re.search(r"\+CESQ:\s*([\d,\s]+)", at(s, "AT+CESQ"))
+    if v:
+        x = [int(i) for i in v.group(1).split(",") if i.strip().isdigit()]
+        if len(x) >= 9:
+            # 標準 6 欄之後多回的 3 個 NR 值，順序是 rsrq, rsrp, sinr
+            print(f"（CESQ）        SINR {x[8]/2-23:+.1f} dB  "
+                  f"RSRP {x[7]-156} dBm  RSRQ {x[6]/2-43:+.1f} dB")
+
+
+def main():
+    try:
+        s = serial.Serial(PORT, 115200, timeout=1.2)
+    except Exception as e:
+        print(f"開不了 {PORT}：{e}")
+        return 1
+    if "OK" not in at(s, "AT", 0.4):
+        print(f"{PORT} 沒有回應 AT——模組可能還沒起來")
+        return 1
+    try:
+        while True:
+            once(s)
+            if "-w" not in sys.argv:
+                break
+            print("─" * 46)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s.close()
+    return 0
+
+
+sys.exit(main())
