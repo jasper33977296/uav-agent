@@ -30,6 +30,18 @@ echo "   已安裝 /etc/systemd/system/uav-agent.service"
 echo "   部署參數（GS_HOST 等）改在該檔的 Environment= 行，不要改程式碼"
 
 echo
-echo "== 3. 完成。尚未啟動 =="
+echo "== 3. 時間跟地面站對齊 =="
+# 機上資料（訊號、補傳、錄製、事件）的時間戳要跟地面站**同一個時鐘**，
+# 否則對不齊。只跟地面站對時、不退回網路上的伺服器：兩邊各自對到不同來源，
+# 實測就差了 0.58 秒（2026-09-14）。地面站的 ntpsec 開著 orphan 模式，
+# 現場沒有網路時仍然會給時間
+GS=$(sed -n 's/^Environment=GS_HOST=//p' "$HERE/systemd/uav-agent.service")
+mkdir -p /etc/systemd/timesyncd.conf.d
+printf '[Time]\nNTP=%s\nFallbackNTP=\n' "$GS" > /etc/systemd/timesyncd.conf.d/uav-gs.conf
+systemctl restart systemd-timesyncd
+echo "   /etc/systemd/timesyncd.conf.d/uav-gs.conf：NTP=$GS"
+
+echo
+echo "== 4. 完成。尚未啟動 =="
 echo "   先手動驗證： sudo systemctl start uav-agent && journalctl -u uav-agent -f"
 echo "   確認無誤後 ： sudo systemctl enable uav-agent"

@@ -33,7 +33,7 @@ class Fake(A.Agent):
         self.mon = types.SimpleNamespace(
             state={"gps_fix": "3D", "lat": lat, "lon": lon, "alt_rel_m": 30.0,
                    "heading": 0.0, "mission_seq": 2, "sysid": 1},
-            events=[], last_hb=time.time())
+            events=[], last_hb=time.monotonic())
         self.proposals = {}
         self.seq = None
         self.a = types.SimpleNamespace(seq_timeout_s=120.0)
@@ -72,7 +72,7 @@ ev = g.on_decision({"intent_id": "i1", "approved": True})
 chk("確認 → cleared", ev["event"] == "cleared", ev.get("reason"))
 chk("序列旗標開始", g.seq and g.seq["step"] == "approved", g.seq)
 chk("序列旗標有死線（地面站掛掉時不能永遠留著）",
-    g.seq["deadline"] > time.time(), g.seq.get("deadline"))
+    g.seq["deadline"] > time.monotonic(), g.seq.get("deadline"))
 
 print("\n── 序列逐步回報 ───────────────────────────────────────")
 for stp in ("hold", "upload", "goto"):
@@ -95,8 +95,8 @@ print("\n── 序列死線：地面站中途掛掉 ─────────
 g = Fake()
 propose(g)
 g.on_decision({"intent_id": "i1", "approved": True})
-g.seq["deadline"] = time.time() - 1        # 假裝已經拖很久
-g._expire_seq(time.time())
+g.seq["deadline"] = time.monotonic() - 1        # 假裝已經拖很久
+g._expire_seq(time.monotonic())
 chk("逾時清掉序列旗標", g.seq is None)
 chk("清掉時留一筆事件（不是安靜地消失）",
     any("逾時" in e[2] for e in g.mon.events), g.mon.events[-1:])

@@ -75,6 +75,7 @@ from collections import defaultdict
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
+import clock
 import guard
 import normalize
 import recorder
@@ -125,6 +126,15 @@ QUIET_STREAMS = [
     mavutil.mavlink.MAV_DATA_STREAM_EXTRA2,
     mavutil.mavlink.MAV_DATA_STREAM_EXTRA3,
 ]
+
+#: 讓路時**不停**的訊息（間隔，微秒）。全停的話遙測斷 3 秒以上，而地面站
+#: 2 秒就判定資料過期——每讀一次參數，畫面就「失連」一次，那是我們自己
+#: 弄斷的（2026-09-14）。只留位置、狀態、速度、落地狀態，一秒不到 5 則，
+#: 57600 上給 PARAM_VALUE 的空間綽綽有餘
+QUIET_KEEP = {33: 500_000,     # GLOBAL_POSITION_INT
+              1: 1_000_000,    # SYS_STATUS
+              74: 1_000_000,   # VFR_HUD
+              245: 1_000_000}  # EXTENDED_SYS_STATE
                                  # 0.17：開機就錄（不再只錄 armed）＋待機時間輪替
                                  # 0.16：電量判準裝回雙判準（電池確認 4S，14.0V 本來就是對的）
                                  # 0.15：（已撤回）電量判準改成單一來源——前提是門檻設錯，而它沒錯
@@ -165,6 +175,23 @@ def agent_uid() -> str | None:
 
 
 # 要飛控持續送的重點訊息（逐一設間隔，比舊式 ALL 串流精準）
+#: 換號（040）完成後記下的新號碼。服務設定的 FC_SYSID 只是初始值——換過號
+#: 之後代理重開，要認得用新號碼回來的那台飛控
+FC_SYSID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fc_sysid")
+
+
+def _load_fc_sysid(default: int) -> int:
+    try:
+        with open(FC_SYSID_FILE) as f:
+            v = int(f.read().strip())
+    except (OSError, ValueError):
+        return default
+    if v != default:
+        log.warning("綁定的飛控 sysid 用 %s 記下的 %d（服務設定是 %d）——換號之後留下的",
+                    FC_SYSID_FILE, v, default)
+    return v
+
+
 WANTED = [1, 24, 27, 29, 30, 33, 36, 42, 62, 65, 74, 116, 125, 147, 193,
           241, 245]   # 245＝EXTENDED_SYS_STATE（landed_state）
 
@@ -342,7 +369,7 @@ class Monitor:
     def feed(self, msg):
         t = msg.get_type()
         self.counts[t] += 1
-        now = time.time()
+        now = time.monotonic()
         s = self.state
 
         if t == "HEARTBEAT" and msg.get_srcSystem() != 255:
@@ -523,7 +550,7 @@ class Monitor:
             txt = ("遙控器已連線" if rc else
                    "⚠ 遙控器離線——此時不得起飛／開始任務" if rc is False
                    else "遙控器狀態不明（收不到判定所需的訊息）")
-            self.events.append((time.time(), "rc_link", txt))
+            self.events.append((time.monotonic(), "rc_link", txt))
             log.info("狀態變化：%s（來源 %s）", txt, s.get("rc_source"))
 
     def _board_uid(self, real):
@@ -569,11 +596,14 @@ class Monitor:
             prev = self.state.get(key)
             self.state[key] = val
             if prev is not None:            # 第一次讀到不算「變化」
-                self.events.append((time.time(), key, message))
+                self.events.append((time.monotonic(), key, message))
                 log.info("狀態變化：%s", message)
 
 
 class Agent:
+    #: 測試替身不跑 __init__；真的值在 __init__ 裡設
+    fc_sysid = 1
+
     def __init__(self, a):
         self.a = a
         self.mon = Monitor(sim_board_uid=getattr(a, "board_uid", None))
@@ -612,6 +642,8 @@ class Agent:
         #: keep／change。`reassigning` 非 None 時代表正在換號並重開飛控——
         #: 它會被送上去，讓地面站不要把飛控消失當成失聯（設計 §3.3）
         self.assigned_sysid = None
+        self.fc_sysid = _load_fc_sysid(getattr(self.a, "fc_sysid", 1))
+        self.foreign = {}             # 別台機的 sysid → 收到幾則（不轉發、不採信）
         self.sysid_action = None
         self.reassigning = None
         self.reassign_tried = False
@@ -956,7 +988,7 @@ class Agent:
         if first:
             self.quiet_since = now
             try:
-                tgt = self.mon.state.get("sysid", 1)
+                tgt = self.fc_sysid
                 # **兩條路都要關，因為 request_streams() 兩條路都開了。**
                 # 第一版只送 REQUEST_DATA_STREAM(ALL, 0)，讓路確實發生了
                 # （日誌有、3.1 秒也對），但參數還是讀不到——因為 ArduPilot
@@ -977,7 +1009,7 @@ class Agent:
                     # interval = -1：停送這一則（0 是「回到預設速率」，不是停）
                     self.serial.mav.command_long_send(
                         tgt, 1, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-                        msgid, -1, 0, 0, 0, 0, 0)
+                        msgid, QUIET_KEEP.get(msgid, -1), 0, 0, 0, 0, 0)
                 self.quiet_rx0 = self.fc_msgs
                 self.quiet_types = {}
                 log.info("參數交換：串流讓路（最多 %.0fs，或最後一則參數訊息"
@@ -1005,7 +1037,7 @@ class Agent:
 
     def request_streams(self):
         """請求／重新請求遙測串流。舊式與新式兩條路都走。"""
-        tgt = self.mon.state.get("sysid", 1)
+        tgt = self.fc_sysid
         try:
             self.serial.mav.request_data_stream_send(
                 tgt, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, self.a.rate, 1)
@@ -1017,7 +1049,7 @@ class Agent:
             log.info("已請求串流 %d Hz（目標 sysid=%d）", self.a.rate, tgt)
         except Exception as e:
             log.warning("請求串流失敗：%s", e)
-        self.last_stream_req = time.time()
+        self.last_stream_req = time.monotonic()
 
     def run(self):
         self.connect_serial()
@@ -1087,9 +1119,26 @@ class Agent:
                 log.exception("主迴圈例外，吞掉續跑")
                 time.sleep(0.2)
 
+    def _accept_sysids(self):
+        ok = {self.fc_sysid}
+        if self.reassigning:
+            ok.add(self.reassigning["to"])     # 換號中：飛控會用新號碼回來
+        return ok
+
+    def _foreign(self, msg):
+        """不是這個代理綁的飛控。**不轉發、不採信，但照錄**——錄下來才查得到
+        它從哪裡來（2026-09-14 就是靠機上錄製認出 sysid 3 是另一台機）。"""
+        src = msg.get_srcSystem()
+        n = self.foreign[src] = self.foreign.get(src, 0) + 1
+        if n == 1:
+            log.warning("收到 sysid %d 的封包，但這個代理只綁 sysid %d 的飛控——"
+                        "不轉發、不採信。多半是飛控把其他 MAVLink 埠聽到的別台機"
+                        "轉過來了（例如數傳）", src, self.fc_sysid)
+        self.recorder.feed(msg.get_msgbuf(), bool(self.mon.state.get("armed")))
+
     def tick(self, fd):
         r, _, _ = select.select([fd, self.telem.sock, self.cmd.sock], [], [], 0.2)
-        now = time.time()
+        now = time.monotonic()
 
         # ── 飛控 → 地面站 ──────────────────────────────────
         if fd in r:
@@ -1098,6 +1147,9 @@ class Agent:
             data = port.read(n) if n else b""
             for msg in (self.fc_parser.parse_buffer(data) or []) if data else []:
                 if msg.get_type() == "BAD_DATA":
+                    continue
+                if msg.get_srcSystem() not in self._accept_sysids():
+                    self._foreign(msg)
                     continue
                 self.fc_msgs += 1
                 if self.quiet_until:      # 讓路期間把型別記下來（診斷用）
@@ -1184,7 +1236,7 @@ class Agent:
                 # MAVLink，我們是那條路徑上的必經之地，順手看一眼就有了
                 # ——與 `_note_mode_request` 同一個做法
                 if m.get_type() in PARAM_MSGS:
-                    self.param_quiet(time.time())
+                    self.param_quiet(time.monotonic())
                 self._write(fd, m.get_msgbuf())
 
     def _note_mode_request(self, m):
@@ -1200,7 +1252,7 @@ class Agent:
         elif t == "COMMAND_LONG" and m.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
             code = int(m.param2)
         if code is not None:
-            self.mode_req = (COPTER_MODE.get(code, code), time.time())
+            self.mode_req = (COPTER_MODE.get(code, code), time.monotonic())
 
     def _track_mode_owner(self):
         """每次觀察到模式變化，判定這個模式是我方造成的還是飛手切的。
@@ -1219,7 +1271,7 @@ class Agent:
         req, ts = self.mode_req or (None, 0)
         # 10 秒：模式指令送出到心跳回報新模式之間的正常延遲遠小於此；
         # 放寬到這個量級是為了容忍 57600 上的重送與丟包
-        fresh = req is not None and time.time() - ts < 10
+        fresh = req is not None and time.monotonic() - ts < 10
         if fresh and req == mode:
             self.mode_owner = "us"
         elif fresh:
@@ -1396,6 +1448,13 @@ class Agent:
         if r["phase"] == "rebooting" and cur == r["to"]:
             log.warning("✓ 換號完成：飛控用 sysid %s 回來了", cur)
             self.reassigning = None
+            self.fc_sysid = cur
+            try:
+                with open(FC_SYSID_FILE, "w") as f:
+                    f.write(str(cur))
+            except OSError as e:
+                log.warning("新的 sysid 記不下來（%s）——代理重開前要把 FC_SYSID 改成 %s",
+                            e, cur)
             self.sysid_action = "keep"
             # **重新註冊**：讓地面站看到它現在用對號碼了（會拿到 keep）
             self.hello_sent = False
@@ -1443,7 +1502,7 @@ class Agent:
         if not ok:
             log.warning("守門擋下意圖 %s（狀態 %s）：%s", action, state, why)
             self.mon.events.append(
-                (time.time(), "guard", f"擋下 {action}：{why}"))
+                (time.monotonic(), "guard", f"擋下 {action}：{why}"))
             return {**base, "event": "guard_refused", "reason": why}
         if action == "change_route":
             # 算提案本來就不動飛機，乾跑與否走同一條路——而**補送的
@@ -1550,10 +1609,10 @@ class Agent:
                     "reason": f"提案已經過期：{drift}。請重看新的提案再決定"}
         # 序列開始。**設一個死線**：地面站中途掛掉的話，這個旗標不能永遠留著
         # ——它會讓失聯處置一直以為序列在跑
-        self.seq = {"intent_id": iid, "step": "approved", "since": time.time(),
-                    "deadline": time.time() + self.a.seq_timeout_s}
+        self.seq = {"intent_id": iid, "step": "approved", "since": time.monotonic(),
+                    "deadline": time.monotonic() + self.a.seq_timeout_s}
         log.info("改航線已確認（%s）→ 由地面站執行三步", iid)
-        self.mon.events.append((time.time(), "intent", "改航線已確認，序列開始"))
+        self.mon.events.append((time.monotonic(), "intent", "改航線已確認，序列開始"))
         return {**base, "event": "cleared", "proposal": now_prop,
                 "reason": "確認成立，由地面站執行三步序列"}
 
@@ -1574,14 +1633,14 @@ class Agent:
                 "state": self.flight_state(), "executor": "ground"}
         if self.seq and self.seq.get("intent_id") == iid:
             self.seq["step"] = step
-            self.seq["deadline"] = time.time() + self.a.seq_timeout_s
+            self.seq["deadline"] = time.monotonic() + self.a.seq_timeout_s
             if step in ("resume", "done") or not ok:
                 self.seq = None
                 self.proposals.pop(iid, None)
         log.info("改航線序列 %s：%s%s", step, "完成" if ok else "**失敗**",
                  f"（{msg.get('detail')}）" if msg.get("detail") else "")
         self.mon.events.append(
-            (time.time(), "intent",
+            (time.monotonic(), "intent",
              f"改航線 {step} {'完成' if ok else '失敗'}"))
         return {**base, "event": "noted", "ok": ok}
 
@@ -1600,14 +1659,14 @@ class Agent:
 
     def _do_agent_action(self, action, base) -> dict:
         mode = self._INTENT_MODE[action]
-        tgt = self.mon.state.get("sysid", 1)
+        tgt = self.fc_sysid
         code = COPTER_MODE_ID.get(mode)
         if code is None:
             return {**base, "event": "failed", "reason": f"不認得模式 {mode}"}
         try:
             # 送三次：57600 上單一封包丟失是真實風險，而這是保命指令。
             # DO_SET_MODE 冪等，重複下達沒有副作用（與失聯處置同一套理由）
-            self.mode_req = (mode, time.time())
+            self.mode_req = (mode, time.monotonic())
             for _ in range(3):
                 self.serial.mav.command_long_send(
                     tgt, 1, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
@@ -1618,11 +1677,16 @@ class Agent:
             log.exception("意圖 %s 送出失敗", action)
             return {**base, "event": "failed", "reason": f"送出失敗：{e}"}
         log.info("意圖 %s → 已下達 %s（狀態 %s）", action, mode, base["state"])
-        self.mon.events.append((time.time(), "intent", f"{action} → {mode}"))
+        self.mon.events.append((time.monotonic(), "intent", f"{action} → {mode}"))
         # **回 sent 而不是 done**：ACK 是「我收到了」，不是「我做到了」。
         # 真的進了哪個模式由下一則 state 說（那是讀回來的事實）
         return {**base, "event": "sent", "mode": mode,
                 "reason": f"已下達 {mode}，實際模式看下一則 state"}
+
+    def _reassigning_wire(self):
+        """`since` 在機上是單調時鐘秒數；送出去之前換成牆鐘時刻。"""
+        r = self.reassigning
+        return None if r is None else {**r, "since": round(clock.wall(r["since"]), 2)}
 
     def _publish_state(self):
         """把當下狀態交給意圖通道。**狀態的定義只有 flight_state() 一份**——
@@ -1645,11 +1709,13 @@ class Agent:
             "rc_link": s.get("rc_link"),
             # 040 A3：正在換號。**放頂層與 rc_link 同理**——地面站的鏡像讀的是
             # 頂層欄位，放進 derived 會讓畫面永遠看不到它
-            "reassigning": self.reassigning,
+            "reassigning": self._reassigning_wire(),
             # **這個 LOITER 是誰造成的**：us／pilot／None＝不知道。
             # 它決定了守門讓不讓地面站動這台機，所以**它必須看得見**——
             # 原本它只活在代理的記憶體裡，畫面上只看得到「指令被拒」
             "mode_owner": self.mode_owner,
+            # 機上時鐘對過了沒。沒對過時它標的時間不能拿去對齊資料
+            "clock_synced": clock.synced(),
             # 014：機上錄製的回傳現況。**放頂層而不是 derived**——`derived`
             # 是拿去與地面站自己算的做比對的（026 §9），塞一個地面站算不出來
             # 的東西進去沒有意義。
@@ -1907,7 +1973,7 @@ class Agent:
         每一格都往「不要亂動」的方向偏——分不出來就當飛手拿著。
         """
         s = self.mon.state
-        if time.time() - self.mon.last_hb > 5.0:
+        if time.monotonic() - self.mon.last_hb > 5.0:
             return "DISCONNECTED"          # 沒有心跳就不得下任何指令
         # MAV_STATE 5/6＝CRITICAL/EMERGENCY：飛控自己的 failsafe 正在跑
         if s.get("system_status") in (5, 6):
@@ -2030,7 +2096,7 @@ class Agent:
         go_home, why = self._battery_verdict()
         if go_home:
             return why
-        # 用 is None 而不是 `or`：loss_started 是 epoch 秒數，`or` 會把
+        # 用 is None 而不是 `or`：loss_started 是單調時鐘秒數，`or` 會把
         # 合法的 0.0 當成未設定——測試就是這樣抓到的（單飛上限永不觸發）
         base = now if self.loss_started is None else self.loss_started
         solo = now - base
@@ -2066,9 +2132,9 @@ class Agent:
         if code is None:
             log.error("未知的失聯處置 %s，不動作", want)
             return
-        tgt = self.mon.state.get("sysid", 1)
+        tgt = self.fc_sysid
         # 這是我方要求的模式：記進溯源，免得等一下把自己下的 RTL 當成飛手切的
-        self.mode_req = (want, time.time())
+        self.mode_req = (want, time.monotonic())
         log.error("⚠⚠ 地面站失聯 %.0f 秒且機體 armed（模式 %s，%s）→ 下達 %s",
                   age, mode, why, want)
         try:
@@ -2120,7 +2186,7 @@ class Agent:
 
     def report(self):
         s = self.mon.state
-        hb_age = time.time() - self.mon.last_hb if self.mon.last_hb else None
+        hb_age = time.monotonic() - self.mon.last_hb if self.mon.last_hb else None
         # **錄製器的 flush 原本是死碼。** 檔案開著 64 KB 緩衝，代理若在飛行中
         # 被 SIGKILL／掉電，尾巴那 64 KB（約十秒）就沒了——而**那十秒正是
         # 我們留這份錄製的理由**（出事前最後那一段）。狀態列本來就每 10 秒
@@ -2139,12 +2205,13 @@ class Agent:
             "fwd_to_fc": self.fwd_to_fc,
             # 讓路中要**說出來**：這段期間遙測是我方刻意停的，不是故障。
             # 沒有這一格，地面站看到的就只是「資料突然變舊」——與失聯同形
-            "param_quiet": time.time() < self.quiet_until,
+            "param_quiet": time.monotonic() < self.quiet_until,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
             "gs_link_ok": self.gs_link_ok,
             "uplink_ok": self.uplink_ok,
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
             # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
+            "foreign_sysids": {str(k): v for k, v in self.foreign.items()},
             "udp": {"telem": self.telem.port, "cmd": self.cmd.port,
                     "rebinds": self.telem.rebinds},
             "state": self.flight_state(),
@@ -2166,6 +2233,11 @@ class Agent:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dev", default=os.environ.get("FC_DEV", "/dev/ttyAMA0"))
+    # **一個代理只綁一台飛控。** 飛控會把它其他 MAVLink 埠聽到的東西轉過來
+    # （2026-09-14：數傳聽到另一台機，sysid 3 混進來、狀態被蓋來蓋去），
+    # 所以只認這個號碼；換號（040）完成後會記下新號碼
+    p.add_argument("--fc-sysid", type=int,
+                   default=int(os.environ.get("FC_SYSID", 1)))
     # **只給模擬器用**：飛控報不出板子身分時改用這個值。不給＝維持原行為，
     # 沒有 uid 就不註冊——實體環境唯一正確的行為（見 Monitor._board_uid）
     p.add_argument("--board-uid", default=os.environ.get("BOARD_UID"),

@@ -41,7 +41,7 @@ class Fake(A.Agent):
         # 心跳新鮮＝不是 DISCONNECTED。要測 DISCONNECTED 就傳 _hb_age
         hb_age = st.pop("_hb_age", 0.0)
         self.mon = types.SimpleNamespace(state=st, events=[],
-                                         last_hb=time.time() - hb_age)
+                                         last_hb=time.monotonic() - hb_age)
         self.mode_owner = owner
         self.loss_started = 0.0
         self.seq = st.pop("_seq", None)   # 改航線序列進行中？
@@ -54,6 +54,8 @@ class Fake(A.Agent):
         self.takeover = None            # 接管紀錄（2026-09-04）：測判定不測留痕
         self.gs_link_ok = False
         self.last_gs_rx = 0.0
+        self.uplink_seen = 0.0            # 上行確認：與正式 __init__ 一致
+        self.reassigning = None
         self.serial = types.SimpleNamespace(
             mav=types.SimpleNamespace(
                 command_long_send=lambda *args: self.sent_modes.append(args[5])))
@@ -186,7 +188,7 @@ RTL_ID, LAND_ID = A.COPTER_MODE_ID["RTL"], A.COPTER_MODE_ID["LAND"]
 for label, batt in (("電量 12%（低於下限）", 12), ("電量 80%（充足）", 80)):
     g = Fake(mode="AUTO", mission_state=3, battery_pct=batt, **AIR)
     why = g._loss_verdict(g.flight_state(), 20.0)
-    g._do_link_loss_action(time.time(), 20.0, "AUTO", str(why))
+    g._do_link_loss_action(time.monotonic(), 20.0, "AUTO", str(why))
     hit = g.sent_modes and all(m == RTL_ID for m in g.sent_modes)
     print(f"{'✓' if hit else '✗'} {label} → 下達 RTL"
           f"（模式碼 {set(g.sent_modes)}，LAND 是 {LAND_ID}）")
@@ -199,10 +201,10 @@ print("\n── 複裁 F：鏈路恢復不取消已經開始的 RTL ────
 g = Fake(mode="RTL", **AIR)              # 已經因為失聯下過 RTL，正在返航
 g.loss_acted = True
 g.loss_warned = True
-g.loss_started = time.time() - 40
+g.loss_started = time.monotonic() - 40
 g.gs_link_ok = False
-g.last_gs_rx = time.time()               # 鏈路剛恢復
-g._check_gs_link(time.time())
+g.last_gs_rx = time.monotonic()               # 鏈路剛恢復
+g._check_gs_link(time.monotonic())
 chk_ok = not g.sent_modes
 print(f"{'✓' if chk_ok else '✗'} 恢復時不對飛機下任何指令"
       f"（送出了 {g.sent_modes}）")
@@ -220,9 +222,9 @@ ok &= traced
 g2 = Fake(mode="AUTO", mission_state=3, battery_pct=80, **AIR)
 g2.loss_warned = True
 g2.gs_link_ok = False
-g2.last_gs_rx = time.time() - 60         # 失聯 60 秒，早就超過單飛上限
+g2.last_gs_rx = time.monotonic() - 60         # 失聯 60 秒，早就超過單飛上限
 g2.loss_started = g2.last_gs_rx
-g2._check_gs_link(time.time())
+g2._check_gs_link(time.monotonic())
 acted = g2.sent_modes and all(m == RTL_ID for m in g2.sent_modes)
 print(f"{'✓' if acted else '✗'} **反向驗證**：仍在失聯且超過上限 → 照樣下 RTL"
       f"（{set(g2.sent_modes)}）")

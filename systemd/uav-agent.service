@@ -14,6 +14,8 @@ WorkingDirectory=/home/pi/uav-agent
 # ── 部署參數（改這裡，不要改程式碼）──────────────────────────
 Environment=GS_HOST=10.141.2.21
 Environment=FC_DEV=/dev/ttyAMA0
+# 這個代理只綁這個 sysid 的飛控；飛控從其他 MAVLink 埠轉過來的別台機一律不轉發
+Environment=FC_SYSID=1
 Environment=FC_BAUD=57600
 Environment=RATE=4
 Environment=MODEM_PORT=/dev/ttyUSB1

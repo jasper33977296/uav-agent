@@ -35,6 +35,8 @@ import os
 import struct
 import time
 
+import clock
+
 log = logging.getLogger(__name__)
 
 
@@ -73,11 +75,22 @@ class Recorder:
         self.frames = 0
         self.dropped = 0
         self._warned = False
+        #: 時鐘對過之前收到的框架：(單調時間, 框架)。對時後補寫、時間換算成牆鐘
+        self._pre: list = []
+        self._pre_bytes = 0
+        self._gave_up = False
 
     # ── 對外 ────────────────────────────────────────────────────
     def feed(self, raw: bytes, armed: bool) -> None:
         """一個 MAVLink 框架。**這個函式不准拋例外**——它在轉發的熱路徑上。"""
         try:
+            # **時鐘對過之前先不寫檔**：那段的牆鐘是錯的（換電池重開時是「上次
+            # 存下的時間」），寫進去的時間戳對不上地面站。先記單調時間，對時後
+            # 換算補寫——檔名也因此是對的時間
+            if not (clock.synced() or self._gave_up):
+                if not self.armed_only or armed:
+                    self._hold(raw)
+                return
             # **落地即換檔＝一趟飛行一個檔案。** armed_only 模式下這是順帶
             # 發生的（下面那行就會關檔），但 RECORD_DISARMED=1 時不換的話，
             # 檔案要等 512 MB 才會關——**而沒關好的檔案不會被自動回傳**
@@ -99,6 +112,8 @@ class Recorder:
                 self._open()
             if self.f is None:
                 return
+            if self._pre:
+                self._write_pre()
             self.f.write(struct.pack(">Q", int(time.time() * 1e6)))
             self.f.write(raw)
             self.written += len(raw) + 8
@@ -126,13 +141,32 @@ class Recorder:
                 pass
 
     # ── 內部 ────────────────────────────────────────────────────
+    #: 等對時最多先壓多少（位元組）。約 3.8 KB/s 的流量下是半個多小時；
+    #: 等不到就照當下牆鐘開始寫——**錄不到比時間戳不準糟**
+    PRE_MAX = 8 * 1024 * 1024
+
+    def _hold(self, raw: bytes) -> None:
+        self._pre.append((time.monotonic(), raw))
+        self._pre_bytes += len(raw)
+        if self._pre_bytes > self.PRE_MAX:
+            self._gave_up = True
+            log.warning("時鐘一直沒有對上（已壓 %.1f MB）——照牆鐘開始寫，"
+                        "這份錄製的時間戳可能對不上地面站", self._pre_bytes / 1e6)
+
+    def _write_pre(self) -> None:
+        for m, raw in self._pre:
+            self.f.write(struct.pack(">Q", int(clock.wall(m) * 1e6)))
+            self.f.write(raw)
+            self.written += len(raw) + 8
+            self.frames += 1
+        log.info("補寫對時前的 %d 個框架（時間已換算）", len(self._pre))
+        self._pre, self._pre_bytes = [], 0
+
     def _open(self) -> None:
         self._opened_at = time.monotonic()
         os.makedirs(self.dir, exist_ok=True)
-        # **檔名用開檔當下的時間**。這台 Pi 的 RTC 沒有電池，冷開機時牆鐘從
-        # 1970 起算——所以檔名可能是 1970，而那**不是 bug，是誠實**：
-        # 它記錄了「這份是在時鐘校正之前錄的」。改用單調時鐘命名反而會讓
-        # 檔案之間失去可比的時間軸（見 issues/039 C 層的同一顆 RTC）
+        # **檔名用開檔當下的時間**。開檔一定在時鐘對過之後（見 feed），
+        # 除非一直等不到對時才照當下牆鐘開檔——那時檔名本身就說明了這件事
         base = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         # **同一秒內換檔要換名字。** 檔名只有秒解析度，而換檔可能在同一秒內
         # 發生（檔案填得快、或上限設得小）——同名會用 `ab` 接回原檔，

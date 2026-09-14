@@ -34,6 +34,8 @@ import json
 import logging
 import threading
 import time
+
+import clock
 import urllib.error
 import urllib.request
 from collections import deque
@@ -237,7 +239,9 @@ class Backfill(threading.Thread):
         # **時鐘還沒同步就先不送。** 5G 剛通到 timesyncd 真的把時間 step 過去
         # 之間有幾秒空窗，那幾秒送出去的換算基準仍然是 1970。資料留在環形裡
         # 等下一輪——環形有上限，等不到也只是丟最舊的，不會無限長大
-        if time.time() < CLOCK_SANE_EPOCH:
+        # 換電池重開時牆鐘是「上次存下的時間」而不是 1970，光看年份分不出
+        # 它還沒對過——有 timesyncd 就認它的旗標（見 clock.synced）
+        if not clock.synced():
             if not self._clock_warned:
                 self._clock_warned = True
                 log.warning("牆鐘還沒同步（現在是 %s）→ 暫不補傳：換算基準是錯的，"

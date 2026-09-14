@@ -13,6 +13,8 @@ import re
 import subprocess
 import threading
 import time
+
+import clock
 from collections import deque
 import urllib.error
 import urllib.request
@@ -245,13 +247,17 @@ class ModemSampler(threading.Thread):
             self.ser = None
             return None
 
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_ping >= 5.0:       # RTT 不必每秒量
             self._last_ping = now
             self._rtt_ms = self._ping_rtt()
         out["rtt_ms"] = self._rtt_ms
         out["raw"] = raw
         out["time"] = datetime.now(timezone.utc).isoformat()   # 必須含時區
+        # 牆鐘還沒對過時，上面那個時間是錯的。即時通道照送，讓地面站改用收到
+        # 的時刻；記錄通道則記單調時間，送出前再換算（見 flush）
+        out["clock_synced"] = clock.synced()
+        mono_at = time.monotonic()
         pos = self.get_position() or {}
         for k in ("lat", "lon", "alt_rel"):
             if pos.get(k) is not None:
@@ -271,7 +277,7 @@ class ModemSampler(threading.Thread):
         self._seq += 1
         if len(self.buf) == self.buf.maxlen:
             self.dropped += 1
-        self.buf.append({**out, "seq": self._seq})
+        self.buf.append({**out, "seq": self._seq, "_m": mono_at})
         return out
 
     def post(self, sample):
@@ -327,8 +333,13 @@ class ModemSampler(threading.Thread):
         """
         if not self.buf:
             return 0
+        if not clock.synced():
+            return 0            # 換算基準還是錯的：留在緩衝裡等對時
         chunk = list(self.buf)[:BATCH_MAX]
-        body = {"samples": chunk}
+        body = {"samples": [
+            {**{k: v for k, v in x.items() if k not in ("_m", "clock_synced")},
+             "time": clock.iso(x["_m"]) if "_m" in x else x["time"]}
+            for x in chunk]}
         if self.drone_id_fn:
             did = self.drone_id_fn()
             if did:

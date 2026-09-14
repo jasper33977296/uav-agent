@@ -126,20 +126,22 @@ class IntentLink(threading.Thread):
             log.info("意圖通道已連上 %s", self.url)
             last_sent = 0.0
             last_state = None
-            last_rx = time.time()
+            # 靜默計時用單調時鐘：Pi 對時會讓牆鐘一次跳好幾分鐘，那一刻會被
+            # 當成「地面站好久沒回話」而自己掐斷連線（2026-09-14）
+            last_rx = time.monotonic()
             while not self._stop.is_set():
                 # 先收：地面站可能回 error（協定版本不合、型別未支援）。
                 # **不能只顧著送**——被拒絕卻沒讀到，就會一路送到天荒地老
                 try:
                     self._on_message(ws.recv(), ws)
-                    last_rx = time.time()
+                    last_rx = time.monotonic()
                 except websocket.WebSocketTimeoutException:
                     pass
                 while self._pending:
                     self._send(ws, dict(self._pending.pop(0), type="event"))
                 with self._lock:
                     snap = self._snapshot
-                now = time.time()
+                now = time.monotonic()
                 # 靜默逾時：**送得出去不代表送得到**（見 SILENCE_S 的說明）。
                 # 對面每則 state 都會回 ack，所以「一直沒人回話」＝這條連線已經
                 # 沒有用了，主動掐掉重來比等 TCP 自己發現快幾十秒
