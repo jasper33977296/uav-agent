@@ -15,12 +15,18 @@
 
 用法：python3 tools/sysid-reassign.py
 """
+import os
 import sys
 import types
 
 sys.path.insert(0, "/home/k200/uav-agent")
 
 import agent as A  # noqa: E402
+import tempfile  # noqa: E402
+
+# 換號完成會把新號碼寫進 .fc_sysid——**測試不准寫真的那個檔**，
+# 否則在這個目錄啟動的代理會去綁測試用的號碼
+A.FC_SYSID_FILE = os.path.join(tempfile.mkdtemp(), ".fc_sysid")
 
 ok = True
 
