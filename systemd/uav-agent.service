@@ -9,7 +9,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 SupplementaryGroups=dialout
-WorkingDirectory=/home/pi/uav-agent
+WorkingDirectory=/opt/uav-agent
 
 # ── 部署參數（改這裡，不要改程式碼）──────────────────────────
 Environment=GS_HOST=10.141.2.21
@@ -37,8 +37,10 @@ Environment=LINK_ACTION=rtl
 Environment=RECORD_UPLOAD=1
 Environment=RECORD_UPLOAD_KBPS=256
 Environment=RECORD_UPLOAD_SETTLE_S=20
+# 錄製 spool 也搬出家目錄（躲誤刪）；預設 /home/pi/uav-record 被這行覆蓋
+Environment=RECORD_DIR=/opt/uav-record
 
-ExecStart=/home/pi/uav-agent/venv/bin/python /home/pi/uav-agent/agent.py
+ExecStart=/opt/uav-agent/venv/bin/python /opt/uav-agent/agent.py
 Restart=always
 RestartSec=3
 

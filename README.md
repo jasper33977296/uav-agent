@@ -186,8 +186,12 @@ RC 狀態讀 `SYS_STATUS` 的 `MAV_SYS_STATUS_SENSOR_RC_RECEIVER` present／heal
 
 ## 安裝
 
+代理住在 **`/opt/uav-agent`**（不是家目錄——搬出來是為了不被誤刪：家目錄裡看不到，
+刪掉整個目錄也要 sudo）。錄製 spool 在 **`/opt/uav-record`**。
+
 ```bash
-git clone <this-repo> ~/uav-agent && cd ~/uav-agent
+sudo git clone <this-repo> /opt/uav-agent && sudo chown -R pi:pi /opt/uav-agent
+cd /opt/uav-agent
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 sudo ./install-service.sh          # UART overlay + systemd unit
@@ -232,7 +236,8 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 
 代理逐 byte 讀過飛控送出的每一個 MAVLink 框架（轉發要用），所以**多寫一份
 檔案是零額外 UART 頻寬、零額外 5G 頻寬**。檔案在 `RECORD_DIR`
-（預設 `/home/pi/uav-record`），格式與地面站那份、QGC、`mavlogdump.py` 相同。
+（程式碼預設 `/home/pi/uav-record`，本部署的 unit 用 `Environment=RECORD_DIR=/opt/uav-record` 覆蓋成
+`/opt/uav-record`），格式與地面站那份、QGC、`mavlogdump.py` 相同。
 
 **它的價值不是備份。** 地面站錄的是「送到地面站的東西」，這裡錄的是
 「**飛控送出的東西**」——**5G 斷線期間，兩者相差的正是我們最想看的那一段**。

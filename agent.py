@@ -2350,9 +2350,15 @@ def main():
                    help="落地後等多久才開始回傳（板凳上 arm/disarm 連續切換時"
                         "不要每次都戳一輪上傳）")
     p.add_argument("--report-interval", type=float, default=10.0)
+    #: **跟著 agent.py 自己的位置走，不寫死絕對路徑**：搬家（例如移到
+    #: /opt/uav-agent 躲誤刪）之後，寫死的路徑會讓 state.json 存檔丟
+    #: FileNotFoundError，而服務照樣 active、只是狀態一直沒存回去——
+    #: 續傳佇列這種靠 state.json 復原的東西就跟著失效（2026-09-16 踩到）
     p.add_argument("--state-file",
-                   default=os.environ.get("STATE_FILE",
-                                          "/home/pi/uav-agent/state.json"))
+                   default=os.environ.get(
+                       "STATE_FILE",
+                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "state.json")))
     a = p.parse_args()
 
     logging.basicConfig(
