@@ -66,6 +66,7 @@ import logging
 import os
 import select
 import socket
+import termios
 import sys
 import urllib.error
 import urllib.request
@@ -155,6 +156,22 @@ QUIET_KEEP = {33: 500_000,     # GLOBAL_POSITION_INT
 # 地面站顯示的版本與機上實際跑的程式沒有關係——`ui-spec.md` §0.2f 記著同一件
 # 事的教訓：事故還原的成本有相當部分來自「系統說不出自己是哪一版」。
 # 部署之後看得到版本變了，才算驗證過這次部署真的生效。
+
+
+#: termios 的速率常數 → 人看得懂的數字。`tcgetattr` 回的是 `B57600` 這種
+#: 常數（57600 不等於 termios.B57600），直接印出來是個沒有意義的整數，
+#: 而這行字的用途正是讓人一眼看出「它被改成多少了」
+_BAUD_NAMES = {getattr(termios, "B%d" % b): b for b in (
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600,
+    19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600,
+    1000000, 1152000, 1500000, 2000000, 2500000, 3000000, 3500000, 4000000,
+) if hasattr(termios, "B%d" % b)}
+
+
+def _baud_name(const) -> str:
+    """速率常數印成數字；認不得就把原始值原樣交出去（**不要假裝認得**）。"""
+    b = _BAUD_NAMES.get(const)
+    return str(b) if b is not None else "?(%s)" % const
 
 
 def agent_uid() -> str | None:
@@ -684,6 +701,13 @@ class Agent:
         self.fc_parser.robust_parsing = True
         self.last_gs_rx = 0.0
         self.gs_link_ok = None
+        #: 飛控心跳的死活。**與 `gs_link_ok` 對稱**：橋有兩端，
+        #: 以前只有地面那端有人看（見 `_check_fc_link`）
+        self.fc_link_ok = None
+        self.fc_lost_since = None      # 失聯起點（單調），算中斷長度用
+        self.fc_lost_nagged = 0.0      # 上次重複提醒（單調），避免洗版
+        self.port_checked = 0.0        # 上次比對 termios（單調）
+        self.port_tampered = 0         # 被外部改掉幾次——**要留在狀態裡**
         #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
         #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
         self.uplink_seen = 0.0
@@ -1140,6 +1164,10 @@ class Agent:
         r, _, _ = select.select([fd, self.telem.sock, self.cmd.sock], [], [], 0.2)
         now = time.monotonic()
 
+        # **先確認這個埠還是我們開的那個埠**，再讀它。設定被改掉時這一拍
+        # 就改回來，下一拍的讀取才是對的（issues/050 需求 1）
+        self._check_port_tamper(fd, now)
+
         # ── 飛控 → 地面站 ──────────────────────────────────
         if fd in r:
             port = self.serial.port
@@ -1193,12 +1221,13 @@ class Agent:
         self._expire_seq(now)
         self._publish_state()
 
+        self._check_fc_link(now)      # 橋的另一端——以前沒有人看
         self._check_gs_link(now)
 
         # ── 串流保活 ────────────────────────────────────────
         # 心跳還在但遙測停了＝飛控把串流速率歸零了（重開機／重連常見）。
         # 這裡重送請求，而不是只在啟動時送一次。
-        hb_ok = (now - self.mon.last_hb) < 5.0
+        hb_ok = (now - self.mon.last_hb) < self.FC_HB_LOST_S
         telem_stale = (now - self.last_telem_rx) > 5.0
         # **讓路期間不要被自己的看門狗開回來。** 遙測停了正是我們要的，
         # 那不是故障；`PARAM_QUIET_S` 已經取得比這裡的 5 秒門檻短，
@@ -1814,6 +1843,101 @@ class Agent:
             return None
         return (time.monotonic() - self.uplink_seen) < UPLINK_STALE_S
 
+    #: 飛控心跳多久沒來就算失聯。**橋這一端只有一個定義**——串流保活的
+    #: `hb_ok` 用的是同一個常數，否則會出現「這裡說還在、那裡說沒了」
+    FC_HB_LOST_S = 5.0
+    #: 還在失聯就每隔這麼久再喊一次。一次失聯只喊一行的話，25 分鐘的故障
+    #: 在日誌裡就只有起點那一行——2026-09-16 實際上連那一行都沒有
+    FC_LOST_NAG_S = 60.0
+    #: 多久比對一次序列埠設定。tcgetattr 是廉價的 syscall，但讀取熱路徑
+    #: 不需要每拍都問
+    PORT_CHECK_S = 1.0
+
+    def _check_port_tamper(self, fd, now):
+        """有人動了這個序列埠就要抓得到（uav-system issues/050 需求 1）。
+
+        2026-09-16：`uart-probe.sh` 對代理**正開著**的裝置連下七次 `stty`，
+        把線速從 57600 一路調到 1500000 就結束了，沒有還原。termios 是
+        per-device 的，代理手上那個 fd 跟著被改走——飛控照常在 57600 送，
+        Pi 這端用 1.5 Mbaud 讀，於是只讀得到雜訊，而代理毫無所覺地空轉了
+        25 分鐘。當時是 `sudo` 跑的，所以 `TIOCEXCL` 擋不住（root 無視它）；
+        能抓到這件事的只有「**問核心現在到底是多少**」。
+
+        **不能拿 pyserial 的 `port.baudrate` 來比**：那是它記在 Python 這邊
+        的設定值，被外部改掉之後它照樣回報 57600。要問 `termios.tcgetattr`。
+
+        改回去的方式是**重設 pyserial 的 baudrate**，而不是自己拼 termios
+        結構：那個 setter 會觸發 `_reconfigure_port()`，把 raw／-echo／
+        -crtscts／parity 等整套設定一起重新套用——外部的 `stty` 動到的
+        不一定只有速率。
+        """
+        if now - self.port_checked < self.PORT_CHECK_S:
+            return
+        self.port_checked = now
+        want = getattr(termios, "B%d" % self.a.baud, None)
+        if want is None:
+            return          # 非標準鮑率沒有 B 常數可比——**不知道就不要裝作知道**
+        try:
+            attrs = termios.tcgetattr(fd)
+        except Exception as e:
+            # 埠壞掉本身是另一個問題（050 需求 2 的「取回」），這裡只記一筆
+            log.warning("讀不到序列埠設定（%s）", e)
+            return
+        ispeed, ospeed = attrs[4], attrs[5]
+        if ispeed == want and ospeed == want:
+            return
+        self.port_tampered += 1
+        log.error("**序列埠設定被外部改掉**：%s 現在是 in=%s out=%s，"
+                  "應該是 %d（B%d）——有別的程式對這個裝置下過 stty／開過它。"
+                  "已改回並清掉輸入緩衝（第 %d 次）",
+                  self.a.dev, _baud_name(ispeed), _baud_name(ospeed),
+                  self.a.baud, self.a.baud, self.port_tampered)
+        try:
+            self.serial.port.baudrate = self.a.baud   # 觸發完整 reconfigure
+            self.serial.port.reset_input_buffer()     # 錯速率讀進來的是垃圾
+        except Exception as e:
+            log.error("改回序列埠設定失敗：%s", e)
+
+    def _check_fc_link(self, now):
+        """飛控心跳不見了要大聲說（uav-system issues/050 需求 2 的前半）。
+
+        既有的看門狗（見 `tick` 的「串流保活」）處理的是「**心跳還在**但遙測
+        停了」＝飛控把串流速率歸零。**心跳本身不見了以前沒有人管**——而那
+        更嚴重：2026-09-16 飛控啞了 25 分鐘，唯一的痕跡是 10 秒一次狀態列裡
+        `fc_heartbeat_age_s` 那個一路長大的數字，沒有任何一行告警，
+        沒有人會盯著那個數字看。
+
+        **這一版只負責說出來。** 取回連線（重設 termios、關掉重開序列埠）
+        與「失聯期間持續向地面站出聲」是 050 的另外兩項需求，各自的影響面
+        大得多——前者要動 `fd` 的生命週期，後者要先決定送什麼才不算說謊。
+        """
+        if not self.mon.last_hb:
+            return              # 還沒看過飛控就沒有「失去」可言（它可能比 Pi 晚上電）
+        age = now - self.mon.last_hb
+        ok = age < self.FC_HB_LOST_S
+
+        if ok != self.fc_link_ok:
+            was = self.fc_link_ok
+            self.fc_link_ok = ok
+            if ok:
+                if was is not None:
+                    dur = now - self.fc_lost_since if self.fc_lost_since else 0
+                    log.warning("飛控心跳恢復（中斷 %.0f 秒）", dur)
+                self.fc_lost_since = None
+                self.fc_lost_nagged = 0.0
+            else:
+                # 失聯起點用**最後一次收到心跳**的時刻，不是偵測到的這一刻
+                self.fc_lost_since = self.mon.last_hb
+                self.fc_lost_nagged = now
+                log.error("**飛控心跳失聯 %.0f 秒**（armed=%s mode=%s）——"
+                          "序列埠 %s@%d。代理目前不會自行重連，"
+                          "見 uav-system issues/050",
+                          age, self.mon.state.get("armed"),
+                          self.mon.state.get("mode"), self.a.dev, self.a.baud)
+        elif not ok and now - self.fc_lost_nagged >= self.FC_LOST_NAG_S:
+            self.fc_lost_nagged = now
+            log.error("飛控心跳仍然失聯（已 %.0f 秒）", age)
+
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
 
@@ -2207,8 +2331,13 @@ class Agent:
             # 沒有這一格，地面站看到的就只是「資料突然變舊」——與失聯同形
             "param_quiet": time.monotonic() < self.quiet_until,
             "tx_errors": self.telem.tx_err + self.cmd.tx_err,
+            # **橋的兩端各一格。** 以前只有 gs 那端有欄位，飛控那端要自己去
+            # 看 `fc_heartbeat_age_s` 是大是小——而沒有人會去看（issues/050）
+            "fc_link_ok": self.fc_link_ok,
             "gs_link_ok": self.gs_link_ok,
             "uplink_ok": self.uplink_ok,
+            # 序列埠被外部改掉幾次。**不是 0 就該有人去問為什麼**
+            "port_tampered": self.port_tampered,
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
             # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
             "foreign_sysids": {str(k): v for k, v in self.foreign.items()},
