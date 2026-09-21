@@ -16,8 +16,12 @@
   * **告警**：心跳不見了要大聲說。既有的看門狗只處理「心跳在、遙測停」
     （飛控把串流速率歸零），`hb_ok` 為 False 時**以前沒有 else**。
 
-**取回連線（重開序列埠）與失聯期間持續向地面站出聲還沒做**，
-是 050 剩下的兩項——所以這份不驗那些。
+  * **取回**：埠壞了（或飛控久無心跳）就關掉重開，而且**不阻塞主迴圈**——
+    開機時「開到成功為止」是對的，執行期卡在那個迴圈裡等於地面站那一側
+    也一起停擺，而地面失聯處置正是靠主迴圈在跑。重開失敗時 `fd` 留在 None，
+    主迴圈照常跑，下一次退避到期再試。
+
+**失聯期間持續向地面站出聲還沒做**（050 需求 3）——所以這份不驗那個。
 
 用 pty 當序列埠，**不碰真的飛控**。
 
@@ -82,11 +86,22 @@ def fake(fd):
         port_checked=0.0, port_tampered=0,
         mon=types.SimpleNamespace(last_hb=None, state={}),
         fc_link_ok=None, fc_lost_since=None, fc_lost_nagged=0.0,
+        fd=fd, fc_reopen_t=0.0, fc_reopens=0, fc_write_dropped=0,
+        fwd_to_fc=0, fc_parser=None,
         # 類別常數借真的那幾個值——**不要讓測試自己編一套門檻**
         PORT_CHECK_S=A.Agent.PORT_CHECK_S,
         FC_HB_LOST_S=A.Agent.FC_HB_LOST_S,
         FC_LOST_NAG_S=A.Agent.FC_LOST_NAG_S,
+        FC_REOPEN_S=A.Agent.FC_REOPEN_S,
+        FC_REOPEN_EVERY_S=A.Agent.FC_REOPEN_EVERY_S,
     )
+
+
+def wire(f):
+    """SimpleNamespace 不會自動綁方法——把會互相呼叫的那幾個接起來。"""
+    f._open_serial_once = lambda: A.Agent._open_serial_once(f)
+    f._reopen_serial = lambda now, why: A.Agent._reopen_serial(f, now, why)
+    return f
 
 
 def main():
@@ -114,6 +129,15 @@ def main():
     tamper(f, slave, 201.5)
     chk("節流之後照樣抓得到", f.port_tampered == 2)
 
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u = fake(sock.fileno())
+    u.port_checked = 0.0
+    tamper(u, sock.fileno(), 300.0)
+    chk("非 tty 的裝置直接跳過", u.port_tampered == 0,
+        "--dev udpin: 走同一條路徑；對 socket 問 termios 只會每秒拋一次")
+    sock.close()
+
     print("\n— 飛控心跳 —")
     fclink(f, 300.0)
     chk("還沒看過飛控就不告警", f.fc_link_ok is None, "它可能只是比 Pi 晚上電")
@@ -138,6 +162,72 @@ def main():
     fclink(f, 575.0)
     chk("長時間失聯會持續留痕", f.fc_lost_nagged == 575.0,
         f"每 {A.Agent.FC_LOST_NAG_S:.0f}s；25 分鐘的故障不該只有起點一行")
+
+    print("— 關掉重開 —")
+    reopen, maybe = A.Agent._reopen_serial, A.Agent._maybe_reopen_serial
+    opened = A.Agent._open_serial_once
+
+    class FakeConn:
+        def __init__(self, fd):
+            self.port = types.SimpleNamespace(fileno=lambda: fd)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    g = fake(slave)
+    old_conn = FakeConn(slave)
+    g.serial = old_conn
+    A.mavutil.mavlink_connection = lambda *a, **k: FakeConn(slave)
+    chk("開得起來就回 True", opened(g) is True)
+    chk("fd 換成新的", g.fd == slave)
+    chk("舊的連線有被關掉", old_conn.closed, "同一個裝置不要同時開兩份")
+    chk("解析器緩衝被丟掉", g.fc_parser is not None,
+        "斷點前那幾個位元組不會是完整的框架")
+
+    def boom(*a, **k):
+        raise OSError(19, "No such device")      # ENODEV＝USB 被拔
+
+    A.mavutil.mavlink_connection = boom
+    chk("開不起來回 False 而不是拋", opened(g) is False)
+    chk("失敗後 fd 是 None", g.fd is None, "**不是留著壞掉的 fd**")
+
+    print("\n— 重開的排程 —")
+    A.mavutil.mavlink_connection = lambda *a, **k: FakeConn(slave)
+    h = wire(fake(slave))
+    h.mon.last_hb = 1000.0
+    maybe(h, 1001.0)
+    chk("心跳新鮮就不要動埠", h.fc_reopens == 0)
+
+    h.mon.last_hb = None
+    h.fc_reopen_t = 0.0
+    maybe(h, 1001.0)
+    chk("還沒看過飛控也不動", h.fc_reopens == 0, "它可能只是比 Pi 晚上電")
+
+    h.mon.last_hb = 1000.0
+    maybe(h, 1000.0 + A.Agent.FC_REOPEN_S)
+    chk("無心跳滿門檻就重開", h.fc_reopens == 1,
+        f"門檻 {A.Agent.FC_REOPEN_S:.0f}s，比告警的 {A.Agent.FC_HB_LOST_S:.0f}s 寬")
+    maybe(h, 1000.0 + A.Agent.FC_REOPEN_S + 1)
+    chk("退避內不連續重開", h.fc_reopens == 1,
+        f"每 {A.Agent.FC_REOPEN_EVERY_S:.0f}s 一次；連開只會一直丟掉剛回來的框架")
+    maybe(h, 1000.0 + A.Agent.FC_REOPEN_S + A.Agent.FC_REOPEN_EVERY_S + 1)
+    chk("退避過了再試一次", h.fc_reopens == 2)
+
+    k = wire(fake(slave))
+    k.fd = None
+    k.mon.last_hb = None
+    maybe(k, 2000.0)
+    chk("沒有埠就一直試著把它拿回來", k.fc_reopens == 1,
+        "否則重開失敗一次就永遠沒有下一次")
+
+    print("\n— 沒有埠的時候，上行要記帳 —")
+    w = fake(slave)
+    A.Agent._write(w, None, b"x")
+    chk("沒有埠不拋例外", True)
+    chk("丟掉的封包有記下來", w.fc_write_dropped == 1,
+        "「送了但沒到」與「沒送」事後是兩件事")
+    chk("沒有假裝轉發成功", w.fwd_to_fc == 0)
 
     print("\n— 速率常數的可讀性 —")
     chk("B1500000 印成 1500000", A._baud_name(termios.B1500000) == "1500000",

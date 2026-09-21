@@ -708,6 +708,12 @@ class Agent:
         self.fc_lost_nagged = 0.0      # 上次重複提醒（單調），避免洗版
         self.port_checked = 0.0        # 上次比對 termios（單調）
         self.port_tampered = 0         # 被外部改掉幾次——**要留在狀態裡**
+        #: 飛控序列埠的 fd。**None ＝現在沒有可用的埠**——重開失敗時會是這個
+        #: 狀態，而主迴圈仍然要活著跑地面站那一側（見 `tick`）
+        self.fd = None
+        self.fc_reopen_t = 0.0         # 上次重開嘗試（單調），退避用
+        self.fc_reopens = 0            # 重開過幾次
+        self.fc_write_dropped = 0      # 沒有埠可寫而丟掉的上行封包
         #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
         #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
         self.uplink_seen = 0.0
@@ -722,18 +728,47 @@ class Agent:
         self.recorder = None      # 機上原始層錄製（014）
         self.uploader = None      # 那份錄製的自動回傳（014）
 
-    def connect_serial(self):
-        while True:
+    def _open_serial_once(self) -> bool:
+        """開一次飛控序列埠，成敗都立刻回來。**不重試、不阻塞。**
+
+        執行期重開絕對不能用「開到成功為止」那種迴圈：主迴圈卡在那裡的每一秒，
+        地面站那一側也跟著停擺——而地面失聯處置（選項 C）正是靠主迴圈在跑。
+        重試由呼叫端按退避排程，見 `_reopen_serial`。
+
+        **先關再開**：同一個裝置開兩次在沒有 `TIOCEXCL` 時是允許的，而兩個 fd
+        共用同一份 termios，只會讓「誰的設定算數」變得沒人說得清。
+
+        關閉不會重置飛控：GPIO14/15 是三線接法（TX/RX/GND），**沒有 DTR/RTS**
+        可以被拉低。換成 USB 數傳或有接 DTR 的轉接板時這個保證就不成立了，
+        要重新確認。
+        """
+        old = getattr(self, "serial", None)   # tools/ 裡有不跑 __init__ 的用法
+        if old is not None:
             try:
-                self.serial = mavutil.mavlink_connection(
-                    self.a.dev, baud=self.a.baud, source_system=255,
-                    source_component=190, dialect="ardupilotmega")
-                log.info("已開啟 %s @ %d", self.a.dev, self.a.baud)
-                return
+                old.close()
             except Exception as e:
-                # 飛控可能比 Pi 晚上電，或 UART overlay 還沒掛好
-                log.warning("開序列埠失敗（%s），3 秒後重試", e)
-                time.sleep(3)
+                log.warning("關閉舊序列埠失敗（%s），照樣往下開", e)
+        self.fd = None
+        try:
+            self.serial = mavutil.mavlink_connection(
+                self.a.dev, baud=self.a.baud, source_system=255,
+                source_component=190, dialect="ardupilotmega")
+        except Exception as e:
+            # 飛控可能比 Pi 晚上電，或 UART overlay 還沒掛好
+            log.warning("開序列埠失敗：%s", e)
+            return False
+        self.fd = self.serial.port.fileno()
+        # **解析器的半截緩衝要丟掉。** 斷點前讀進來的那幾個位元組不會是完整的
+        # 框架，留著只會讓重開後的第一批資料被它帶壞
+        self.fc_parser = apm.MAVLink(None)
+        self.fc_parser.robust_parsing = True
+        return True
+
+    def connect_serial(self):
+        """開機時用：開到成功為止（這時候阻塞是對的，還沒有東西在跑）。"""
+        while not self._open_serial_once():
+            time.sleep(3)
+        log.info("已開啟 %s @ %d", self.a.dev, self.a.baud)
 
     def request_board_id(self):
         """問一次飛控板身分（AUTOPILOT_VERSION → uid2）。見 uav-system issues/038。
@@ -1131,13 +1166,12 @@ class Agent:
             # ——後者晚了一整個 UPLINK_STALE_S
             confirmed_fn=lambda: self.uplink_seen)
         self.backfill.start()
-        fd = self.serial.port.fileno()
         log.info("轉發目標：%s:%d（遙測）／%s:%d（指令）",
                  self.a.gs, self.a.telemetry_port, self.a.gs, self.a.command_port)
 
         while True:
             try:
-                self.tick(fd)
+                self.tick()
             except Exception:
                 # 這個迴圈不准死：它死了＝飛控與地面站同時失聯，而且外面看不出來
                 log.exception("主迴圈例外，吞掉續跑")
@@ -1160,19 +1194,32 @@ class Agent:
                         "轉過來了（例如數傳）", src, self.fc_sysid)
         self.recorder.feed(msg.get_msgbuf(), bool(self.mon.state.get("armed")))
 
-    def tick(self, fd):
-        r, _, _ = select.select([fd, self.telem.sock, self.cmd.sock], [], [], 0.2)
+    def tick(self):
+        # **`self.fd` 是 None ＝現在沒有可用的埠**（重開失敗）。這一拍照樣要跑：
+        # 地面站那一側、失聯處置、以及排程中的重開嘗試都在後面
+        fd = self.fd
+        socks = [self.telem.sock, self.cmd.sock]
+        r, _, _ = select.select(([fd] if fd is not None else []) + socks, [], [], 0.2)
         now = time.monotonic()
 
         # **先確認這個埠還是我們開的那個埠**，再讀它。設定被改掉時這一拍
         # 就改回來，下一拍的讀取才是對的（issues/050 需求 1）
-        self._check_port_tamper(fd, now)
+        if fd is not None:
+            self._check_port_tamper(fd, now)
 
         # ── 飛控 → 地面站 ──────────────────────────────────
-        if fd in r:
+        if fd is not None and fd in r:
             port = self.serial.port
-            n = getattr(port, "in_waiting", 0)
-            data = port.read(n) if n else b""
+            try:
+                n = getattr(port, "in_waiting", 0)
+                data = port.read(n) if n else b""
+            except Exception as e:
+                # 埠壞了（USB 被拔＝ENODEV 最常見）。**不能只是吞掉**：壞掉的 fd
+                # 會讓 select 每次都說它可讀，主迴圈就變成 100% CPU 的空轉，
+                # 而外面看起來一切正常
+                log.error("讀飛控序列埠失敗：%s", e)
+                self._reopen_serial(now, "讀取失敗")
+                return
             for msg in (self.fc_parser.parse_buffer(data) or []) if data else []:
                 if msg.get_type() == "BAD_DATA":
                     continue
@@ -1206,7 +1253,7 @@ class Agent:
         for link in (self.telem, self.cmd):
             for data in link.recv():
                 self.last_gs_rx = now
-                self.to_fc(fd, data)
+                self.to_fc(self.fd, data)
 
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
@@ -1222,6 +1269,7 @@ class Agent:
         self._publish_state()
 
         self._check_fc_link(now)      # 橋的另一端——以前沒有人看
+        self._maybe_reopen_serial(now)   # 說完之後，該動手的時候動手
         self._check_gs_link(now)
 
         # ── 串流保活 ────────────────────────────────────────
@@ -1318,6 +1366,11 @@ class Agent:
             self.mode_owner = None
 
     def _write(self, fd, data):
+        if fd is None:
+            # 埠不在的期間地面站送來的東西沒有地方去。**要記下來**——
+            # 「指令送了但沒到飛控」與「指令沒送」在事後看是兩件事
+            self.fc_write_dropped += 1
+            return
         try:
             os.write(fd, data)
             self.fwd_to_fc += 1
@@ -1852,6 +1905,12 @@ class Agent:
     #: 多久比對一次序列埠設定。tcgetattr 是廉價的 syscall，但讀取熱路徑
     #: 不需要每拍都問
     PORT_CHECK_S = 1.0
+    #: 心跳消失多久之後把埠關掉重開。**比告警門檻寬得多是故意的**：飛控重開機
+    #: 本來就要幾秒，termios 那層每秒也在修——先讓輕的手段有機會
+    FC_REOPEN_S = 15.0
+    #: 兩次重開之間至少隔這麼久。重開會丟掉解析器緩衝，連續重開只會讓剛回來的
+    #: 那幾個框架一直被丟掉
+    FC_REOPEN_EVERY_S = 10.0
 
     def _check_port_tamper(self, fd, now):
         """有人動了這個序列埠就要抓得到（uav-system issues/050 需求 1）。
@@ -1874,6 +1933,10 @@ class Agent:
         if now - self.port_checked < self.PORT_CHECK_S:
             return
         self.port_checked = now
+        # **`--dev udpin:…` 走的是同一條路徑**（SITL 用，見 tools/udp-link.py）。
+        # 對 socket 問 termios 只會每秒拋一次例外，而那不是故障
+        if not os.isatty(fd):
+            return
         want = getattr(termios, "B%d" % self.a.baud, None)
         if want is None:
             return          # 非標準鮑率沒有 B 常數可比——**不知道就不要裝作知道**
@@ -1898,6 +1961,44 @@ class Agent:
         except Exception as e:
             log.error("改回序列埠設定失敗：%s", e)
 
+    def _reopen_serial(self, now, why):
+        """把飛控序列埠關掉重開（uav-system issues/050 需求 2）。
+
+        2026-09-16 那次的教訓不只是「埠被改壞」，還有**代理從頭到尾沒想過要
+        重開**：`connect_serial()` 只在 `run()` 開頭跑過一次，fd 也只取一次，
+        之後不論埠出什麼事都沒有回頭路，主迴圈就這樣空轉了 25 分鐘。
+
+        失敗不拋、不阻塞：`self.fd` 留在 None，主迴圈照樣跑地面站那一側，
+        下一次退避到期再試。**這條路徑在飛行中也會走**——它修的是代理自己的
+        鏈路，不是對飛機下指令，所以與 `LINK_ACTION` 那套處置無關。
+        """
+        self.fc_reopen_t = now
+        self.fc_reopens += 1
+        log.error("關掉重開飛控序列埠（第 %d 次，原因：%s）", self.fc_reopens, why)
+        if self._open_serial_once():
+            log.warning("序列埠已重開：%s@%d", self.a.dev, self.a.baud)
+        else:
+            log.error("重開失敗，%.0f 秒後再試", self.FC_REOPEN_EVERY_S)
+
+    def _maybe_reopen_serial(self, now):
+        """該不該重開。兩種情況：**埠根本不在**（上一次重開失敗），
+        或**埠在、但飛控久無心跳**。
+
+        後者走到這裡代表 termios 那層（每秒都在修）沒救回來，問題比「設定被
+        改壞」更重：fd 壞死、裝置消失（USB 被拔）、或飛控根本沒上電。重開對
+        最後那個無效——但也無害，而且飛控一上電就會被接上。
+        """
+        if now - self.fc_reopen_t < self.FC_REOPEN_EVERY_S:
+            return
+        if self.fd is None:
+            self._reopen_serial(now, "目前沒有可用的序列埠")
+            return
+        if not self.mon.last_hb:
+            return          # 還沒看過飛控就沒有「失去」可言（它可能比 Pi 晚上電）
+        age = now - self.mon.last_hb
+        if age >= self.FC_REOPEN_S:
+            self._reopen_serial(now, "飛控無心跳 %.0f 秒" % age)
+
     def _check_fc_link(self, now):
         """飛控心跳不見了要大聲說（uav-system issues/050 需求 2 的前半）。
 
@@ -1907,9 +2008,11 @@ class Agent:
         `fc_heartbeat_age_s` 那個一路長大的數字，沒有任何一行告警，
         沒有人會盯著那個數字看。
 
-        **這一版只負責說出來。** 取回連線（重設 termios、關掉重開序列埠）
-        與「失聯期間持續向地面站出聲」是 050 的另外兩項需求，各自的影響面
-        大得多——前者要動 `fd` 的生命週期，後者要先決定送什麼才不算說謊。
+        這裡只負責**說出來**；真的動手重開是 `_maybe_reopen_serial`。
+        兩件事分開是因為門檻不同：5 秒就該有人知道，15 秒才值得動埠。
+
+        **「失聯期間持續向地面站出聲」還沒做**（050 需求 3）——要先決定送什麼
+        才不算說謊：合成假的飛控 MAVLink 會讓後端把這台機標成連線中、數字新鮮。
         """
         if not self.mon.last_hb:
             return              # 還沒看過飛控就沒有「失去」可言（它可能比 Pi 晚上電）
@@ -1930,10 +2033,10 @@ class Agent:
                 self.fc_lost_since = self.mon.last_hb
                 self.fc_lost_nagged = now
                 log.error("**飛控心跳失聯 %.0f 秒**（armed=%s mode=%s）——"
-                          "序列埠 %s@%d。代理目前不會自行重連，"
-                          "見 uav-system issues/050",
+                          "序列埠 %s@%d，再 %.0f 秒沒回來就關掉重開",
                           age, self.mon.state.get("armed"),
-                          self.mon.state.get("mode"), self.a.dev, self.a.baud)
+                          self.mon.state.get("mode"), self.a.dev, self.a.baud,
+                          max(0.0, self.FC_REOPEN_S - age))
         elif not ok and now - self.fc_lost_nagged >= self.FC_LOST_NAG_S:
             self.fc_lost_nagged = now
             log.error("飛控心跳仍然失聯（已 %.0f 秒）", age)
@@ -2338,6 +2441,11 @@ class Agent:
             "uplink_ok": self.uplink_ok,
             # 序列埠被外部改掉幾次。**不是 0 就該有人去問為什麼**
             "port_tampered": self.port_tampered,
+            # 重開過幾次、以及沒有埠可寫而丟掉的上行封包
+            "fc_reopens": self.fc_reopens,
+            "fc_write_dropped": self.fc_write_dropped,
+            # **None ＝現在根本沒有埠**，與「有埠但飛控不講話」是兩回事
+            "fc_port": None if self.fd is None else self.a.dev,
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
             # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
             "foreign_sysids": {str(k): v for k, v in self.foreign.items()},
