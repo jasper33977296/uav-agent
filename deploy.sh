@@ -29,7 +29,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DEST=/opt/uav-agent
+DEST="${UAV_DEST:-/opt/uav-agent}"   # UAV_DEST 只給測試閘門用（指向一個假的目錄）
 UNIT=/etc/systemd/system/uav-agent.service
 KEEP=5
 STATE_FRESH_S=30
@@ -185,36 +185,47 @@ REMOTE_SUM=$(R "cd $DEST && xargs -d '\n' md5sum" < "$LIST" | sort -k2)
 if [ "$LOCAL_SUM" = "$REMOTE_SUM" ]; then say "   ✓ $N 個檔 md5 與本機逐一相同"
 else say "   ✗ md5 對不上："; diff <(echo "$LOCAL_SUM") <(echo "$REMOTE_SUM") | sed 's/^/     /'; FAIL=1; fi
 
-LINE=""
-for _ in $(seq 1 $VERIFY_WAIT_S); do
+# **等到定下來才判**：第一條狀態列常常早於飛控與意圖通道連上（2026-09-22 第一次
+# 部署就是這樣，兩格都是「…」）。每秒看最新一條，全部 ✓ 就結束，逾時才照最後一條判
+EVAL=$(cat <<'EOF'
+import json, sys
+line, commit, final = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+s = json.loads(line[line.index("{"):])
+checks = [
+    (s.get("deployed") == commit, "機上說它跑的是這個 commit", str(s.get("deployed"))),
+    (True if s.get("fc_link_ok") else (None if s.get("fc_link_ok") is None else False),
+     "飛控心跳", f"fc_link_ok={s.get('fc_link_ok')}（None＝還沒看到飛控）"),
+    (s.get("port_exclusive") is not False, "獨佔飛控序列埠", f"port_exclusive={s.get('port_exclusive')}"),
+    (True if (s.get("intent") or {}).get("up") else None, "意圖通道連上地面站",
+     f"up={(s.get('intent') or {}).get('up')}"),
+]
+if final or all(c[0] is True for c in checks):
+    for ok, label, note in checks:
+        print(f"   {'✓' if ok is True else ('…' if ok is None else '✗')} {label}｜{note}")
+    sys.exit(0 if all(c[0] is True for c in checks) else (1 if any(c[0] is False for c in checks) else 3))
+sys.exit(2)          # 還沒定下來
+EOF
+)
+LINE=""; RC=2
+for i in $(seq 1 $VERIFY_WAIT_S); do
   LINE=$(R "journalctl -u uav-agent --since '$T0' --no-pager -o cat | grep ' 狀態 {' | tail -1" || true)
-  [ -n "$LINE" ] && break
+  if [ -n "$LINE" ]; then
+    FINAL=0; [ "$i" = "$VERIFY_WAIT_S" ] && FINAL=1
+    set +e; python3 -c "$EVAL" "$LINE" "$COMMIT" "$FINAL"; RC=$?; set -e
+    [ "$RC" != 2 ] && break
+  fi
   sleep 1
 done
 if [ -z "$LINE" ]; then
   say "   ✗ ${VERIFY_WAIT_S} 秒內沒有出現狀態列"
   R "systemctl is-active uav-agent; journalctl -u uav-agent --since '$T0' --no-pager -o cat | tail -15" | sed 's/^/     /'
   FAIL=1
-else
-  python3 - "$LINE" "$COMMIT" <<'EOF' || FAIL=1
-import json, sys
-line, commit = sys.argv[1], sys.argv[2]
-s = json.loads(line[line.index("{"):])
-bad = 0
-def row(ok, label, note=""):
-    global bad
-    mark = "✓" if ok is True else ("…" if ok is None else "✗")
-    if ok is False:
-        bad = 1
-    print(f"   {mark} {label}{('｜' + note) if note else ''}")
-row(s.get("deployed") == commit, "機上說它跑的是這個 commit", str(s.get("deployed")))
-row(True if s.get("fc_link_ok") else (None if s.get("fc_link_ok") is None else False),
-    "飛控心跳", f"fc_link_ok={s.get('fc_link_ok')}（None＝還沒看到飛控，可能是它比 Pi 晚上電）")
-row(s.get("port_exclusive") is not False, "獨佔飛控序列埠", f"port_exclusive={s.get('port_exclusive')}")
-row(True if (s.get("intent") or {}).get("up") else None, "意圖通道連上地面站",
-    "還沒連上時是「…」：第一條狀態列可能早於連線")
-sys.exit(bad)
-EOF
+elif [ "$RC" = 2 ]; then
+  python3 -c "$EVAL" "$LINE" "$COMMIT" 1 || true; FAIL=1
+elif [ "$RC" = 1 ]; then
+  FAIL=1
+elif [ "$RC" = 3 ]; then
+  say "   （${VERIFY_WAIT_S} 秒內還有「…」的格子——不算失敗，但要去看一眼）"
 fi
 
 if [ "$FAIL" = 0 ]; then
