@@ -9,6 +9,11 @@ Wants=network-online.target
 Type=simple
 User=pi
 SupplementaryGroups=dialout
+# 看得到**所有**行程開著哪些檔（uav-system 059 B：誰還開著飛控序列埠）。
+# 沒有它，root 行程的 /proc/<pid>/fd 全是 EACCES——而 root 正是 TIOCEXCL 擋不住、
+# 最需要被抓到的那一種（09-16 的 sudo uart-probe.sh）。
+# pi 本來就有免密碼 sudo，這沒有讓代理多出任何它原本拿不到的權力。
+AmbientCapabilities=CAP_SYS_PTRACE
 WorkingDirectory=/opt/uav-agent
 
 # ── 部署參數（改這裡，不要改程式碼）──────────────────────────

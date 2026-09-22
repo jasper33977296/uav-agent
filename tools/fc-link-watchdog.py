@@ -88,6 +88,7 @@ def fake(fd):
         fc_link_ok=None, fc_lost_since=None, fc_lost_nagged=0.0,
         fd=fd, fc_reopen_t=0.0, fc_reopens=0, fc_write_dropped=0,
         fwd_to_fc=0, fc_parser=None, port_exclusive=None,
+        outbox=A.Outbox(), _reopens_at_loss=0,
         # 類別常數借真的那幾個值——**不要讓測試自己編一套門檻**
         PORT_CHECK_S=A.Agent.PORT_CHECK_S,
         FC_HB_LOST_S=A.Agent.FC_HB_LOST_S,
@@ -98,6 +99,8 @@ def fake(fd):
     # 開埠會順手主張獨佔（059 A）——**綁真的那個**，不替它編假的
     f._claim_exclusive = lambda fd: A.Agent._claim_exclusive(f, fd)
     f._release_exclusive = lambda fd: A.Agent._release_exclusive(f, fd)
+    f._fc_lost_text = lambda age: A.Agent._fc_lost_text(f, age)
+    f._fc_lost_level = lambda: A.Agent._fc_lost_level(f)
     return f
 
 
@@ -122,6 +125,10 @@ def main():
     tamper(f, slave, 200.0)
     chk("抓到被改成 1500000", f.port_tampered == 1)
     chk("改回去（觸發完整 reconfigure）", f.serial.port.reconfigured == 1)
+    n = f.outbox.unsent()
+    chk("**報到地面站**（以前只有 log.error）",
+        len(n) == 1 and n[0]["kind"] == "fc_port" and "1500000" in n[0]["text"],
+        n[-1]["text"] if n else None)
     chk("清掉用錯速率讀進來的垃圾", f.serial.port.flushed == 1)
     chk("核心實際速率回到 57600",
         termios.tcgetattr(slave)[5] == termios.B57600,
@@ -152,11 +159,19 @@ def main():
     fclink(f, 310.0)
     chk("超過門檻＝失聯", f.fc_link_ok is False, f"門檻 {A.Agent.FC_HB_LOST_S}s")
     chk("失聯起點用最後心跳時刻", f.fc_lost_since == 300.0, "不是偵測到的那一刻")
+    lost = [x for x in f.outbox.unsent() if x["kind"] == "fc_link"]
+    chk("**失聯報到地面站**（050 需求 3）", len(lost) == 1 and "沒有心跳" in lost[0]["text"],
+        lost[-1]["text"] if lost else None)
+    chk("說得出「指令送不到飛控」", lost and "送不到飛控" in lost[0]["text"])
+    chk("未解鎖時是警告", lost and lost[0]["level"] == "warning")
 
     f.mon.last_hb = 400.0
     fclink(f, 400.5)
     chk("心跳回來＝恢復", f.fc_link_ok is True)
     chk("恢復後清掉起點", f.fc_lost_since is None)
+    back = [x for x in f.outbox.unsent() if x["kind"] == "fc_link"]
+    chk("恢復也報", len(back) == 2 and "恢復" in back[-1]["text"]
+        and "中斷 100 秒" in back[-1]["text"], back[-1]["text"] if back else None)
 
     f.mon.last_hb = 500.0
     fclink(f, 510.0)
@@ -166,6 +181,15 @@ def main():
     fclink(f, 575.0)
     chk("長時間失聯會持續留痕", f.fc_lost_nagged == 575.0,
         f"每 {A.Agent.FC_LOST_NAG_S:.0f}s；25 分鐘的故障不該只有起點一行")
+    nags = [x["text"] for x in f.outbox.unsent() if "仍然沒有心跳" in x["text"]]
+    chk("**持續的那幾聲也送地面站**（不只 log）", len(nags) == 1, nags)
+    f.mon.state["armed"] = True
+    f.mon.last_hb = 600.0
+    fclink(f, 601.0)
+    fclink(f, 610.0)
+    lvl = [x for x in f.outbox.unsent() if x["kind"] == "fc_link"][-1]
+    chk("**解鎖中失去飛控＝危急**", lvl["level"] == "critical" and "已解鎖" in lvl["text"],
+        "代理連 RTL 都送不出去")
 
     print("— 關掉重開 —")
     reopen, maybe = A.Agent._reopen_serial, A.Agent._maybe_reopen_serial

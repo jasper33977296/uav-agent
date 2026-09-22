@@ -79,6 +79,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import clock
 import guard
+import holders
 import normalize
 import recorder
 import uploader
@@ -706,6 +707,7 @@ class Agent:
         self.fc_link_ok = None
         self.fc_lost_since = None      # 失聯起點（單調），算中斷長度用
         self.fc_lost_nagged = 0.0      # 上次重複提醒（單調），避免洗版
+        self._reopens_at_loss = 0      # 這次失聯開始時重開過幾次（算「期間重開幾次」）
         self.port_checked = 0.0        # 上次比對 termios（單調）
         self.port_tampered = 0         # 被外部改掉幾次——**要留在狀態裡**
         #: 飛控序列埠的 fd。**None ＝現在沒有可用的埠**——重開失敗時會是這個
@@ -714,6 +716,12 @@ class Agent:
         self.fc_reopen_t = 0.0         # 上次重開嘗試（單調），退避用
         self.fc_reopens = 0            # 重開過幾次
         self.port_exclusive = None     # 有沒有獨佔住序列埠，見 `_claim_exclusive`
+        #: 還有誰開著飛控序列埠（059 B）。**與 `port_exclusive` 互補**：
+        #: 獨佔擋得住之後的非 root，擋不住 root 與比我們早開的人
+        self.port_holders = []
+        self.port_holders_unreadable = 0   # 讀不到 fd 表的行程數：不是 0 ＝看不完整
+        self.holders_checked = 0.0
+        self._holders_blind_said = False
         self.fc_write_dropped = 0      # 沒有埠可寫而丟掉的上行封包
         #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
         #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
@@ -1260,6 +1268,7 @@ class Agent:
         # 就改回來，下一拍的讀取才是對的（issues/050 需求 1）
         if fd is not None:
             self._check_port_tamper(fd, now)
+            self._check_port_holders(fd, now)
 
         # ── 飛控 → 地面站 ──────────────────────────────────
         if fd is not None and fd in r:
@@ -1817,6 +1826,21 @@ class Agent:
         r = self.reassigning
         return None if r is None else {**r, "since": round(clock.wall(r["since"]), 2)}
 
+    def _fc_link_wire(self):
+        now = time.monotonic()
+        return {
+            "ok": self.fc_link_ok,        # None＝還沒看過飛控
+            "lost_s": (round(now - self.fc_lost_since, 1)
+                       if self.fc_link_ok is False and self.fc_lost_since else None),
+            "port_open": self.fd is not None,
+            "reopens": self.fc_reopens,
+            "tampered": self.port_tampered,
+            "exclusive": self.port_exclusive,
+            "holders": self.port_holders,
+            # 讀不到開檔的行程數。**不是 0 時 holders 空的不代表沒有人**
+            "holders_unreadable": self.port_holders_unreadable,
+        }
+
     def _publish_state(self):
         """把當下狀態交給意圖通道。**狀態的定義只有 flight_state() 一份**——
         失聯處置與這裡送出去的是同一個值，不會出現「代理自己做一套、
@@ -1845,6 +1869,12 @@ class Agent:
             "mode_owner": self.mode_owner,
             # 機上時鐘對過了沒。沒對過時它標的時間不能拿去對齊資料
             "clock_synced": clock.synced(),
+            # **橋的飛控那一端**（050 需求 3、059 B）。後端收不到 MAVLink 時，
+            # 畫面只知道「斷了」；這一格讓它說得出**斷的是哪一段**：
+            # 代理連著而 `ok` 是 False ＝機上的序列埠斷了（指令送不到飛控）；
+            # `ok` 是 True ＝飛控好好的，斷的是遙測回地面站那一段。
+            # 放頂層，理由同 rc_link（鏡像讀頂層；derived 是拿去比對的）
+            "fc_link": self._fc_link_wire(),
             # 014：機上錄製的回傳現況。**放頂層而不是 derived**——`derived`
             # 是拿去與地面站自己算的做比對的（026 §9），塞一個地面站算不出來
             # 的東西進去沒有意義。
@@ -1952,6 +1982,9 @@ class Agent:
     #: 多久比對一次序列埠設定。tcgetattr 是廉價的 syscall，但讀取熱路徑
     #: 不需要每拍都問
     PORT_CHECK_S = 1.0
+    #: 多久掃一次「還有誰開著這個埠」。掃 /proc 在 Pi 5 上約 20 ms，
+    #: 而搶埠是持續的狀態不是瞬間的事件，5 秒的解析度夠了
+    PORT_HOLDERS_S = 5.0
     #: 心跳消失多久之後把埠關掉重開。**比告警門檻寬得多是故意的**：飛控重開機
     #: 本來就要幾秒，termios 那層每秒也在修——先讓輕的手段有機會
     FC_REOPEN_S = 15.0
@@ -2002,11 +2035,58 @@ class Agent:
                   "已改回並清掉輸入緩衝（第 %d 次）",
                   self.a.dev, _baud_name(ispeed), _baud_name(ospeed),
                   self.a.baud, self.a.baud, self.port_tampered)
+        self.outbox.note(
+            "fc_port", f"⚠ 飛控序列埠設定被外部改掉（速率變成 {_baud_name(ospeed)}，"
+            f"應為 {self.a.baud}）——有別的程式對它下過 stty 或開過它。"
+            f"已改回（第 {self.port_tampered} 次）", "warning", now)
         try:
             self.serial.port.baudrate = self.a.baud   # 觸發完整 reconfigure
             self.serial.port.reset_input_buffer()     # 錯速率讀進來的是垃圾
         except Exception as e:
             log.error("改回序列埠設定失敗：%s", e)
+
+    def _check_port_holders(self, fd, now):
+        """還有誰開著飛控序列埠，**有的話報到地面站**（uav-system 059 B）。
+
+        2026-09-21 的答案要 ssh 上去 `fuser` 才拿得到；放上畫面，下次五秒就解決。
+        啟動時發現被搶**不拒絕啟動**（059 裁定）：被干擾的橋仍然比沒有橋好，
+        它照跑並持續抱怨——這裡在「名單變了」時說一次，名單本身一直在狀態裡。
+        """
+        if now - self.holders_checked < self.PORT_HOLDERS_S:
+            return
+        self.holders_checked = now
+        if not os.isatty(fd):
+            return                       # udpin:（SITL）沒有別人搶得到
+        found, unreadable = holders.scan(self.a.dev, exclude_pid=os.getpid())
+        self.port_holders_unreadable = unreadable
+        if unreadable and not self._holders_blind_said:
+            # **看不完整要說出來**：這時「沒找到」不等於「沒有」
+            self._holders_blind_said = True
+            log.warning("有 %s 個行程的開檔讀不到（權限不足）——root 開著飛控序列埠"
+                        "時抓不到。unit 要有 AmbientCapabilities=CAP_SYS_PTRACE",
+                        "全部" if unreadable < 0 else unreadable)
+            self.outbox.note(
+                "fc_port", "代理看不到所有程式的開檔（權限不足）——別的程式以 root"
+                "開著飛控序列埠時，這裡抓不到", "warning", now)
+        before = {h["pid"] for h in self.port_holders}
+        after = {h["pid"] for h in found}
+        self.port_holders = found
+        if after == before:
+            return
+        new = [h for h in found if h["pid"] not in before]
+        if new:
+            log.error("**有別的程式開著飛控序列埠**：%s——兩邊會輪流讀走位元組，"
+                      "MAVLink 對兩邊都是破的", holders.describe(new))
+            self.outbox.note(
+                "fc_port", "⚠ 機上有別的程式開著飛控序列埠：" + holders.describe(new)
+                + "——兩邊會各拿到隨機片段，校正與參數讀寫會卡住而不報錯。"
+                # **不要叫它改走某條路**：機上目前沒有給本機程式用的 MAVLink
+                # 出口（UDP 是送地面站的），指一條不存在的路比不指更糟（059 C）
+                "停掉它：代理運行時，飛控序列埠只能由代理開",
+                "critical", now)
+        if not after:
+            log.warning("已沒有別的程式開著飛控序列埠")
+            self.outbox.note("fc_port", "已沒有別的程式開著飛控序列埠", "info", now)
 
     def _reopen_serial(self, now, why):
         """把飛控序列埠關掉重開（uav-system issues/050 需求 2）。
@@ -2058,8 +2138,10 @@ class Agent:
         這裡只負責**說出來**；真的動手重開是 `_maybe_reopen_serial`。
         兩件事分開是因為門檻不同：5 秒就該有人知道，15 秒才值得動埠。
 
-        **「失聯期間持續向地面站出聲」還沒做**（050 需求 3）——要先決定送什麼
-        才不算說謊：合成假的飛控 MAVLink 會讓後端把這台機標成連線中、數字新鮮。
+        **失聯期間持續向地面站出聲**（050 需求 3）：走代理自己的通道——
+        `notice`（失聯、每 `FC_LOST_NAG_S` 一次、恢復）與 `state` 的 `fc_link`。
+        **絕不合成假的飛控 MAVLink**：後端對任何收下的框架都會標連線中、
+        刷新數字的年齡，畫面就會說「連線中、數字新鮮」——036 的老問題。
         """
         if not self.mon.last_hb:
             return              # 還沒看過飛控就沒有「失去」可言（它可能比 Pi 晚上電）
@@ -2073,12 +2155,20 @@ class Agent:
                 if was is not None:
                     dur = now - self.fc_lost_since if self.fc_lost_since else 0
                     log.warning("飛控心跳恢復（中斷 %.0f 秒）", dur)
+                    self.outbox.note(
+                        "fc_link", f"飛控心跳恢復（中斷 {dur:.0f} 秒"
+                        + (f"，期間重開序列埠 {self.fc_reopens - self._reopens_at_loss} 次"
+                           if self.fc_reopens > self._reopens_at_loss else "")
+                        + "）", "info", now)
                 self.fc_lost_since = None
                 self.fc_lost_nagged = 0.0
             else:
                 # 失聯起點用**最後一次收到心跳**的時刻，不是偵測到的這一刻
                 self.fc_lost_since = self.mon.last_hb
                 self.fc_lost_nagged = now
+                self._reopens_at_loss = self.fc_reopens
+                self.outbox.note("fc_link", self._fc_lost_text(age),
+                                 self._fc_lost_level(), now)
                 log.error("**飛控心跳失聯 %.0f 秒**（armed=%s mode=%s）——"
                           "序列埠 %s@%d，再 %.0f 秒沒回來就關掉重開",
                           age, self.mon.state.get("armed"),
@@ -2087,6 +2177,22 @@ class Agent:
         elif not ok and now - self.fc_lost_nagged >= self.FC_LOST_NAG_S:
             self.fc_lost_nagged = now
             log.error("飛控心跳仍然失聯（已 %.0f 秒）", age)
+            # **失聯期間持續出聲**（050 需求 3）：25 分鐘的故障不該只有起點一則
+            self.outbox.note(
+                "fc_link", f"飛控仍然沒有心跳（已 {age:.0f} 秒，"
+                f"重開序列埠 {self.fc_reopens - self._reopens_at_loss} 次）",
+                self._fc_lost_level(), now)
+
+    def _fc_lost_text(self, age):
+        st = self.mon.state
+        return (f"⚠ 飛控沒有心跳 {age:.0f} 秒（失聯前 "
+                f"{'已解鎖' if st.get('armed') else '未解鎖'}、模式 {st.get('mode') or '?'}）"
+                "——機上代理還連著，正在試著把序列埠拿回來；"
+                "這段期間地面站的指令送不到飛控")
+
+    def _fc_lost_level(self):
+        """解鎖中失去飛控＝危急（代理連 RTL 都送不出去）；地上是警告。"""
+        return "critical" if self.mon.state.get("armed") else "warning"
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
@@ -2494,6 +2600,8 @@ class Agent:
             # 有沒有獨佔住飛控序列埠（059 A）。**False 就是有人搶得進來**；
             # None ＝不是 tty（udpin:），或還沒開過
             "port_exclusive": self.port_exclusive,
+            # 還有誰開著這個埠（059 B）。**不是空的就是有人在搶**
+            "port_holders": [f"{h['pid']}:{h['cmd'][:40]}" for h in self.port_holders],
             # **None ＝現在根本沒有埠**，與「有埠但飛控不講話」是兩回事
             "fc_port": None if self.fd is None else self.a.dev,
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
