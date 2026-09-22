@@ -8,12 +8,12 @@
 **比代理早開的人**。這裡把那兩種找出來：掃 `/proc/*/fd`，看哪個 fd 指向
 同一個裝置節點。
 
-**看不完整時要說看不完整。** 別的使用者（尤其 root）的 `/proc/<pid>/fd`
-要有 ptrace 讀權才讀得到。代理以 `pi` 身分跑，沒有 `CAP_SYS_PTRACE` 的話
-root 的行程全是 `EACCES`——那時「沒找到別人」不等於「沒有別人」，
-結果裡的 `unreadable` 就是為了讓呼叫端說得出這個差別。
-（unit 已加 `AmbientCapabilities=CAP_SYS_PTRACE`；`pi` 本來就有免密碼 sudo，
-這沒有讓代理多出任何它原本拿不到的權力。）
+**看不完整時要說看不完整。** 別的使用者（尤其 root）的 `/proc/<pid>/fd` 要兩道門：
+**列出目錄**是一般檔案權限（`CAP_DAC_READ_SEARCH`），**讀每個 fd 的連結**是 ptrace
+讀權（`CAP_SYS_PTRACE`）。2026-09-22 上機：只給 PTRACE 時 158 個行程讀不到、root
+開著的完全抓不到。那時「沒找到別人」不等於「沒有別人」，結果裡的 `unreadable`
+就是為了讓呼叫端說得出這個差別（而它當時也確實說了）。
+（unit 給兩個能力；`pi` 本來就有免密碼 sudo，沒有多給任何權力。）
 """
 import os
 import pwd

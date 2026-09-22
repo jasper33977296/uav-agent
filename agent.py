@@ -2085,7 +2085,7 @@ class Agent:
             # **看不完整要說出來**：這時「沒找到」不等於「沒有」
             self._holders_blind_said = True
             log.warning("有 %s 個行程的開檔讀不到（權限不足）——root 開著飛控序列埠"
-                        "時抓不到。unit 要有 AmbientCapabilities=CAP_SYS_PTRACE",
+                        "時抓不到。unit 要有 AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH",
                         "全部" if unreadable < 0 else unreadable)
             self.outbox.note(
                 "fc_port", "代理看不到所有程式的開檔（權限不足）——別的程式以 root"

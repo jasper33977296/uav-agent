@@ -13,7 +13,10 @@ SupplementaryGroups=dialout
 # 沒有它，root 行程的 /proc/<pid>/fd 全是 EACCES——而 root 正是 TIOCEXCL 擋不住、
 # 最需要被抓到的那一種（09-16 的 sudo uart-probe.sh）。
 # pi 本來就有免密碼 sudo，這沒有讓代理多出任何它原本拿不到的權力。
-AmbientCapabilities=CAP_SYS_PTRACE
+# **兩個都要**（2026-09-22 上機實測）：PTRACE 管「讀 fd 的連結」，但列出
+# /proc/<pid>/fd 這個目錄本身是一般的檔案權限，要 DAC_READ_SEARCH。只給 PTRACE 時
+# 158 個行程讀不到、root 開著的完全抓不到——單元測試接受「看不完整」，所以沒翻出來
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 WorkingDirectory=/opt/uav-agent
 
 # ── 部署參數（改這裡，不要改程式碼）──────────────────────────
