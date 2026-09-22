@@ -33,7 +33,8 @@ class Fake(A.Agent):
         self.mon = types.SimpleNamespace(
             state={"gps_fix": "3D", "lat": lat, "lon": lon, "alt_rel_m": 30.0,
                    "heading": 0.0, "mission_seq": 2, "sysid": 1},
-            events=[], last_hb=time.monotonic())
+            last_hb=time.monotonic())
+        self.outbox = A.Outbox()
         self.proposals = {}
         self.seq = None
         self.a = types.SimpleNamespace(seq_timeout_s=120.0)
@@ -98,8 +99,9 @@ g.on_decision({"intent_id": "i1", "approved": True})
 g.seq["deadline"] = time.monotonic() - 1        # 假裝已經拖很久
 g._expire_seq(time.monotonic())
 chk("逾時清掉序列旗標", g.seq is None)
-chk("清掉時留一筆事件（不是安靜地消失）",
-    any("逾時" in e[2] for e in g.mon.events), g.mon.events[-1:])
+chk("清掉時留一筆事件送地面站（不是安靜地消失）",
+    any("逾時" in n["text"] for n in g.outbox.unsent()),
+    [n["text"] for n in g.outbox.unsent()][-1:])
 
 print("\n── 確認的位階低於守門（協定 §5.2）─────────────────────")
 g = Fake()

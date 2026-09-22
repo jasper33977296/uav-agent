@@ -50,7 +50,8 @@ class Fake(A.Agent):
         st = {"sysid": sysid, "autopilot_raw": raw}
         if params is not None:
             st["params"] = dict(params)
-        self.mon = types.SimpleNamespace(state=st, events=[])
+        self.mon = types.SimpleNamespace(state=st)
+        self.outbox = A.Outbox()
         self.a = types.SimpleNamespace(link_loss_max_solo_s=solo,
                                        link_action_s=act)
         self.fs_gcs_asked = 1
@@ -66,7 +67,7 @@ class Fake(A.Agent):
 def run(g, now=1000.0):
     """跑自檢，回傳 (說了沒有, 事件文字)。"""
     g._check_fs_gcs(now)
-    return g.fs_gcs_said, [e[2] for e in g.mon.events]
+    return g.fs_gcs_said, [n["text"] for n in g.outbox.unsent()]
 
 
 print("── 裁定值：通過 ───────────────────────────────────────")
@@ -216,9 +217,9 @@ chk("**對照**：ArduPilot 同型別是數值本身，原樣留著",
 print("\n── 結論只說一次 ───────────────────────────────────────")
 g = Fake(params={"FS_GCS_ENABLE": 1.0, "FS_GCS_TIMEOUT": 15.0})
 run(g)
-n = len(g.mon.events)
+n = len(g.outbox.unsent())
 run(g); run(g)
-chk("重複呼叫不會重複刷事件", len(g.mon.events) == n, len(g.mon.events))
+chk("重複呼叫不會重複刷事件", len(g.outbox.unsent()) == n, len(g.outbox.unsent()))
 
 print("\n" + ("全部通過" if ok else "**有未通過項目**"))
 print("**注意：這是邏輯測試，不是真機覆核。** FS_GCS_TIMEOUT 在這台飛控上"

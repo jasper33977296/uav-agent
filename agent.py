@@ -87,6 +87,7 @@ from autopilot import get_driver
 from backfill import Backfill
 from intent import IntentLink
 from modem import ModemSampler
+from outbox import Outbox
 
 log = logging.getLogger("uav-agent")
 
@@ -346,7 +347,6 @@ class Monitor:
         self.state = {}
         self.last_hb = 0.0
         self.counts = defaultdict(int)
-        self.events = []
         #: PREARM_CHECK 位元見過沒有（026 B4-b）。**黏性**：見過一次就信
         #: health 位元；從未見過＝韌體不回報，就緒判定退回次級訊號
         self._prearm_seen = False
@@ -516,8 +516,6 @@ class Monitor:
                 return
             txt = whole.strip()
             if txt:
-                self.events.append((now, "statustext",
-                                    f"[sev{msg.severity}] {txt}"))
                 log.info("飛控訊息 [sev%d] %s", msg.severity, txt)
                 # **預檢失敗的原因，飛控本來就在講**——記下來，就緒判定才
                 # 說得出是哪一項。`prearm_ok is False` 只說得出「有一項沒過」。
@@ -568,7 +566,6 @@ class Monitor:
             txt = ("遙控器已連線" if rc else
                    "⚠ 遙控器離線——此時不得起飛／開始任務" if rc is False
                    else "遙控器狀態不明（收不到判定所需的訊息）")
-            self.events.append((time.monotonic(), "rc_link", txt))
             log.info("狀態變化：%s（來源 %s）", txt, s.get("rc_source"))
 
     def _board_uid(self, real):
@@ -614,7 +611,6 @@ class Monitor:
             prev = self.state.get(key)
             self.state[key] = val
             if prev is not None:            # 第一次讀到不算「變化」
-                self.events.append((time.monotonic(), key, message))
                 log.info("狀態變化：%s", message)
 
 
@@ -656,6 +652,9 @@ class Agent:
         self.hello_sent = False
         self.drone_id = None
         self.intent = None            # 意圖通道（拿到 board_uid 才起，見 say_hello）
+        #: 只有代理知道的事的出口（issues/057）。**開機就建**，不等意圖通道：
+        #: 通道還沒起來、或正斷著的時候發生的事，正是最需要留著的那些
+        self.outbox = Outbox()
         #: 配號（040）。`assigned_sysid` 是地面站的決定，`sysid_action` 是
         #: keep／change。`reassigning` 非 None 時代表正在換號並重開飛控——
         #: 它會被送上去，讓地面站不要把飛控消失當成失聯（設計 §3.3）
@@ -1028,8 +1027,9 @@ class Agent:
                         "掉了。無法確認 %s > %.0fs 這條不變式是否成立",
                         "、".join(missing), self.fs_gcs_asked,
                         n_to, self.a.link_loss_max_solo_s)
-            self.mon.events.append(
-                (now, "fs_gcs", f"讀不到失聯 failsafe 設定（缺 {'、'.join(missing)}）"))
+            self.outbox.note(
+                "fs_gcs", f"讀不到失聯 failsafe 設定（缺 {'、'.join(missing)}）",
+                "warning", now)
             return
 
         self.fs_gcs_said = True
@@ -1056,9 +1056,9 @@ class Agent:
             log.error("⚠⚠ **失聯 failsafe 不變式不成立**"
                       "（要求 %s > %.0fs > %.0fs）：%s",
                       n_to, solo, act, "；".join(problems))
-            self.mon.events.append(
-                (now, "fs_gcs", "⚠ 失聯 failsafe 設定與失聯處置衝突："
-                                + "；".join(problems)))
+            self.outbox.note(
+                "fs_gcs", "⚠ 失聯 failsafe 設定與失聯處置衝突："
+                          + "；".join(problems), "critical", now)
             return
         log.info("失聯 failsafe 自檢通過：%s=%g、%s=%gs > 單飛上限 %.0fs "
                  "> 處置起算 %.0fs——飛控那層是後備，只在代理沒動手時才出手",
@@ -1325,6 +1325,7 @@ class Agent:
         self._check_fc_link(now)      # 橋的另一端——以前沒有人看
         self._maybe_reopen_serial(now)   # 說完之後，該動手的時候動手
         self._check_gs_link(now)
+        self.outbox.tick(now)         # 節流窗口到期時，彙總那一則要送得出去
 
         # ── 串流保活 ────────────────────────────────────────
         # 心跳還在但遙測停了＝飛控把串流速率歸零了（重開機／重連常見）。
@@ -1619,7 +1620,7 @@ class Agent:
                         "limits": normalize.driver_limits(
                             self.mon.state.get("autopilot_raw"))}},
             on_intent=self.on_intent, on_decision=self.on_decision,
-            on_progress=self.on_progress)
+            on_progress=self.on_progress, outbox=self.outbox)
         self.intent.start()
 
     def on_intent(self, msg) -> dict:
@@ -1637,8 +1638,6 @@ class Agent:
                 "state": state, "executor": guard.executor(action or "")}
         if not ok:
             log.warning("守門擋下意圖 %s（狀態 %s）：%s", action, state, why)
-            self.mon.events.append(
-                (time.monotonic(), "guard", f"擋下 {action}：{why}"))
             return {**base, "event": "guard_refused", "reason": why}
         if action == "change_route":
             # 算提案本來就不動飛機，乾跑與否走同一條路——而**補送的
@@ -1748,7 +1747,6 @@ class Agent:
         self.seq = {"intent_id": iid, "step": "approved", "since": time.monotonic(),
                     "deadline": time.monotonic() + self.a.seq_timeout_s}
         log.info("改航線已確認（%s）→ 由地面站執行三步", iid)
-        self.mon.events.append((time.monotonic(), "intent", "改航線已確認，序列開始"))
         return {**base, "event": "cleared", "proposal": now_prop,
                 "reason": "確認成立，由地面站執行三步序列"}
 
@@ -1775,9 +1773,6 @@ class Agent:
                 self.proposals.pop(iid, None)
         log.info("改航線序列 %s：%s%s", step, "完成" if ok else "**失敗**",
                  f"（{msg.get('detail')}）" if msg.get("detail") else "")
-        self.mon.events.append(
-            (time.monotonic(), "intent",
-             f"改航線 {step} {'完成' if ok else '失敗'}"))
         return {**base, "event": "noted", "ok": ok}
 
     def _expire_seq(self, now):
@@ -1786,8 +1781,7 @@ class Agent:
         if self.seq and now > self.seq["deadline"]:
             log.warning("改航線序列逾時未完成（%.0f 秒），清掉序列旗標",
                         now - self.seq["since"])
-            self.mon.events.append(
-                (now, "intent", "改航線序列逾時，旗標已清除"))
+            self.outbox.note("intent", "改航線序列逾時，旗標已清除", "warning", now)
             self.seq = None
 
     #: 代理自己執行的意圖 → 飛控模式。只要 DO_SET_MODE，不碰任務協定
@@ -1813,7 +1807,6 @@ class Agent:
             log.exception("意圖 %s 送出失敗", action)
             return {**base, "event": "failed", "reason": f"送出失敗：{e}"}
         log.info("意圖 %s → 已下達 %s（狀態 %s）", action, mode, base["state"])
-        self.mon.events.append((time.monotonic(), "intent", f"{action} → {mode}"))
         # **回 sent 而不是 done**：ACK 是「我收到了」，不是「我做到了」。
         # 真的進了哪個模式由下一則 state 說（那是讀回來的事實）
         return {**base, "event": "sent", "mode": mode,
@@ -2150,18 +2143,19 @@ class Agent:
                     # 中斷長度會永遠印「中斷 0 秒」。要用失聯起點算才是實話。
                     dur = now - self.loss_started if self.loss_started else 0
                     log.warning("地面站鏈路恢復（中斷 %.0f 秒）", dur)
-                    self.mon.events.append(
-                        (now, "gs_link", f"地面站鏈路恢復（中斷 {dur:.0f}s）"))
+                    self.outbox.note(
+                        "gs_link", f"地面站鏈路恢復（中斷 {dur:.0f}s）", "info", now)
                     # **接管結束要交代做過什麼。** 「我不在的時候發生了什麼」
                     # 是操作員回來第一個要問的問題，而唯一答得出來的是代理
                     if self.takeover:
                         acts = self.takeover["acts"]
                         log.warning("**接管結束**（%.0f 秒）：%s", dur,
                                     "；".join(acts) if acts else "期間沒有動作")
-                        self.mon.events.append(
-                            (now, "takeover",
-                             f"代理接管結束（{dur:.0f}s）："
-                             + ("；".join(acts) if acts else "期間沒有動作")))
+                        self.outbox.note(
+                            "takeover",
+                            f"代理接管結束（{dur:.0f}s）："
+                            + ("；".join(acts) if acts else "期間沒有動作"),
+                            "warning", now)
                         self.takeover = None
                 self.loss_warned = self.loss_acted = False   # 解除警戒
                 self._solo_logged = False
@@ -2176,8 +2170,8 @@ class Agent:
                     self.takeover = {"since": now, "state": st0, "acts": []}
                     log.warning("⚠ **代理接管**（失聯時狀態 %s）"
                                 "——到連線恢復為止由代理決定", st0)
-                    self.mon.events.append(
-                        (now, "takeover", f"代理接管（失聯時 {st0}）"))
+                    self.outbox.note(
+                        "takeover", f"代理接管（失聯時 {st0}）", "warning", now)
             return
 
         if ok:
@@ -2205,10 +2199,10 @@ class Agent:
             self._rebind_t = time.monotonic()
             self.telem.rebind()
             self.cmd.rebind()
-            self.mon.events.append(
-                (now, "gs_link",
-                 f"自主重綁 UDP 來源埠（失聯 {age:.0f}s，但地面站收得到我"
-                 f"——回程位址對映壞了）"))
+            self.outbox.note(
+                "gs_link",
+                f"自主重綁 UDP 來源埠（失聯 {age:.0f}s，但地面站收得到我"
+                f"——回程位址對映壞了）", "warning", now)
 
         armed = self.mon.state.get("armed")
         mode = self.mon.state.get("mode")
@@ -2220,7 +2214,7 @@ class Agent:
                         self.a.link_action_s,
                         "" if self.a.link_action != "none"
                         else "（設定為 none＝只告警不動作）")
-            self.mon.events.append((now, "gs_link", f"⚠ 地面站失聯（{age:.0f}s）"))
+            self.outbox.note("gs_link", f"⚠ 地面站失聯（{age:.0f}s）", "warning", now)
 
         if self.loss_acted or age < self.a.link_action_s:
             return
@@ -2235,8 +2229,7 @@ class Agent:
         if reason is False:
             self.loss_acted = True          # 這個狀態下永遠不介入，不必再看
             log.warning("地面站失聯逾時，狀態 %s → 不介入", state)
-            self.mon.events.append(
-                (now, "gs_link", f"地面失聯但不介入（{state}）"))
+            self.outbox.note("gs_link", f"地面失聯但不介入（{state}）", "info", now)
             return
         self._do_link_loss_action(now, age, mode, f"{state}／{reason}")
 
@@ -2400,8 +2393,7 @@ class Agent:
                          if self.a.mission_complete_by_seq else
                          "（韌體不回報 mission_state＝測不到「跑完」，"
                          "只能靠時間上限收尾）"))
-            self.mon.events.append(
-                (now, "gs_link", "地面失聯，任務續飛中（上限內）"))
+            self.outbox.note("gs_link", "地面失聯，任務續飛中（上限內）", "warning", now)
         return None
 
     def _do_link_loss_action(self, now, age, mode, why):
@@ -2427,8 +2419,9 @@ class Agent:
                     mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                     code, 0, 0, 0, 0, 0)
                 time.sleep(0.1)
-            self.mon.events.append((now, "gs_link_action",
-                                    f"⚠ 地面失聯 {age:.0f}s（{why}）→ 下達 {want}"))
+            self.outbox.note("gs_link_action",
+                             f"⚠ 地面失聯 {age:.0f}s（{why}）→ 下達 {want}",
+                             "critical", now)
         except Exception:
             log.exception("失聯處置送出失敗")
 
@@ -2510,6 +2503,9 @@ class Agent:
                     "rebinds": self.telem.rebinds},
             "state": self.flight_state(),
             "intent": self.intent.stats() if self.intent else None,
+            # 事件出口（057）。`queued` 一直長＝地面站沒在回執；`dropped` 不是 0
+            # ＝緩衝滿過、最舊的事件已經沒了
+            "outbox": self.outbox.stats(),
             "backfill": self.backfill.stats() if self.backfill else None,
             "record": self.recorder.stats() if self.recorder else None,
             "upload": self.uploader.stats() if self.uploader else None,

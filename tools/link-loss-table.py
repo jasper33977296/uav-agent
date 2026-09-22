@@ -40,7 +40,8 @@ class Fake(A.Agent):
         st.setdefault("armed", True)
         # 心跳新鮮＝不是 DISCONNECTED。要測 DISCONNECTED 就傳 _hb_age
         hb_age = st.pop("_hb_age", 0.0)
-        self.mon = types.SimpleNamespace(state=st, events=[],
+        self.outbox = A.Outbox()
+        self.mon = types.SimpleNamespace(state=st,
                                          last_hb=time.monotonic() - hb_age)
         self.mode_owner = owner
         self.loss_started = 0.0
@@ -213,9 +214,9 @@ print(f"{'✓' if g.gs_link_ok else '✗'} 恢復被認出來了（gs_link_ok=Tr
 ok &= bool(g.gs_link_ok)
 print(f"{'✓' if not g.loss_acted else '✗'} 警戒解除（下次真的再失聯還會處置）")
 ok &= not g.loss_acted
-traced = any(e[1] == "gs_link" for e in g.mon.events)
-print(f"{'✓' if traced else '✗'} 恢復有留痕｜"
-      f"{[e[2] for e in g.mon.events][-1:]}")
+traced = any(n["kind"] == "gs_link" for n in g.outbox.unsent())
+print(f"{'✓' if traced else '✗'} 恢復有留痕（進 outbox 送地面站）｜"
+      f"{[n['text'] for n in g.outbox.unsent()][-1:]}")
 ok &= traced
 # **反向驗證**：不是把 _check_gs_link 整個變成不動作——還在失聯而且到期時
 # 仍然要處置

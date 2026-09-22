@@ -206,7 +206,8 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 |---|---|
 | `agent.py` | 主程式：路由、串流保活、監控、失聯處置 |
 | `guard.py` | 守門：這個意圖在當下這個狀態能不能做（含 RC 前置條件） |
-| `intent.py` | 意圖通道（WebSocket）：state 推送、intent 回執與判決 |
+| `intent.py` | 意圖通道（WebSocket）：state 推送、intent 回執與判決、`notice` 送出 |
+| `outbox.py` | **代理的事件出口**：只有代理知道的事，送地面站（見〈事件要送到哪裡〉）|
 | `route.py` | 改航線提案：續飛航點、過期重算 |
 | `backfill.py` | 失聯期間的機上緩衝與恢復後補傳 |
 | `recorder.py` | 機上原始層錄製：飛控送出的每一個框架落盤（tlog） |
@@ -218,6 +219,9 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/rc-link.py` | RC 三態解析；`--live` 可接真飛控做覆核 |
 | `tools/intent-ack.py` | 意圖回執的順序：先 ack 再 event |
 | `tools/decision-flow.py` | 提案→確認→序列、乾跑、RC 前置 |
+| `tools/notice-flow.py` | 事件出口：緩衝、回執才刪、重連重送、上限、節流要說出來 |
+| `tools/uart-exclusive.py` | 飛控序列埠獨佔（TIOCEXCL）：別人開不起來、自己重開不被擋 |
+| `tools/fc-link-watchdog.py` | 序列埠被動手腳、飛控心跳失聯、關掉重開 |
 | `autopilot/` | 自駕儀驅動，**與 uav-system `libs/autopilot/` 逐字相同**（026 B4-b） |
 | `normalize.py` | 正規化欄位：模式動詞／名稱、就緒判定（移植自地面站 `state.py`） |
 | `tools/driver-parity.py` | 搬家的等價驗收：兩份實作同時載入逐鍵比對（B4-d 核心） |
@@ -231,6 +235,40 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |
+
+## 事件要送到哪裡（uav-system issues/057）
+
+**要讓操作員看到的事，呼叫 `self.outbox.note(kind, text, level)`。**
+`level` 是 `info`／`warning`／`critical`；`text` 寫整句中文（畫面原樣顯示）；
+`now` 傳主迴圈那一拍的**單調時鐘**（送出時才換成牆鐘）。
+
+以前有一個 `Monitor.events` 清單，18 處往裡寫、**0 處讀**——看起來像有在收集，
+實際上是黑洞（「代理接管期間做過什麼」就丟在裡面）。已經刪掉，不要再做一個。
+
+**先問：地面站自己看不看得到？** 看得到的就只寫 `log`，不要送：
+
+| 地面站自己看得到（**不送**） | 從哪裡 |
+|---|---|
+| 飛控 STATUSTEXT、解鎖／模式、電量、GPS | 地面站的 `mavlink_rx` 從轉發過去的 MAVLink 自己產生事件 |
+| RC 在不在 | 同上（`rc_link` 事件） |
+| 守門擋下、意圖已下達、序列逐步 | 意圖通道的 `event` 回應，地面站寫成 `intent_*` |
+
+| 只有代理知道（**送**） | kind |
+|---|---|
+| 地面站鏈路失聯／恢復／重綁／失聯但不介入／續飛中 | `gs_link`（**有節流**）|
+| 代理接管開始與結束（結束時交代做過什麼） | `takeover` |
+| 失聯處置實際下達了什麼 | `gs_link_action` |
+| 失聯 failsafe 自檢讀不到或設定衝突 | `fs_gcs` |
+| 改航線序列逾時、旗標被清掉 | `intent` |
+
+送的方式：意圖通道的 `notice` 型別（uav-system `doc/agent-intent-protocol.md` §4.7）。
+**斷線時留在機上**（上限 500 則，滿了丟最舊的），地面站逐則回執才刪，
+沒回執的下一條連線重送。地面站 hello 回應的 `accepts` 沒有 `notice`（舊版）就不送。
+狀態列的 `outbox` 看得到現況：`queued` 一直長＝地面站沒在回執。
+
+`gs_link` 節流：10 分鐘內前 4 則照送，其餘併成一則「另有 N 則沒有逐則送出」。
+新增的 kind 預設**不節流**；要節流加進 `outbox.THROTTLED`，而且想清楚
+被併掉的那幾則會不會讓畫面說出不對的事。
 
 ## 機上錄製與自動回傳（uav-system issues/014）
 

@@ -117,29 +117,47 @@ chk("**對照**：enabled 有而 health 無時，兩邊都說 RC 有問題",
     and "RC 接收器" in feed(BIT, 0, enabled=BIT).state["sensors_unhealthy"])
 
 print("\n── 變化要留痕（含「不知道 → 掉線」）───────────────────")
+# 痕跡是 journald 那一行。**不送地面站**（issues/057）：地面站從 MAVLink
+# 自己產生 rc_link 事件（`mavlink_rx`），代理再送一份只會重複
+import logging
+
+
+class _Grab(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, r):
+        m = r.getMessage()
+        if "遙控器" in m:
+            self.lines.append(m)
+
+
+grab = _Grab()
+logging.getLogger("uav-agent").addHandler(grab)
+logging.getLogger("uav-agent").setLevel(logging.INFO)
 mon = A.Monitor()
 mon.feed(sys_status(BIT, BIT))
-n0 = len(mon.events)
+n0 = len(grab.lines)
 mon.feed(sys_status(BIT, 0))
-chk("在線 → 掉線 留一筆事件", len(mon.events) == n0 + 1,
-    mon.events[-1][2] if mon.events else None)
+chk("在線 → 掉線 留一筆紀錄", len(grab.lines) == n0 + 1,
+    grab.lines[-1] if grab.lines else None)
 mon.feed(sys_status(BIT, 0))
-chk("沒變化不重複記", len(mon.events) == n0 + 1)
+chk("沒變化不重複記", len(grab.lines) == n0 + 1)
 # **這一格是 `_change` 做不到的**：它把第一次讀到的值當成「還沒讀到」，
 # 於是 None → False 會安靜地過去——而那正是最該留痕的一次
 mon2 = A.Monitor()
 mon2.feed(sys_status(0, 0))          # 先讀到「不知道」
-n1 = len(mon2.events)
+n1 = len(grab.lines)
 mon2.feed(sys_status(BIT, 0))        # 韌體開始回報，而且說 RC 掉了
 chk("**不知道 → 掉線 也留痕**（None 是值，不是「還沒讀到」）",
-    len(mon2.events) == n1 + 1, mon2.events[-1][2] if mon2.events else None)
+    len(grab.lines) == n1 + 1, grab.lines[-1] if grab.lines else None)
 
 print("\n── 分層來源：SYS_STATUS 沒有時退到 RC_CHANNELS ─────────")
 import time as _t
 import agent as _A
 
 mon = _A.Monitor.__new__(_A.Monitor)
-mon.events = []
 
 
 def derive(sys_bit=None, chancount=None, age=0.0):
@@ -169,13 +187,13 @@ chk("**反向驗證**：門檻內仍然有效",
 print("\n── 轉態留痕（含「不知道 → 掉線」那一格）────────────────")
 st = {}
 mon._note_rc(st, None)                      # 第一次讀到，不算轉態
-n0 = len(mon.events)
+n0 = len(grab.lines)
 mon._note_rc(st, False)                     # 不知道 → 掉線
 chk("**「不知道 → 掉線」有留痕**（最該被看見的一次轉換）",
-    len(mon.events) == n0 + 1 and "離線" in mon.events[-1][2],
-    mon.events[-1][2] if mon.events else "")
+    len(grab.lines) == n0 + 1 and "離線" in grab.lines[-1],
+    grab.lines[-1] if grab.lines else "")
 mon._note_rc(st, False)
-chk("沒有變化就不重複記", len(mon.events) == n0 + 1)
+chk("沒有變化就不重複記", len(grab.lines) == n0 + 1)
 
 print("\n── 接到守門：三態各自的後果 ───────────────────────────")
 for label, rc, want in (("在線", True, True), ("掉線", False, False),

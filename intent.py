@@ -55,7 +55,8 @@ class IntentLink(threading.Thread):
     """
 
     def __init__(self, url, hello, interval=KEEPALIVE_S, silence=SILENCE_S,
-                 on_intent=None, on_decision=None, on_progress=None):
+                 on_intent=None, on_decision=None, on_progress=None,
+                 outbox=None):
         super().__init__(daemon=True)
         self.url = url
         self.hello = hello
@@ -66,6 +67,12 @@ class IntentLink(threading.Thread):
         #: 兩者都回一則 event，走與 intent 相同的路徑
         self.on_decision = on_decision
         self.on_progress = on_progress
+        #: 只有代理知道的事（`outbox.Outbox`，issues/057），以 `notice` 送出
+        self.outbox = outbox
+        #: 這個地面站收不收 `notice`。**看 hello 回應的 `accepts`，不用試的**：
+        #: 舊版地面站會對每一則回「尚未實作」，而機上會以為送到了
+        self._notice_ok = False
+        self._notice_said = False
         self.interval = interval
         self.silence = silence
         self._snapshot = None
@@ -93,7 +100,8 @@ class IntentLink(threading.Thread):
         分開放就要兩邊對時間戳才看得出「那次遙測掉包時意圖通道在不在」。"""
         return {"up": self.connected, "sent": self.sent,
                 "drops": self.drops, "silent": self.silent_drops,
-                "rejected": self.rejected, "acked": self.acked}
+                "rejected": self.rejected, "acked": self.acked,
+                "notice_ok": self._notice_ok}
 
     # ── 執行緒本體 ─────────────────────────────────────────────
     def run(self):
@@ -116,6 +124,8 @@ class IntentLink(threading.Thread):
             # 狀態變化「立即送」，那時最多會慢 5 秒才送出去）
             ws.settimeout(min(0.2, self.interval / 4))
             self._send(ws, dict(self.hello, type="hello"))
+            self._notice_ok = False       # 換了地面站就要重新問
+            notice_sent = 0               # 這條連線上送到第幾則（沒回執的重連後重送）
             self.connected = True
             # **退避在「連上」時重置，不是在 session 結束時**：session 結束的
             # 唯一方式是拋例外，所以原本寫在 try 之後的重置永遠不會執行。
@@ -139,6 +149,10 @@ class IntentLink(threading.Thread):
                     pass
                 while self._pending:
                     self._send(ws, dict(self._pending.pop(0), type="event"))
+                if self.outbox is not None and self._notice_ok:
+                    for n in self.outbox.unsent(after_seq=notice_sent):
+                        self._send(ws, dict(n, type="notice"))
+                        notice_sent = n["seq"]
                 with self._lock:
                     snap = self._snapshot
                 now = time.monotonic()
@@ -246,5 +260,19 @@ class IntentLink(threading.Thread):
         elif t == "proposal":
             log.warning("收到 proposal——那是**我方**送出去的型別，"
                         "地面站不該送回來 → 丟棄")
-        elif t != "ack":
+        elif t == "ack":
+            self._on_ack(msg)
+        else:
             log.warning("收到未知型別 %s，丟棄（協定 §3：不半懂地解讀）", t)
+
+    def _on_ack(self, msg):
+        of = msg.get("of")
+        if of == "hello":
+            self._notice_ok = "notice" in (msg.get("accepts") or [])
+            if not self._notice_ok and not self._notice_said:
+                self._notice_said = True
+                log.warning("地面站不收 notice（accepts=%s，舊版？）——"
+                            "代理的事件留在機上緩衝，不會出現在畫面上",
+                            msg.get("accepts"))
+        elif of == "notice" and self.outbox is not None:
+            self.outbox.ack(msg.get("boot"), msg.get("seq") or 0)
