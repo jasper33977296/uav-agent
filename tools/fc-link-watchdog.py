@@ -80,14 +80,14 @@ class FakePort:
 
 
 def fake(fd):
-    return types.SimpleNamespace(
+    f = types.SimpleNamespace(
         a=types.SimpleNamespace(baud=57600, dev="/dev/pty-test"),
         serial=types.SimpleNamespace(port=FakePort(fd)),
         port_checked=0.0, port_tampered=0,
         mon=types.SimpleNamespace(last_hb=None, state={}),
         fc_link_ok=None, fc_lost_since=None, fc_lost_nagged=0.0,
         fd=fd, fc_reopen_t=0.0, fc_reopens=0, fc_write_dropped=0,
-        fwd_to_fc=0, fc_parser=None,
+        fwd_to_fc=0, fc_parser=None, port_exclusive=None,
         # 類別常數借真的那幾個值——**不要讓測試自己編一套門檻**
         PORT_CHECK_S=A.Agent.PORT_CHECK_S,
         FC_HB_LOST_S=A.Agent.FC_HB_LOST_S,
@@ -95,6 +95,10 @@ def fake(fd):
         FC_REOPEN_S=A.Agent.FC_REOPEN_S,
         FC_REOPEN_EVERY_S=A.Agent.FC_REOPEN_EVERY_S,
     )
+    # 開埠會順手主張獨佔（059 A）——**綁真的那個**，不替它編假的
+    f._claim_exclusive = lambda fd: A.Agent._claim_exclusive(f, fd)
+    f._release_exclusive = lambda fd: A.Agent._release_exclusive(f, fd)
+    return f
 
 
 def wire(f):

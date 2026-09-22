@@ -61,6 +61,7 @@
   什麼，它只能做一件粗的事。見 `_check_gs_link`。
 """
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -713,6 +714,7 @@ class Agent:
         self.fd = None
         self.fc_reopen_t = 0.0         # 上次重開嘗試（單調），退避用
         self.fc_reopens = 0            # 重開過幾次
+        self.port_exclusive = None     # 有沒有獨佔住序列埠，見 `_claim_exclusive`
         self.fc_write_dropped = 0      # 沒有埠可寫而丟掉的上行封包
         #: 上次「地面站說它收到我的遙測」是什麼時候（單調時鐘）。
         #: **與 `gs_link_ok` 是兩個不同的問題**，見 `uplink_ok`
@@ -744,6 +746,7 @@ class Agent:
         """
         old = getattr(self, "serial", None)   # tools/ 裡有不跑 __init__ 的用法
         if old is not None:
+            self._release_exclusive(self.fd)
             try:
                 old.close()
             except Exception as e:
@@ -758,11 +761,62 @@ class Agent:
             log.warning("開序列埠失敗：%s", e)
             return False
         self.fd = self.serial.port.fileno()
+        self._claim_exclusive(self.fd)
         # **解析器的半截緩衝要丟掉。** 斷點前讀進來的那幾個位元組不會是完整的
         # 框架，留著只會讓重開後的第一批資料被它帶壞
         self.fc_parser = apm.MAVLink(None)
         self.fc_parser.robust_parsing = True
         return True
+
+    def _claim_exclusive(self, fd):
+        """主張獨佔這個序列埠（uav-system 059 A）：之後別人 `open()` 拿到 `EBUSY`。
+
+        2026-09-21 的故障：`get-gps.py` 帶起的 `mavsdk_server` 與代理同開
+        `/dev/ttyAMA0`，兩邊輪流從同一個核心緩衝 `read()`、各拿隨機片段，
+        校正永遠跑不完而且不報錯。
+
+        **不能用 pyserial 的 `exclusive=True`**——它做的是
+        `flock(LOCK_EX|LOCK_NB)`，那是建議鎖，只擋得住同樣去 flock 的人；
+        `mavsdk_server`／`stty`／`cat` 都不 flock，照樣開得起來。
+        要的是核心層的 `TIOCEXCL`：tty 被標成獨佔之後，任何沒有
+        `CAP_SYS_ADMIN` 的 `open()` 都回 `EBUSY`。
+
+        它擋不住的兩種情況，**要知道但不在這裡處理**（059 B 的偵測）：
+          * root——`sudo` 跑的東西無視 TIOCEXCL（09-16 的 `uart-probe.sh`）
+          * **早於我們開的人**——TIOCEXCL 只擋之後的 `open()`，已經開著的
+            fd 不受影響（09-21 那次 `get-gps.py` 就比代理早 7 秒）
+
+        **重開前要先放掉**（`_release_exclusive`）：旗標只在 tty 被最後釋放時
+        才由核心清除，而只要別人還開著（例如 root 的 `stty`），關掉自己那個
+        fd 並不是最後一次——旗標留著，重開時擋到的是**我們自己**。
+
+        下不成功只告警、**不擋開機**（059 裁定：被搶也不拒絕啟動——
+        沒有代理比有一個不獨佔的代理更糟）。結果留在 `port_exclusive`。
+        """
+        if not os.isatty(fd):
+            # `--dev udpin:…` 走同一條路徑（SITL），socket 沒有獨佔可言
+            self.port_exclusive = None
+            return
+        try:
+            fcntl.ioctl(fd, termios.TIOCEXCL)
+            self.port_exclusive = True
+        except OSError as e:
+            self.port_exclusive = False
+            log.error("**沒辦法獨佔 %s**（TIOCEXCL：%s）——別的程式仍開得到飛控序列埠",
+                      self.a.dev, e)
+
+    def _release_exclusive(self, fd):
+        """放掉獨佔（`TIOCNXCL`），`_open_serial_once` 關舊埠之前呼叫。
+
+        埠壞掉時 fd 可能已經不能用（ENODEV／EBADF）——那也放不掉，
+        而且那種情況 tty 多半已經隨裝置消失，不會留下擋人的旗標。
+        """
+        if fd is None:
+            return
+        try:
+            fcntl.ioctl(fd, termios.TIOCNXCL)
+        except OSError:
+            pass
 
     def connect_serial(self):
         """開機時用：開到成功為止（這時候阻塞是對的，還沒有東西在跑）。"""
@@ -2444,6 +2498,9 @@ class Agent:
             # 重開過幾次、以及沒有埠可寫而丟掉的上行封包
             "fc_reopens": self.fc_reopens,
             "fc_write_dropped": self.fc_write_dropped,
+            # 有沒有獨佔住飛控序列埠（059 A）。**False 就是有人搶得進來**；
+            # None ＝不是 tty（udpin:），或還沒開過
+            "port_exclusive": self.port_exclusive,
             # **None ＝現在根本沒有埠**，與「有埠但飛控不講話」是兩回事
             "fc_port": None if self.fd is None else self.a.dev,
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
