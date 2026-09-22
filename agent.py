@@ -93,6 +93,20 @@ from outbox import Outbox
 log = logging.getLogger("uav-agent")
 
 AGENT_VERSION = "0.20.0"         # 0.20.0：L2 自主重綁（我送得到、他回不來）
+
+#: 部署腳本（`deploy.sh`，uav-system issues/069）留下的「這是哪一版」。
+#: **版本號不夠**：0.20.0 之後改過好幾次都沒動版本號，只有 commit 對得上 repo。
+DEPLOYED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DEPLOYED")
+
+
+def _deployed() -> dict:
+    """讀不到＝不是經由部署腳本放上來的（手動 scp），**照實說不知道**。"""
+    try:
+        with open(DEPLOYED_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 #: 「我送得到、他回不來」持續這麼久就重綁 UDP 來源埠。20 秒遠長於一次
 #: 尋常的抖動，又遠短於一趟飛行——真的壞掉時不該讓操作員等到落地。
 REBIND_AFTER_S = 20.0
@@ -1173,6 +1187,13 @@ class Agent:
         self.last_stream_req = time.monotonic()
 
     def run(self):
+        dep = _deployed()
+        if dep:
+            log.info("部署版本 %s%s（%s 由 %s 部署）", dep.get("commit"),
+                     "-dirty" if dep.get("dirty") else "", dep.get("at"), dep.get("by"))
+        else:
+            log.warning("沒有 DEPLOYED 檔——不是經由 deploy.sh 放上來的，"
+                        "說不出機上跑的是哪個 commit")
         self.connect_serial()
         if self.a.modem_port:
             self.modem = ModemSampler(
@@ -1467,6 +1488,7 @@ class Agent:
             "fw": self.mon.state.get("fw"),
             "vehicle_type": self.mon.state.get("vehicle_type"),
             "agent_version": AGENT_VERSION,
+            "deployed": _deployed().get("commit"),
             # **它現在用的號碼**（uav-system issues/040 A1）。地面站據此判斷
             # 「它跑錯號碼了沒」——不送的話那頭只能配一個號給我們，
             # 分不出「本來就用對了」與「不知道它用什麼」
@@ -2579,6 +2601,8 @@ class Agent:
             "battery_pct": s.get("battery_pct"), "voltage": s.get("voltage"),
             "gps": f"{s.get('gps_fix')}/{s.get('gps_sats')}sats",
             "alt_rel_m": s.get("alt_rel_m"),
+            # 機上跑的是哪個 commit（069）。None＝不是經由 deploy.sh 放上來的
+            "deployed": _deployed().get("commit"),
             "msgs_from_fc": sum(self.mon.counts.values()),
             "tx_telemetry": self.telem.tx, "tx_command": self.cmd.tx,
             "rx_from_gs": self.telem.rx + self.cmd.rx,

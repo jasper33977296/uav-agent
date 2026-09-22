@@ -200,6 +200,20 @@ sudo systemctl start uav-agent && journalctl -u uav-agent -f
 sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 ```
 
+## 部署（開發機 → Pi，uav-system issues/069）
+
+```bash
+./deploy.sh --dry-run    # 先看：解鎖閘門、哪些檔會變、unit 有沒有差（不動機上）
+./deploy.sh              # 部署目前的 commit（工作目錄要乾淨，否則 --dirty）
+./deploy.sh --rollback   # 還原上一次部署前的備份
+```
+
+**不要再手動 scp。** 腳本只傳 git 追蹤的檔、不刪機上任何東西、不碰 `state.json`／
+`.fc_sysid`／venv；代理在跑時要 `state.json` 新鮮且未解鎖才重啟（不知道就中止）；
+unit 有差只裝 unit（`config.txt` 仍是 `install-service.sh` 的事）；`requirements.txt`
+有變要 `--pip`。部署後機上的 `DEPLOYED` 記著 commit，代理開機時 log 出來、狀態列帶
+`deployed`——**「機上跑的是哪一版」從此有答案**。驗收失敗不自動回滾，保留現場。
+
 ## 檔案
 
 | 檔案 | 用途 |
@@ -233,6 +247,7 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 | `tools/recorder-flow.py` | 錄製器：armed 才錄、格式、滾動、失敗不拖垮轉發 |
 | `tools/upload-flow.py` | 回傳的**時機**：飛行中不傳、半路起飛就停、續傳、限速 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
+| `deploy.sh` | **開發機上跑**：部署到 Pi（見〈部署〉） |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |
 
