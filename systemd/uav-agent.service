@@ -48,6 +48,11 @@ Environment=RECORD_UPLOAD_SETTLE_S=20
 # 錄製 spool 也搬出家目錄（躲誤刪）；預設 /home/pi/uav-record 被這行覆蓋
 Environment=RECORD_DIR=/opt/uav-record
 
+# **啟動前先對時**（uav-system 070，2026-09-22 使用者裁定）。`+`＝這一步以 root 跑
+# （要重啟 timesyncd），代理本身仍是 pi。已對過就立刻過；沒對過最多等 60 秒，
+# **逾時照樣啟動**——沒有橋比時間錯更糟。TimeoutStartSec 要比那 60 秒寬
+ExecStartPre=+/opt/uav-agent/systemd/wait-time-sync.sh
+TimeoutStartSec=120
 ExecStart=/opt/uav-agent/venv/bin/python /opt/uav-agent/agent.py
 Restart=always
 RestartSec=3

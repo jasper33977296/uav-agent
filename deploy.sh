@@ -138,7 +138,9 @@ fi
 # ── 5. requirements ──────────────────────────────────────────
 step "5. requirements.txt"
 REQ_LOCAL=$(sha256sum requirements.txt | cut -c1-16)
-REQ_REMOTE=$(R "sha256sum $DEST/requirements.txt 2>/dev/null | cut -c1-16" || true)
+# **連不上與「變了」要分開**：以前 ssh 一失敗 REQ_REMOTE 就是空的，被說成「相依有變」
+REQ_REMOTE=$(R "if [ -f $DEST/requirements.txt ]; then sha256sum $DEST/requirements.txt | cut -c1-16; else echo none; fi") \
+  || die "讀機上的 requirements.txt 時 ssh 失敗——Pi 可能剛斷線，機上沒有任何改動，稍後重跑"
 if [ "$REQ_LOCAL" = "$REQ_REMOTE" ]; then say "   沒變"; else
   say "   **變了**（機上 ${REQ_REMOTE:-無} → $REQ_LOCAL）"
   if [ "$PIP" = 0 ] && [ "$DRY" = 0 ]; then
