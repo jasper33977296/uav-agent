@@ -38,26 +38,19 @@ fi
 have_csi() { rpicam-hello --list-cameras 2>/dev/null | grep -q "^[0-9] *:"; }
 
 # ── CSI 模組（libcamera）────────────────────────────────────────────────
-# rpicam-vid 自己編 H.264 後由 ffmpeg 純轉封裝（`-c copy`）送進 RTSP。
-# 不能 exec 一整條管線，所以用 `kill 0` 把整個行程群組一起收掉——不這樣做的話
-# MediaMTX 結束這支腳本時 rpicam-vid 會留下來，**相機被佔住，下一次拉不到**。
+# **用 rpicam-vid 自己的 libav 輸出直接推 RTSP，不接 ffmpeg。**
+# 原本想用 `-o -` 管給 ffmpeg，2026-09-23 實測 **rpicam-apps v1.12 的 `-o -`
+# 吐 0 bytes**（ffmpeg 看到空輸入，報 `unspecified size`）。改用 libav 之後
+# 這支腳本只有一個行程，可以 exec——MediaMTX 收掉它就真的收乾淨了，不會留下
+# rpicam-vid 把相機佔住害下一次拉不到。
 start_csi() {
-  local w="${SIZE%x*}" h="${SIZE#*x}" bps="$BITRATE"
-  case "$bps" in
-    *M|*m) bps=$(( ${bps%[Mm]} * 1000000 )) ;;
-    *K|*k) bps=$(( ${bps%[Kk]} * 1000 )) ;;
-  esac
-  echo "CSI 相機（libcamera）→ rpicam-vid 軟體編碼 ${w}x${h}@${FPS} ${bps}bps" >&2
-  trap 'kill 0' EXIT INT TERM
-  # --inline：每個 IDR 前都帶 SPS/PPS。**中途加入的觀看者靠它才解得開**，
-  # 少了它，第一個關鍵影格之前的畫面是黑的（而拉流本來就都是中途加入）。
-  # --intra：1 秒一個關鍵影格，讓「開了就看得到」的等待有上限。
-  rpicam-vid -n -t 0 --width "$w" --height "$h" --framerate "$FPS" \
-      --codec h264 --inline --intra "$FPS" --bitrate "$bps" -o - 2>/dev/null \
-    | ffmpeg -nostdin -hide_banner -loglevel warning \
-        -fflags +genpts -f h264 -i - -c:v copy -an -f rtsp -rtsp_transport tcp "$OUT" &
-  wait
-  exit $?
+  local w="${SIZE%x*}" h="${SIZE#*x}"
+  echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} $BITRATE" >&2
+  # --inline 在 libav 路徑上不適用（封裝由 libav 做）；關鍵影格間隔用 --intra，
+  # 一秒一個，讓「開了多久才看得到畫面」有上限——拉流的人都是中途加入的。
+  exec rpicam-vid -n -t 0 --width "$w" --height "$h" --framerate "$FPS" \
+    --intra "$FPS" --codec libav --libav-format rtsp --libav-video-codec libx264 \
+    -o "$OUT"
 }
 
 # ── USB 相機（v4l2）─────────────────────────────────────────────────────
