@@ -1212,7 +1212,10 @@ class Agent:
                 # **上行確認**（issues/047 項次 6）：地面站在這條每秒一次的
                 # 回應裡告訴我們「我最後收到你的遙測是多久以前」。那是機上
                 # 唯一問得到「我送的東西有沒有到」的地方
-                on_uplink_ok=self.mark_uplink_ok)
+                on_uplink_ok=self.mark_uplink_ok,
+                # **上下行實際用量**（2026-09-23 使用者裁定：量用量不量容量、
+                # 只記總量不區分）。讀這個介面的收發位元組計數器做差分
+                net_iface=self.a.net_iface)
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）
@@ -2684,6 +2687,9 @@ def main():
                    help="即時通道多久送一次（秒）。取樣可以更密，這只管畫面")
     p.add_argument("--modem-interval", type=float,
                    default=float(os.environ.get("MODEM_INTERVAL", 1.0)))
+    p.add_argument("--net-iface", default=os.environ.get("NET_IFACE", "usb0"),
+                   help="量上下行實際用量的網路介面（5G 那條）。"
+                        "讀不到就送 null，不會假裝是 0")
     # ── 地面失聯處置（飛安相關，預設值刻意保守）──────────────────
     p.add_argument("--link-warn-s", type=float,
                    default=float(os.environ.get("LINK_WARN_S", 5.0)),

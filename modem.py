@@ -81,7 +81,7 @@ class ModemSampler(threading.Thread):
 
     def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
                  drone_id_fn=None, airborne_fn=None, live_interval=1.0,
-                 on_uplink_ok=None):
+                 on_uplink_ok=None, net_iface="usb0"):
         super().__init__(name="modem-sampler")
         #: **地面站確認「我收到你的遙測了」時呼叫**（issues/047 項次 6）。
         #: 這條每秒一次的通道是機上唯一能問到「我送的東西有沒有到」的地方
@@ -113,6 +113,20 @@ class ModemSampler(threading.Thread):
         self.last = {}
         self._rtt_ms = None
         self._last_ping = 0.0
+        # ── 上下行實際流量（uav-system issues/022 之後，2026-09-23 使用者裁定）──
+        #
+        # **量的是「現在傳了多少」，不是「能傳多少」。** 讀 5G 介面的收發位元組
+        # 計數器做差分，零額外流量——主動打流量會佔滿上行，而那條上行正是要
+        # 研究的對象，量它等於弄壞它。
+        #
+        # 方向以**這台機**為準：`up`＝機→地面（介面的 tx）、`down`＝地面→機（rx）。
+        #
+        # **總量，不區分**（使用者裁定）：影像、遙測、樣本回傳全部算在一起。
+        # 影像現在就走同一條（實測 2.1 Mbps），所以看到某段偏高時要對照那時候
+        # 有沒有人在拉畫面。
+        self.net_iface = net_iface
+        self._net_at = None          # 上一次讀計數器的單調時刻
+        self._net_tx = self._net_rx = None
         # ── 記錄通道（uav-system issues/021／doc/onboard-telemetry.md）──────
         #
         # **這條路以前不存在。** 採樣只往 `/live` 送，而那個端點的 docstring
@@ -209,6 +223,35 @@ class ModemSampler(threading.Thread):
     # 就是陷阱：**兩邊解的是同一個原始字串，沒有誰比較第一手**，
     # 第一手的是 raw 本身。所以機上只負責把 raw 原樣送上去，解碼只留一份。
 
+    def _throughput(self, now):
+        """5G 介面這一段時間的**實際**收發速率（kbps）。回 (up, down)。
+
+        **讀不到就回 (None, None)，不是 0。** 介面不存在、計數器讀不到、
+        第一次取樣沒有前值——這三種都是「不知道」，而 0 的意思是「這段時間
+        什麼都沒傳」。兩者對事後分析的意義相反，不能混。
+
+        計數器變小＝介面被重設或溢位（重開、usb0 重新列舉）。那一段的差分
+        沒有意義，**丟掉並重新起算**，不要送出一個假的負數或暴衝值。
+        """
+        base = f"/sys/class/net/{self.net_iface}/statistics"
+        try:
+            with open(f"{base}/tx_bytes") as f:
+                tx = int(f.read())
+            with open(f"{base}/rx_bytes") as f:
+                rx = int(f.read())
+        except (OSError, ValueError):
+            self._net_at = self._net_tx = self._net_rx = None
+            return None, None
+        prev_at, prev_tx, prev_rx = self._net_at, self._net_tx, self._net_rx
+        self._net_at, self._net_tx, self._net_rx = now, tx, rx
+        if prev_at is None:
+            return None, None
+        dt = now - prev_at
+        if dt <= 0 or tx < prev_tx or rx < prev_rx:
+            return None, None            # 計數器重設／時間沒前進＝這一段不算
+        return (round((tx - prev_tx) * 8 / 1000.0 / dt, 1),
+                round((rx - prev_rx) * 8 / 1000.0 / dt, 1))
+
     def _ping_rtt(self):
         """真的量一次 RTT，而不是拿 HTTP 往返充數（那含伺服器處理時間）。"""
         try:
@@ -252,6 +295,8 @@ class ModemSampler(threading.Thread):
             self._last_ping = now
             self._rtt_ms = self._ping_rtt()
         out["rtt_ms"] = self._rtt_ms
+        up, down = self._throughput(now)
+        out["throughput_up_kbps"], out["throughput_down_kbps"] = up, down
         out["raw"] = raw
         out["time"] = datetime.now(timezone.utc).isoformat()   # 必須含時區
         # 牆鐘還沒對過時，上面那個時間是錯的。即時通道照送，讓地面站改用收到
@@ -421,6 +466,9 @@ class ModemSampler(threading.Thread):
                 "dropped": self.dropped, "on_ground": self.on_ground,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
+                # 實際用量（不是容量）。null＝讀不到，不是 0
+                "up_kbps": self.last.get("throughput_up_kbps"),
+                "down_kbps": self.last.get("throughput_down_kbps"),
                 # pci／cell_id／band 由地面站從 raw 解（唯一一份解碼）
                 "pci": self.last.get("pci"), "cell_id": self.last.get("cell_id"),
                 "band": self.last.get("band")}
