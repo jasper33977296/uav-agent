@@ -53,8 +53,16 @@ start_csi() {
   echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} ${bps}bps" >&2
   # --inline 在 libav 路徑上不適用（封裝由 libav 做）；關鍵影格間隔用 --intra，
   # 一秒一個，讓「開了多久才看得到畫面」有上限——拉流的人都是中途加入的。
+  #
+  # **bf=0 不是調效能，是必要條件**：libx264 預設會產生 B-frame，而 **WebRTC 不支援**。
+  # 2026-09-23 實測，地面站 MediaMTX 每一次都是
+  #   `[WebRTC] session closed: WebRTC doesn't support H264 streams with B-frames`
+  # ——連得上、讀得到軌道，然後立刻被關掉。使用者看到的是「畫面只出現一下」。
+  # USB 那條路沒踩到，是因為它的 ffmpeg 指令帶了 `-tune zerolatency`（順便關掉 B-frame）。
+  # codec-opts 會**覆蓋內建預設**，所以 preset 也要一起帶上。
   exec rpicam-vid -n -t 0 --width "$w" --height "$h" --framerate "$FPS" \
     --intra "$FPS" --codec libav --libav-format rtsp --libav-video-codec libx264 \
+    --libav-video-codec-opts "preset=ultrafast;tune=zerolatency;bf=0" \
     --bitrate "$bps" -o "$OUT"
 }
 
