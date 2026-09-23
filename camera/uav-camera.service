@@ -1,0 +1,27 @@
+[Unit]
+Description=機上相機：USB/CSI → RTSP（地面站來拉，見 uav-system issues/022）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# 相機與影像裝置：video（USB UVC）；CSI 模組還要 render/gpio，換過去時再加
+SupplementaryGroups=video
+WorkingDirectory=/opt/uav-agent/camera
+# 相機參數改這裡，不要改程式（同 uav-agent.service 的規矩）
+Environment=CAM_DEV=/dev/video0
+Environment=CAM_SIZE=1280x720
+Environment=CAM_FPS=30
+Environment=CAM_BITRATE=2M
+ExecStart=/opt/uav-agent/camera/mediamtx /opt/uav-agent/camera/mediamtx.yml
+Restart=always
+RestartSec=5
+# **比代理低一階**：影像不該跟飛控↔地面站那座橋搶 CPU（agent 是 Nice=-5）
+Nice=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uav-camera
+
+[Install]
+WantedBy=multi-user.target

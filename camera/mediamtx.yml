@@ -1,0 +1,29 @@
+# 機上的 RTSP 伺服器（uav-system issues/022；2026-09-23 使用者裁定：拉流、獨立服務）
+#
+# **地面站來拉，機上不推。** 理由是研究效度不是省頻寬：影像與 5G 量測共用同一條
+# 上行，一直傳等於量到的不再是原本那條鏈路的品質（doc/flight-video-design.md §9）。
+# `runOnDemand` 讓相機與編碼**只在有人拉的時候才跑**——沒人看、也沒在錄的時候，
+# 機上不開相機、不編碼、不送任何位元組。
+#
+# **獨立於 uav-agent**（使用者裁定）：影像掛掉不該影響飛控↔地面站那座橋。
+logLevel: info
+api: no
+metrics: no
+rtsp: yes
+rtspAddress: :8554
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+playback: no
+record: no                      # 錄影是地面站的事（保留天數、回放都在那裡）
+
+paths:
+  cam:
+    # 相機格式由 `camera-source.sh` 當場探測：能輸出 H.264 就直接轉送
+    # （**Pi 5 沒有硬體 H.264 編碼器**，能不編就不編），否則軟體編碼。
+    runOnDemand: /opt/uav-agent/camera/camera-source.sh
+    runOnDemandRestart: yes
+    # 最後一個人離開之後還留這麼久——切換畫面、重新整理不必重新開相機
+    runOnDemandCloseAfter: 10s
+    runOnDemandStartTimeout: 10s
