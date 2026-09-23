@@ -14,6 +14,9 @@ Environment=CAM_DEV=/dev/video0
 Environment=CAM_SIZE=1280x720
 Environment=CAM_FPS=30
 Environment=CAM_BITRATE=2M
+# 關鍵影格間隔（影格數）。**對外 HLS 的延遲下限就是這個**——HLS 只能從關鍵
+# 影格切片。半秒一個；調大會省一點頻寬，代價是對外延遲跟著變長
+Environment=CAM_INTRA=15
 ExecStart=/opt/uav-agent/camera/mediamtx /opt/uav-agent/camera/mediamtx.yml
 Restart=always
 RestartSec=5

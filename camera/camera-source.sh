@@ -45,12 +45,18 @@ have_csi() { rpicam-hello --list-cameras 2>/dev/null | grep -q "^[0-9] *:"; }
 # rpicam-vid 把相機佔住害下一次拉不到。
 start_csi() {
   local w="${SIZE%x*}" h="${SIZE#*x}" bps="$BITRATE"
+  # 關鍵影格間隔（影格數）。**這個值直接決定對外 HLS 的延遲**：HLS 只能從
+  # 關鍵影格切片，所以切片長度的下限就是這個間隔。2026-09-23 實測，1 秒一個
+  # 關鍵影格時 MediaMTX 切出 2–3 秒的片，播放器又從倒數第 3 片起播，
+  # 對外延遲變成 6–8 秒。預設改成半秒一個。
+  local intra="${CAM_INTRA:-$(( FPS / 2 ))}"
+  [ "$intra" -lt 1 ] 2>/dev/null && intra=1
   # rpicam-vid 的 --bitrate 要 bps 數字，CAM_BITRATE 沿用 ffmpeg 的 2M/500K 寫法
   case "$bps" in
     *M|*m) bps=$(( ${bps%[Mm]} * 1000000 )) ;;
     *K|*k) bps=$(( ${bps%[Kk]} * 1000 )) ;;
   esac
-  echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} ${bps}bps" >&2
+  echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} ${bps}bps（關鍵影格每 ${intra} 格）" >&2
   # --inline 在 libav 路徑上不適用（封裝由 libav 做）；關鍵影格間隔用 --intra，
   # 一秒一個，讓「開了多久才看得到畫面」有上限——拉流的人都是中途加入的。
   #
@@ -61,7 +67,7 @@ start_csi() {
   # USB 那條路沒踩到，是因為它的 ffmpeg 指令帶了 `-tune zerolatency`（順便關掉 B-frame）。
   # codec-opts 會**覆蓋內建預設**，所以 preset 也要一起帶上。
   exec rpicam-vid -n -t 0 --width "$w" --height "$h" --framerate "$FPS" \
-    --intra "$FPS" --codec libav --libav-format rtsp --libav-video-codec libx264 \
+    --intra "$intra" --codec libav --libav-format rtsp --libav-video-codec libx264 \
     --libav-video-codec-opts "preset=ultrafast;tune=zerolatency;bf=0" \
     --bitrate "$bps" -o "$OUT"
 }
