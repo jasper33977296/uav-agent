@@ -44,13 +44,18 @@ have_csi() { rpicam-hello --list-cameras 2>/dev/null | grep -q "^[0-9] *:"; }
 # 這支腳本只有一個行程，可以 exec——MediaMTX 收掉它就真的收乾淨了，不會留下
 # rpicam-vid 把相機佔住害下一次拉不到。
 start_csi() {
-  local w="${SIZE%x*}" h="${SIZE#*x}"
-  echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} $BITRATE" >&2
+  local w="${SIZE%x*}" h="${SIZE#*x}" bps="$BITRATE"
+  # rpicam-vid 的 --bitrate 要 bps 數字，CAM_BITRATE 沿用 ffmpeg 的 2M/500K 寫法
+  case "$bps" in
+    *M|*m) bps=$(( ${bps%[Mm]} * 1000000 )) ;;
+    *K|*k) bps=$(( ${bps%[Kk]} * 1000 )) ;;
+  esac
+  echo "CSI 相機（libcamera）→ rpicam-vid libav 軟體編碼 ${w}x${h}@${FPS} ${bps}bps" >&2
   # --inline 在 libav 路徑上不適用（封裝由 libav 做）；關鍵影格間隔用 --intra，
   # 一秒一個，讓「開了多久才看得到畫面」有上限——拉流的人都是中途加入的。
   exec rpicam-vid -n -t 0 --width "$w" --height "$h" --framerate "$FPS" \
     --intra "$FPS" --codec libav --libav-format rtsp --libav-video-codec libx264 \
-    -o "$OUT"
+    --bitrate "$bps" -o "$OUT"
 }
 
 # ── USB 相機（v4l2）─────────────────────────────────────────────────────
