@@ -1,0 +1,18 @@
+[Unit]
+Description=機上供電黑盒子：1 Hz 記電壓／負載（uav-system issues/072）
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/opt/uav-agent/tools/power-log.sh
+Restart=always
+RestartSec=2
+# **開機就跑、而且比代理早**：要查的正是「重開前後」那幾秒，
+# 晚啟動就會漏掉。Nice 比代理低——這支再重要也不該跟飛控資料搶 CPU
+Nice=10
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=uav-power-log
+
+[Install]
+WantedBy=multi-user.target
