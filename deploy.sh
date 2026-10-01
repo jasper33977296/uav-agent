@@ -68,11 +68,34 @@ fi
 say "   commit $COMMIT$([ "$DIRTY" = true ] && echo '（dirty）')"
 
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
+
+# 機上位址**先問地面站**（2026-10-01）。指令服務會從實際收到的封包學對端位址
+# 並寫進 peers.json——那是「這台機現在在哪」的事實源，而寫死的清單不是。
+# 2026-10-01 就踩到：地面站與機上都換了網段，這支腳本的兩個預設值全部失效。
+# 問不到才退回寫死的清單（手邊沒有地面站時仍然能用）。
+learn_host() {
+  docker exec uav-command cat /state/peers.json 2>/dev/null \
+    | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin).get('peers') or {}
+except Exception:
+    raise SystemExit
+for v in d.values():
+    ip = v.get('ip')
+    if ip:
+        print(ip); break" 2>/dev/null
+}
+
 if [ -z "$HOST" ]; then
-  for h in 10.141.2.32 10.101.129.121; do
-    if ssh "${SSH_OPTS[@]}" "pi@$h" true 2>/dev/null; then HOST=$h; break; fi
+  LEARNED=$(learn_host || true)
+  for h in $LEARNED 10.141.2.32 10.101.129.121; do
+    if ssh "${SSH_OPTS[@]}" "pi@$h" true 2>/dev/null; then
+      HOST=$h
+      [ "$h" = "${LEARNED:-}" ] && say "   位址取自地面站學到的對端（peers.json）"
+      break
+    fi
   done
-  [ -n "$HOST" ] || die "兩個位址都連不到 Pi（5G 側 10.141.2.32、eth0 10.101.129.121）"
+  [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
 else
   ssh "${SSH_OPTS[@]}" "pi@$HOST" true || die "連不到 pi@$HOST"
 fi
