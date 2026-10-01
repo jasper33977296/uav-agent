@@ -13,6 +13,29 @@
 set -u
 FLAG=${SYNC_FLAG:-/run/systemd/timesync/synchronized}   # SYNC_FLAG 只給測試用
 WAIT=${SYNC_WAIT_S:-60}
+DROPIN=${SYNC_DROPIN:-/etc/systemd/timesyncd.conf.d/50-gs.conf}
+
+# ── 對時位址跟著 GS_HOST 走（2026-10-01）──────────────────────────────
+# **寫死的下場看過了，而且代價是整天的研究資料。** 那天地面站換了 IP，
+# timesyncd 還指著更早之前的位址，於是：對不到時 → 時鐘停在 7 天前 →
+# 每一筆訊號樣本都帶著 7 天前的時戳 → 地面站用時間區間歸屬，**對不到任何
+# 架次，整批當成「架次外」丟掉** → 11 趟飛行的採樣一筆都沒進資料庫。
+# 而全程只有機上日誌裡的一行。
+#
+# GS_HOST 本來就是「地面站在哪」的單一事實源（遙測與記錄通道都用它），
+# 對時沒有理由自己記一份。
+if [ -n "${GS_HOST:-}" ]; then
+  want="[Time]
+NTP=${GS_HOST}
+"
+  if [ "$(cat "$DROPIN" 2>/dev/null)" != "$want" ]; then
+    mkdir -p "$(dirname "$DROPIN")"
+    printf '%s' "$want" > "$DROPIN"
+    echo "對時：NTP 位址改成 ${GS_HOST}（跟著 GS_HOST，不另外記一份）"
+    systemctl --no-block restart systemd-timesyncd 2>/dev/null || true
+    rm -f "$FLAG" 2>/dev/null || true     # 換了伺服器，舊的「已對過」不算數
+  fi
+fi
 
 if [ -e "$FLAG" ]; then
   echo "對時：已對過（$(date '+%F %T')），不必等"
