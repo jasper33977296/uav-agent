@@ -24,7 +24,7 @@ WorkingDirectory=/opt/uav-agent
 # 以及機上對時要問誰（wait-time-sync.sh 會照它寫 timesyncd 的 drop-in）。
 # 地面站換 IP 時改這裡一處就好——2026-10-01 的教訓是對時位址另外寫死在
 # timesyncd 裡，結果時鐘停了 7 天而沒人發現，整天的採樣被當成「架次外」丟掉。
-Environment=GS_HOST=10.141.2.6
+Environment=GS_HOST=10.141.2.4
 Environment=FC_DEV=/dev/ttyAMA0
 # 這個代理只綁這個 sysid 的飛控；飛控從其他 MAVLink 埠轉過來的別台機一律不轉發
 Environment=FC_SYSID=1
