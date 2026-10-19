@@ -11,3 +11,4 @@ state.json
 .fc_binding.json.tmp
 # 每台機的連線帳密：只留在開發機，不進 git
 drone-*.env
+machine.env
