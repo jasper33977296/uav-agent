@@ -2,13 +2,25 @@
 # 把這個 repo 的代理部署到機上的 Pi（uav-system issues/069）。**在開發機上跑。**
 #
 #   ./deploy.sh              # 部署目前的 commit
-#   ./deploy.sh --dry-run    # 只看：閘門判定、哪些檔會變、unit 有沒有差——不動機上
+#   ./deploy.sh --host <addr># 指定哪台。**空機也是這一行**（見下）
+#   ./deploy.sh --dry-run    # 只看：dongle、閘門判定、哪些檔會變、unit 有沒有差——不動機上
 #   ./deploy.sh --rollback   # 還原上一次部署前的備份並重啟
 #
 # 其他選項：
-#   --host <addr>   指定 Pi（預設依序試 UAV_PI、10.141.2.32、10.101.129.121）
+#   --host <addr>   指定 Pi（預設依序試 UAV_PI、地面站學到的、10.141.2.32、10.101.129.121）。
+#                   IPv6 本地位址也行：--host 'fe80::...%eno2'
 #   --dirty         工作目錄有未提交的改動也照部署（DEPLOYED 會標 dirty）
-#   --pip           requirements.txt 有變時順便 pip install（機上要有網路）
+#   UAV_PI_PASS=…   第一次連一台新機時用的密碼（裝好 SSH 金鑰之後就不再需要）。
+#                   不給的話 ssh-copy-id 會在終端機上問
+#
+# **一鍵：空機與舊機同一行指令**（2026-10-19 使用者要求）。機上沒有 venv＝空機，
+# 會先做初次安裝：裝 SSH 金鑰與免密碼 sudo → 傳程式 → **在開發機下載相依套件
+# 再推上去**（機上不需要網路）→ 建 venv → 跑 install-service.sh（開機設定、
+# 日誌、服務、對時）→ 需要的話重開機並等它回來 → 接著走一般部署與驗收。
+#
+# **5G dongle 沒過就不部署**（使用者 2026-10-19）：動機上任何東西之前先跑
+# tools/dongle-check.py（USB、網卡、經 5G 到地面站、AT 埠量得到訊號），驗收時
+# 也要代理自己真的量到訊號。這台機的用途就是經 5G 跟地面站講話、同時量 5G。
 #
 # 為什麼要有這支（069）：以前每次都是手動 scp＋手動 md5 比一個檔，機上說不出跑的是
 # 哪個 commit，解鎖中不准重啟也全靠人記得。這支把那六個手動步驟變成固定的順序：
@@ -21,8 +33,9 @@
 #   4. rsync **git 追蹤的檔案**。不刪任何東西、不碰 state.json／.fc_sysid／venv
 #   5. unit 有差：只裝 unit（備份舊的、daemon-reload），**不碰 config.txt**
 #      ——那是 install-service.sh 的事
-#   6. requirements.txt 有變：停下來，除非 --pip
-#   7. 寫 DEPLOYED、重啟、逐檔比 md5、等狀態列出現並驗收
+#   6. requirements.txt 有變：在開發機下載套件推上去裝（機上不必有網路）
+#   7. install-service.sh（可重跑；系統設定收斂到 repo 的版本，要重開機才重開）
+#   8. 寫 DEPLOYED、重啟、逐檔比 md5、等狀態列出現並驗收（含 5G 取樣）
 #
 # **驗收失敗不自動回滾**：自動回滾會把「新版哪裡不對」的現場蓋掉。失敗時印出
 # 回滾指令，由人決定。
@@ -41,7 +54,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --rollback) ROLLBACK=1 ;;
     --dirty) DIRTY_OK=1 ;;
-    --pip) PIP=1 ;;
+    --pip) PIP=1 ;;     # 舊選項：現在相依有變一律自動裝，留著不報錯
     --host) HOST="$2"; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "不認得的選項：$1" >&2; exit 2 ;;
@@ -67,7 +80,7 @@ if ! git diff --quiet HEAD -- || [ -n "$(git ls-files --others --exclude-standar
 fi
 say "   commit $COMMIT$([ "$DIRTY" = true ] && echo '（dirty）')"
 
-SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
+SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
 # 機上位址**先問地面站**（2026-10-01）。指令服務會從實際收到的封包學對端位址
 # 並寫進 peers.json——那是「這台機現在在哪」的事實源，而寫死的清單不是。
@@ -96,11 +109,60 @@ if [ -z "$HOST" ]; then
     fi
   done
   [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
-else
-  ssh "${SSH_OPTS[@]}" "pi@$HOST" true || die "連不到 pi@$HOST"
+elif ! ssh "${SSH_OPTS[@]}" "pi@$HOST" true 2>/dev/null; then
+  # **新機第一次連**：還沒有金鑰。裝一次，之後全程免密碼
+  # 先分清楚是「要密碼」還是「根本連不到」——後者裝金鑰也沒用
+  WHY=$(ssh "${SSH_OPTS[@]}" "pi@$HOST" true 2>&1 || true)
+  case "$WHY" in *"Permission denied"*) ;; *)
+    die "連不到 pi@$HOST（不是密碼的問題——位址、網路線、SSH 有沒有開）：$WHY" ;; esac
+  say "   pi@$HOST 還沒有這台開發機的金鑰——裝一次（ssh-copy-id）"
+  [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+  if [ -n "${UAV_PI_PASS:-}" ]; then
+    AP=$(mktemp); trap 'rm -f "$AP"' EXIT
+    printf '#!/bin/sh\nprintf "%%s\\n" "$UAV_PI_PASS"\n' > "$AP"; chmod +x "$AP"
+    UAV_PI_PASS="$UAV_PI_PASS" SSH_ASKPASS="$AP" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+      setsid ssh-copy-id -o StrictHostKeyChecking=accept-new "pi@$HOST" </dev/null >/dev/null 2>&1 \
+      || die "UAV_PI_PASS 登不進 pi@$HOST（帳號要是 pi：unit 以 pi 執行）"
+  else
+    ssh-copy-id -o StrictHostKeyChecking=accept-new "pi@$HOST" \
+      || die "裝金鑰失敗。沒有終端機可以問密碼的話，用 UAV_PI_PASS=… ./deploy.sh --host $HOST"
+  fi
+  ssh "${SSH_OPTS[@]}" "pi@$HOST" true || die "金鑰裝了還是連不到 pi@$HOST"
 fi
 say "   Pi：$HOST"
 R() { ssh "${SSH_OPTS[@]}" "pi@$HOST" "$@"; }
+# rsync 的目的地：IPv6 位址要加中括號
+case "$HOST" in *:*) RT="pi@[$HOST]" ;; *) RT="pi@$HOST" ;; esac
+
+# **免密碼 sudo**：重啟服務、裝 unit、改開機設定都要，而部署中途沒辦法問密碼。
+# Raspberry Pi Imager 建的第一個帳號通常已經有；沒有就用 UAV_PI_PASS 補一次
+if ! R "sudo -n true" 2>/dev/null; then
+  [ -n "${UAV_PI_PASS:-}" ] || die "pi 在 $HOST 上的 sudo 要密碼。用 UAV_PI_PASS=… 重跑，會設成免密碼"
+  printf '%s\n' "$UAV_PI_PASS" | R "sudo -S -p '' sh -c 'echo \"pi ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/010_pi-nopasswd && chmod 440 /etc/sudoers.d/010_pi-nopasswd'" \
+    && R "sudo -n true" || die "設定免密碼 sudo 失敗"
+  say "   已設 pi 免密碼 sudo"
+fi
+FRESH=0
+R "test -x $DEST/venv/bin/python" || FRESH=1
+[ "$FRESH" = 1 ] && say "   **空機**（沒有 $DEST/venv）→ 這次會先做初次安裝"
+
+# ── 1b. 5G dongle ────────────────────────────────────────────
+# 參數：repo unit 的預設值，被機上 /etc/uav-agent.env 蓋過（與 systemd 同一個規則）
+envval() {
+  local k=$1 v
+  v=$(R "sed -n 's/^$k=//p' /etc/uav-agent.env 2>/dev/null | tail -1" || true)
+  [ -n "$v" ] || v=$(sed -n "s/^Environment=$k=//p" systemd/uav-agent.service)
+  printf '%s' "$v"
+}
+dongle_check() {
+  step "$1"
+  local gs port
+  gs=$(envval GS_HOST); port=$(envval MODEM_PORT)
+  [ -n "$port" ] || die "沒有設 MODEM_PORT——代理不會量 5G，不部署"
+  R "python3 - --gs '$gs' --port '$port' --state '$DEST/state.json'" < tools/dongle-check.py \
+    || die "5G dongle 沒過——**不部署**（程式、服務、系統設定都還沒動）。修好再跑；dongle 的 AT 埠不是 $port 的話寫進機上 /etc/uav-agent.env"
+}
+dongle_check "1b. 5G dongle"
 
 # ── 2. 解鎖閘門 ───────────────────────────────────────────────
 step "2. 解鎖閘門"
@@ -147,12 +209,13 @@ LIST=$(mktemp); trap 'rm -f "$LIST"' EXIT
 git ls-files > "$LIST"
 N=$(wc -l < "$LIST")
 say "   git 追蹤的 $N 個檔（不刪機上任何東西；不碰 state.json／.fc_sysid／venv）"
-CHANGES=$(rsync -ani --checksum --files-from="$LIST" ./ "pi@$HOST:$DEST/" | grep -E '^[<>c]' || true)
+if [ "$FRESH" = 1 ]; then CHANGES="（空機：全部 $N 個檔）"; else
+CHANGES=$(rsync -ani --checksum --files-from="$LIST" ./ "$RT:$DEST/" | grep -E '^[<>c]' || true); fi
 if [ -z "$CHANGES" ]; then say "   沒有檔案不同"; else printf '%s\n' "$CHANGES" | sed 's/^/   /'; fi
 
 # ── 4. unit ──────────────────────────────────────────────────
 step "4. systemd unit"
-UNIT_DIFF=$(R "cat $UNIT" | diff - systemd/uav-agent.service || true)
+UNIT_DIFF=$(R "cat $UNIT 2>/dev/null" | diff - systemd/uav-agent.service || true)
 if [ -z "$UNIT_DIFF" ]; then say "   與 repo 相同"; else
   say "   **與 repo 不同**（部署時會裝上 repo 那份，舊的留備份）："
   printf '%s\n' "$UNIT_DIFF" | sed 's/^/     /'
@@ -165,15 +228,49 @@ REQ_LOCAL=$(sha256sum requirements.txt | cut -c1-16)
 REQ_REMOTE=$(R "if [ -f $DEST/requirements.txt ]; then sha256sum $DEST/requirements.txt | cut -c1-16; else echo none; fi") \
   || die "讀機上的 requirements.txt 時 ssh 失敗——Pi 可能剛斷線，機上沒有任何改動，稍後重跑"
 if [ "$REQ_LOCAL" = "$REQ_REMOTE" ]; then say "   沒變"; else
-  say "   **變了**（機上 ${REQ_REMOTE:-無} → $REQ_LOCAL）"
-  if [ "$PIP" = 0 ] && [ "$DRY" = 0 ]; then
-    die "相依有變。機上現場不一定有網路——確認後用 --pip 重跑（會在 venv 裡 pip install -r）"
-  fi
+  say "   **變了**（機上 ${REQ_REMOTE:-無} → $REQ_LOCAL）→ 在開發機下載套件推上去裝（機上不必有網路）"
 fi
 
 if [ "$DRY" = 1 ]; then
+  [ "$FRESH" = 1 ] && say "" && say "   空機：實際部署時會先建 $DEST、推相依套件、建 venv、跑 install-service.sh（可能重開機）"
   step "--dry-run：到此為止，機上沒有任何改動"
   exit 0
+fi
+
+# 相依套件：**在開發機下載、推上去裝**。機上現場常常沒有網路（5G 只通地面站），
+# 而 pymavlink／lxml 有編譯過的部分，要照機上的 Python 版本與 CPU 挑對的 wheel
+push_wheels() {
+  local pyv arch cache
+  pyv=$(R "python3 -c 'import sys;print(\"%d.%d\" % sys.version_info[:2])'")
+  arch=$(R "uname -m")
+  [ "$arch" = aarch64 ] || die "機上是 $arch，這裡只準備了 aarch64 的套件"
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/uav-agent-wheels/py$pyv"
+  mkdir -p "$cache"
+  python3 -m pip download -q --dest "$cache" --only-binary=:all: \
+    --platform manylinux2014_aarch64 --platform manylinux_2_17_aarch64 \
+    --platform manylinux_2_28_aarch64 --platform any --python-version "$pyv" \
+    -r requirements.txt pip \
+    || die "下載相依套件失敗（開發機要能上網，或 $cache 裡已經有）"
+  rsync -a --delete "$cache"/ "$RT:$DEST/.wheels/"
+  say "   相依套件（Python $pyv／$arch）已推上去：$(ls "$cache" | wc -l) 個 wheel"
+}
+
+if [ "$FRESH" = 1 ]; then
+  step "6a. 初次安裝"
+  R "command -v rsync >/dev/null" || R "sudo apt-get install -y -q rsync" \
+    || die "機上沒有 rsync，也裝不起來（沒網路）"
+  R "sudo install -d -o pi -g pi $DEST"
+  rsync -a --files-from="$LIST" ./ "$RT:$DEST/"
+  say "   程式已傳到 $DEST"
+  push_wheels
+  # Debian 把 venv 的 ensurepip 拆成另一個套件；沒裝的話用推上去的 pip wheel 自己補
+  R "cd $DEST && (python3 -m venv venv 2>/dev/null || { rm -rf venv && python3 -m venv --without-pip venv \
+       && W=\$(ls .wheels/pip-*.whl | head -1) && venv/bin/python \$W/pip install -q --no-index \$W; })" \
+    || die "建 venv 失敗"
+  R "$DEST/venv/bin/pip install -q --no-index --find-links $DEST/.wheels -r $DEST/requirements.txt" \
+    || die "裝相依套件失敗"
+  say "   venv 已建好：$(R "$DEST/venv/bin/python -c 'import pymavlink, serial, websocket; print(\"pymavlink\", pymavlink.__version__ if hasattr(pymavlink, \"__version__\") else \"ok\")'")"
+  REQ_REMOTE=$REQ_LOCAL
 fi
 
 # ── 6. 備份、傳送、裝 unit ───────────────────────────────────
@@ -185,25 +282,50 @@ R "set -e; mkdir -p '$BAK'; cd '$DEST'; \
    [ -f DEPLOYED ] && cp DEPLOYED '$BAK/DEPLOYED.prev' || true" < "$LIST"
 say "   備份：$BAK（機上原本的 $OLD）"
 R "ls -1d $DEST/.bak-deploy-* | sort | head -n -$KEEP | xargs -r rm -rf"
-rsync -a --checksum --files-from="$LIST" ./ "pi@$HOST:$DEST/"
+rsync -a --checksum --files-from="$LIST" ./ "$RT:$DEST/"
 say "   已傳送"
 if [ -n "$UNIT_DIFF" ]; then
   R "set -e; sudo cp $UNIT $UNIT.bak-$(date +%Y%m%d-%H%M%S); \
      sudo install -m 0644 $DEST/systemd/uav-agent.service $UNIT; sudo systemctl daemon-reload"
   say "   unit 已更新並 daemon-reload（舊的留在 $UNIT.bak-*）"
 fi
-if [ "$REQ_LOCAL" != "$REQ_REMOTE" ] && [ "$PIP" = 1 ]; then
-  R "$DEST/venv/bin/pip install -q -r $DEST/requirements.txt" || die "pip install 失敗——程式已傳上去但還沒重啟；要回到舊版用 ./deploy.sh --rollback"
+if [ "$REQ_LOCAL" != "$REQ_REMOTE" ]; then
+  push_wheels
+  R "$DEST/venv/bin/pip install -q --no-index --find-links $DEST/.wheels -r $DEST/requirements.txt" \
+    || die "pip install 失敗——程式已傳上去但還沒重啟；要回到舊版用 ./deploy.sh --rollback"
 fi
+
+# ── 7. 系統設定 ──────────────────────────────────────────────
+# 每次都跑：它可以重跑、已經對的就跳過，於是每台機的系統設定都收斂到 repo 這一版
+# ——第一台機上那兩項手動修的設定，就是因為不在任何會重跑的地方才會漏
+step "7. 系統設定（install-service.sh）"
+SVC_OUT=$(R "sudo $DEST/install-service.sh") || { printf '%s\n' "$SVC_OUT" | sed 's/^/   /'; die "install-service.sh 失敗"; }
+printf '%s\n' "$SVC_OUT" | grep -v '^REBOOT_NEEDED$' | sed 's/^/   /'
+REBOOT=0; printf '%s\n' "$SVC_OUT" | grep -qx REBOOT_NEEDED && REBOOT=1
 BY="$(git config user.name 2>/dev/null || whoami)@$(hostname)"
 R "cat > $DEST/DEPLOYED" <<EOF
 {"commit": "$COMMIT", "dirty": $DIRTY, "at": "$(date -Is)", "by": "$BY", "files": $N}
 EOF
 
-# ── 7. 重啟與驗收 ────────────────────────────────────────────
-step "7. 重啟與驗收"
+# ── 8. 重啟與驗收 ────────────────────────────────────────────
+step "8. 重啟與驗收"
 T0=$(R "date '+%Y-%m-%d %H:%M:%S'")
-R "sudo systemctl restart uav-agent"
+JSEL="--since '$T0'"
+if [ "$REBOOT" = 1 ]; then
+  # 開機設定要重開才生效。**重開後用 -b 取日誌**：這台沒有 RTC 電池，開機時鐘
+  # 停在上次關機那一刻、對時後才跳，拿重開前的時間去 --since 會漏
+  say "   開機設定有改 → 重開機（解鎖閘門已經過了）"
+  R "sudo systemctl reboot" || true
+  sleep 15
+  for i in $(seq 1 30); do R true 2>/dev/null && break; sleep 5; done
+  R true || die "重開機後 150 秒還連不回 $HOST——去機旁看一下"
+  say "   已重開回來（$(R uptime -p)）"
+  JSEL="-b"
+  VERIFY_WAIT_S=150      # 開機要等對時（最多 60 秒）、5G 註冊
+else
+  R "sudo systemctl restart uav-agent"
+  [ "$FRESH" = 1 ] && VERIFY_WAIT_S=120
+fi
 FAIL=0
 LOCAL_SUM=$(xargs -a "$LIST" -d '\n' md5sum | sort -k2)
 REMOTE_SUM=$(R "cd $DEST && xargs -d '\n' md5sum" < "$LIST" | sort -k2)
@@ -224,6 +346,14 @@ checks = [
     (True if (s.get("intent") or {}).get("up") else None, "意圖通道連上地面站",
      f"up={(s.get('intent') or {}).get('up')}"),
 ]
+# **5G 取樣是硬條件**（使用者 2026-10-19）：等到最後還沒量到＝✗，不是「…」。
+# 飛控那格可以是「…」（桌上裝機時常常還沒接飛控），5G 不行
+m = s.get("modem")
+sig = bool(m) and m.get("samples", 0) > 0 and (m.get("rsrp") is not None or m.get("sinr") is not None)
+mok = True if sig else (False if (m is None or final) else None)
+checks.append((mok, "代理量得到 5G",
+               "沒有在取樣（MODEM_PORT？）" if m is None else
+               f"取樣 {m.get('samples')} 次、失敗 {m.get('errors')}、RSRP {m.get('rsrp')} SINR {m.get('sinr')}"))
 if final or all(c[0] is True for c in checks):
     for ok, label, note in checks:
         print(f"   {'✓' if ok is True else ('…' if ok is None else '✗')} {label}｜{note}")
@@ -233,7 +363,7 @@ EOF
 )
 LINE=""; RC=2
 for i in $(seq 1 $VERIFY_WAIT_S); do
-  LINE=$(R "journalctl -u uav-agent --since '$T0' --no-pager -o cat | grep ' 狀態 {' | tail -1" || true)
+  LINE=$(R "journalctl -u uav-agent $JSEL --no-pager -o cat | grep ' 狀態 {' | tail -1" || true)
   if [ -n "$LINE" ]; then
     FINAL=0; [ "$i" = "$VERIFY_WAIT_S" ] && FINAL=1
     set +e; python3 -c "$EVAL" "$LINE" "$COMMIT" "$FINAL"; RC=$?; set -e
@@ -243,7 +373,7 @@ for i in $(seq 1 $VERIFY_WAIT_S); do
 done
 if [ -z "$LINE" ]; then
   say "   ✗ ${VERIFY_WAIT_S} 秒內沒有出現狀態列"
-  R "systemctl is-active uav-agent; journalctl -u uav-agent --since '$T0' --no-pager -o cat | tail -15" | sed 's/^/     /'
+  R "systemctl is-active uav-agent; journalctl -u uav-agent $JSEL --no-pager -o cat | tail -15" | sed 's/^/     /'
   FAIL=1
 elif [ "$RC" = 2 ]; then
   python3 -c "$EVAL" "$LINE" "$COMMIT" 1 || true; FAIL=1
@@ -254,7 +384,7 @@ elif [ "$RC" = 3 ]; then
 fi
 
 if [ "$FAIL" = 0 ]; then
-  say ""; say "✓ 部署完成：$COMMIT$([ "$DIRTY" = true ] && echo '（dirty）') → pi@$HOST:$DEST"
+  say ""; say "✓ 部署完成：$COMMIT$([ "$DIRTY" = true ] && echo '（dirty）') → pi@$HOST:$DEST$([ "$FRESH" = 1 ] && echo '（初次安裝）')"
 else
   say ""; say "✗ 驗收沒過。**沒有自動回滾**（保留現場）。要回到上一版：./deploy.sh --rollback"
   exit 1

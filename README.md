@@ -184,35 +184,38 @@ RC 狀態讀 `SYS_STATUS` 的 `MAV_SYS_STATUS_SENSOR_RC_RECEIVER` present／heal
 
 ---
 
-## 安裝
+## 安裝與部署（一鍵，開發機上跑）
 
-代理住在 **`/opt/uav-agent`**（不是家目錄——搬出來是為了不被誤刪：家目錄裡看不到，
-刪掉整個目錄也要 sudo）。錄製 spool 在 **`/opt/uav-record`**。
-
-```bash
-sudo git clone <this-repo> /opt/uav-agent && sudo chown -R pi:pi /opt/uav-agent
-cd /opt/uav-agent
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-sudo ./install-service.sh          # UART overlay + systemd unit
-# 部署參數改 systemd/uav-agent.service 的 Environment= 行，不要改程式碼
-sudo systemctl start uav-agent && journalctl -u uav-agent -f
-sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
-```
-
-## 部署（開發機 → Pi，uav-system issues/069）
+**空機與已裝好的機是同一行指令**（2026-10-19）：
 
 ```bash
-./deploy.sh --dry-run    # 先看：解鎖閘門、哪些檔會變、unit 有沒有差（不動機上）
-./deploy.sh              # 部署目前的 commit（工作目錄要乾淨，否則 --dirty）
-./deploy.sh --rollback   # 還原上一次部署前的備份
+./deploy.sh --host <Pi 位址> --dry-run     # 先看（不動機上）
+UAV_PI_PASS=<密碼> ./deploy.sh --host <Pi 位址>   # 空機第一次；之後不必給密碼
+./deploy.sh                                # 已裝好的機（位址先問地面站）
+./deploy.sh --rollback                     # 還原上一次部署前的備份
 ```
 
-**不要再手動 scp。** 腳本只傳 git 追蹤的檔、不刪機上任何東西、不碰 `state.json`／
-`.fc_sysid`／`.fc_binding.json`／venv；代理在跑時要 `state.json` 新鮮且未解鎖才重啟（不知道就中止）；
-unit 有差只裝 unit（`config.txt` 仍是 `install-service.sh` 的事）；`requirements.txt`
-有變要 `--pip`。部署後機上的 `DEPLOYED` 記著 commit，代理開機時 log 出來、狀態列帶
-`deployed`——**「機上跑的是哪一版」從此有答案**。驗收失敗不自動回滾，保留現場。
+順序固定，任何一步沒過就停：
+
+1. 連線：沒有金鑰就用 `UAV_PI_PASS` 裝一次（或在終端機上問）；`pi` 的 sudo 要密碼就設成免密碼。
+   **帳號要是 `pi`**（unit 以 `pi` 執行）
+2. **5G dongle**（`tools/dongle-check.py`）：USB 在、網卡有 IPv4、**從 5G 那張** ping 得到地面站、
+   AT 埠量得到訊號。**沒過就不部署**——這台機的用途就是經 5G 跟地面站講話、同時量 5G
+3. 解鎖閘門：代理在跑時 `state.json` 要新鮮且未解鎖（不知道就中止）
+4. 空機：建 `/opt/uav-agent`、**在開發機下載相依套件推上去**（機上不必有網路）、建 venv
+5. 傳 git 追蹤的檔（不刪機上任何東西；不碰 `state.json`／`.fc_sysid`／`.fc_binding.json`／venv），
+   相依有變就照第 4 步的方式裝
+6. `install-service.sh`（**每次都跑，可重跑**）：UART overlay、USB 供電上限、日誌持久化、
+   unit、開機自啟、對時。改到 `config.txt` 就重開機並等它回來
+7. 重啟、逐檔比 md5、驗收：commit 對、獨佔飛控序列埠、意圖通道、**代理量得到 5G**（硬條件）。
+   飛控那格可以是「…」（桌上裝機時常常還沒接飛控）
+
+**每台機不同的參數放機上 `/etc/uav-agent.env`**（例如 `MODEM_PORT=/dev/ttyUSB2`），不要改 unit——
+unit 是所有機共用的一份，每次部署都會裝回 repo 的版本；那個檔部署不碰，而且蓋過 unit 的預設值。
+
+代理住在 **`/opt/uav-agent`**、錄製 spool 在 **`/opt/uav-record`**（不放家目錄：躲誤刪）。
+部署後機上的 `DEPLOYED` 記著 commit，代理開機時 log 出來、狀態列帶 `deployed`。
+驗收失敗不自動回滾，保留現場。
 
 ## 一個代理只綁一塊飛控板（uav-system issues/076）
 
@@ -282,8 +285,9 @@ python3 fc-rebind.py --release --reason "…" --fc-sysid 3   # 新飛控的號�
 | `tools/upload-flow.py` | 回傳的**時機**：飛行中不傳、半路起飛就停、續傳、限速 |
 | `tools/fc-binding-flow.py` | 綁定：熱插拔換飛控、armed 不切、更換流程、錄檔歸屬 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
-| `deploy.sh` | **開發機上跑**：部署到 Pi（見〈部署〉） |
-| `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
+| `deploy.sh` | **開發機上跑**：一鍵安裝／部署到 Pi（見〈安裝與部署〉） |
+| `tools/dongle-check.py` | 5G dongle 檢查（只用標準函式庫；部署前在機上跑） |
+| `systemd/uav-agent.service` | 服務定義（所有機共用的預設值；單機的值放 `/etc/uav-agent.env`） |
 | `reference/` | Fibocom AT 指令手冊與欄位對照表 |
 
 ## 事件要送到哪裡（uav-system issues/057）

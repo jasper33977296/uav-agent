@@ -51,6 +51,9 @@ Environment=RECORD_UPLOAD_KBPS=256
 Environment=RECORD_UPLOAD_SETTLE_S=20
 # 錄製 spool 也搬出家目錄（躲誤刪）；預設 /home/pi/uav-record 被這行覆蓋
 Environment=RECORD_DIR=/opt/uav-record
+# **每台機自己的值放 /etc/uav-agent.env**（install-service.sh 建的，deploy.sh 不碰），
+# 它蓋過上面這些預設——這份 unit 是所有機共用的，deploy 每次都會裝回 repo 的版本
+EnvironmentFile=-/etc/uav-agent.env
 
 # **啟動前先對時**（uav-system 070，2026-09-22 使用者裁定）。`+`＝這一步以 root 跑
 # （要重啟 timesyncd），代理本身仍是 pi。已對過就立刻過；沒對過最多等 60 秒，
