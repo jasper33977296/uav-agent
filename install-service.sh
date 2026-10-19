@@ -35,11 +35,10 @@ echo "== 3. 時間跟地面站對齊 =="
 # 否則對不齊。只跟地面站對時、不退回網路上的伺服器：兩邊各自對到不同來源，
 # 實測就差了 0.58 秒（2026-09-14）。地面站的 ntpsec 開著 orphan 模式，
 # 現場沒有網路時仍然會給時間
-GS=$(sed -n 's/^Environment=GS_HOST=//p' "$HERE/systemd/uav-agent.service")
-mkdir -p /etc/systemd/timesyncd.conf.d
-printf '[Time]\nNTP=%s\nFallbackNTP=\n' "$GS" > /etc/systemd/timesyncd.conf.d/uav-gs.conf
-systemctl restart systemd-timesyncd
-echo "   /etc/systemd/timesyncd.conf.d/uav-gs.conf：NTP=$GS"
+# 設定檔由 systemd/wait-time-sync.sh 每次代理啟動時照 GS_HOST 寫（50-gs.conf），
+# 這裡不另寫一份——另寫的那份會寫死安裝當下的位址，而 NTP= 在 drop-in 之間是累加的
+GS_HOST=$(sed -n 's/^Environment=GS_HOST=//p' "$HERE/systemd/uav-agent.service") \
+  SYNC_WAIT_S=0 "$HERE/systemd/wait-time-sync.sh"
 
 echo
 echo "== 4. 完成。尚未啟動 =="

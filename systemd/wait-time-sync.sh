@@ -14,6 +14,8 @@ set -u
 FLAG=${SYNC_FLAG:-/run/systemd/timesync/synchronized}   # SYNC_FLAG 只給測試用
 WAIT=${SYNC_WAIT_S:-60}
 DROPIN=${SYNC_DROPIN:-/etc/systemd/timesyncd.conf.d/50-gs.conf}
+#: install-service.sh 早期另寫的一份（寫死安裝當下的 GS_HOST）
+LEGACY=${SYNC_LEGACY:-/etc/systemd/timesyncd.conf.d/uav-gs.conf}
 
 # ── 對時位址跟著 GS_HOST 走（2026-10-01）──────────────────────────────
 # **寫死的下場看過了，而且代價是整天的研究資料。** 那天地面站換了 IP，
@@ -24,14 +26,32 @@ DROPIN=${SYNC_DROPIN:-/etc/systemd/timesyncd.conf.d/50-gs.conf}
 #
 # GS_HOST 本來就是「地面站在哪」的單一事實源（遙測與記錄通道都用它），
 # 對時沒有理由自己記一份。
+#
+# 2026-10-19 兩個洞：
+#   * 比對永遠不相等——`$(cat)` 會吃掉結尾換行，而 want 帶著換行。於是**每次**
+#     代理重啟都當成換了伺服器：重寫、重啟 timesyncd、刪掉「已對過」旗標。地面站
+#     那一刻連不到的話，一台早就對好時的機會被自己打回 clock_synced=false。
+#   * 舊的 uav-gs.conf 還在。timesyncd 的 NTP= 在多個 drop-in 之間是**累加**的，
+#     所以伺服器清單是「新位址＋安裝當下的舊位址」，連不到新的就去試舊的
+#     （當天日誌：.22 逾時 → 換試 .21）。這份由這裡全權負責，舊的刪掉，
+#     FallbackNTP= 一併搬過來（不退回網路上的伺服器，見 install-service.sh）。
 if [ -n "${GS_HOST:-}" ]; then
   want="[Time]
 NTP=${GS_HOST}
-"
+FallbackNTP="
+  changed=0
   if [ "$(cat "$DROPIN" 2>/dev/null)" != "$want" ]; then
     mkdir -p "$(dirname "$DROPIN")"
-    printf '%s' "$want" > "$DROPIN"
+    printf '%s\n' "$want" > "$DROPIN"
     echo "對時：NTP 位址改成 ${GS_HOST}（跟著 GS_HOST，不另外記一份）"
+    changed=1
+  fi
+  if [ -e "$LEGACY" ]; then
+    echo "對時：刪掉舊的 $(basename "$LEGACY")（$(grep -h '^NTP=' "$LEGACY" 2>/dev/null)）——NTP= 會累加，留著就會去試舊位址"
+    rm -f "$LEGACY"
+    changed=1
+  fi
+  if (( changed )); then
     systemctl --no-block restart systemd-timesyncd 2>/dev/null || true
     rm -f "$FLAG" 2>/dev/null || true     # 換了伺服器，舊的「已對過」不算數
   fi
