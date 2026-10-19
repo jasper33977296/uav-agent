@@ -2,7 +2,7 @@
 # 把這個 repo 的代理部署到機上的 Pi（uav-system issues/069）。**在開發機上跑。**
 #
 #   ./deploy.sh              # 部署目前的 commit
-#   ./deploy.sh --env drone-e.env   # 空機：照填好的安裝資訊從頭裝（見下）
+#   ./deploy.sh --env drone-e.env   # 空機：精靈帶著填安裝資訊（找得到的給你確認），再從頭裝
 #   ./deploy.sh --dry-run    # 只看：dongle、閘門判定、哪些檔會變、unit 有沒有差——不動機上
 #   ./deploy.sh --rollback   # 還原上一次部署前的備份並重啟
 #
@@ -71,13 +71,19 @@ die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 # ── 0. 這台機的安裝資訊 ──────────────────────────────────────
 # **填好才開始**（使用者 2026-10-19）：機密與必要參數全部填齊之前什麼都不做——
 # 裝到一半才發現少一個值，機上會停在一個半套的狀態。欄位見 drone.env.example
-REQUIRED=(UAV_PI_HOST UAV_PI_USER UAV_PI_PASS GS_HOST MODEM_PORT FC_SYSID)
+REQUIRED=(UAV_PI_HOST UAV_PI_USER UAV_PI_PASS GS_HOST MODEM_PORT FC_SYSID FC_BAUD)
 #: 寫進機上 /etc/uav-agent.env 的那幾欄（蓋過 unit 的共用預設）
-MACHINE_KEYS=(GS_HOST MODEM_PORT FC_SYSID)
+MACHINE_KEYS=(GS_HOST MODEM_PORT FC_SYSID FC_BAUD)
 cd "$HERE"
 if [ -n "$ENVFILE" ]; then
   step "0. 安裝資訊（$ENVFILE）"
-  [ -f "$ENVFILE" ] || die "找不到 $ENVFILE——從 drone.env.example 複製一份填好"
+  # **有終端機就走精靈**（tools/env-wizard.py）：只有人知道的（帳密）用問的，
+  # 找得到的（Pi 在哪、地面站、AT 埠、飛控 sysid）先找好給人確認。找的時候只讀，
+  # 人確認之前機上什麼都沒動。沒有終端機（自動化）就照檔案，缺欄位一樣停
+  if [ -t 0 ]; then
+    python3 tools/env-wizard.py "$ENVFILE" || die "安裝資訊沒有確認——**什麼都還沒做**"
+  fi
+  [ -f "$ENVFILE" ] || die "找不到 $ENVFILE——在終端機上跑會有精靈帶著填，或從 drone.env.example 複製一份填好"
   case "$ENVFILE" in /*) ;; *) ENVFILE="./$ENVFILE" ;; esac
   set -a; . "$ENVFILE"; set +a
   MISSING=()
@@ -168,7 +174,7 @@ fi
 FRESH=0
 R "test -x $DEST/venv/bin/python" || FRESH=1
 if [ "$FRESH" = 1 ]; then
-  [ -n "$ENVFILE" ] || die "這是空機（沒有 $DEST/venv）。初次安裝要先填好安裝資訊：cp drone.env.example drone-<代號>.env，填完用 --env 跑"
+  [ -n "$ENVFILE" ] || die "這是空機（沒有 $DEST/venv）。初次安裝用：./deploy.sh --env drone-<代號>.env（檔案不存在也行，精靈會帶著填）"
   say "   **空機**（沒有 $DEST/venv）→ 這次會先做初次安裝"
 fi
 

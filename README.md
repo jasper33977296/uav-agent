@@ -189,12 +189,17 @@ RC 狀態讀 `SYS_STATUS` 的 `MAV_SYS_STATUS_SENSOR_RC_RECEIVER` present／heal
 **空機與已裝好的機是同一行指令**（2026-10-19）：
 
 ```bash
-cp drone.env.example drone-e.env           # 空機：先把安裝資訊填好（帳密、地面站、AT 埠、sysid）
+./deploy.sh --env drone-e.env              # 空機：精靈帶著填安裝資訊，確認後從頭裝。之後也用這行更新
 ./deploy.sh --env drone-e.env --dry-run    # 先看（不動機上）
-./deploy.sh --env drone-e.env              # 從頭裝。之後也可以一直用這行更新
 ./deploy.sh                                # 已裝好的機（位址先問地面站）
 ./deploy.sh --rollback                     # 還原上一次部署前的備份
 ```
+
+**安裝資訊精靈**（`tools/env-wizard.py`，在終端機上跑 `--env` 時自動出現）：只有人知道的——帳號、
+密碼——用問的（問完立刻試登入）；找得到的——Pi 在哪（相連網段上網卡是樹莓派的鄰居）、地面站位址
+（dongle 網段上這台自己的位址）、AT 埠（屬於 dongle 且回 OK 的）、飛控 sysid（聽排針 UART 的
+HEARTBEAT）——找好帶著「怎麼找到的」給人看，Enter 接受或打別的值。**找的時候只讀**（密碼登入、
+不裝金鑰），人確認整張表之前機上什麼都沒動。已經在跑代理的機排在 Pi 候選的最後並標警告。
 
 **每一欄都填好才會開始**：`--env` 檔缺哪一欄就說哪一欄，連線都還沒連。空機沒給 `--env`
 也一樣不開始——裝到一半才發現少一個值，機上會停在半套的狀態。填好的 `drone-*.env`
