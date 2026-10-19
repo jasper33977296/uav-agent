@@ -9,3 +9,5 @@ state.json
 # 綁定的飛控板（issues/076）：每台機自己的狀態，不進版本控制
 .fc_binding.json
 .fc_binding.json.tmp
+# 每台機的連線帳密：只留在開發機，不進 git
+drone-*.env
