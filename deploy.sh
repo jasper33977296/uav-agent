@@ -249,7 +249,8 @@ if [ -z "$CHANGES" ]; then say "   沒有檔案不同"; else printf '%s\n' "$CHA
 # ── 4. unit ──────────────────────────────────────────────────
 step "4. systemd unit"
 UNIT_DIFF=$(R "cat $UNIT 2>/dev/null" | diff - systemd/uav-agent.service || true)
-if [ -z "$UNIT_DIFF" ]; then say "   與 repo 相同"; else
+if [ -z "$UNIT_DIFF" ]; then say "   與 repo 相同"
+elif ! R "test -f $UNIT"; then say "   機上還沒有 unit——會裝上 repo 那份"; else
   say "   **與 repo 不同**（部署時會裝上 repo 那份，舊的留備份）："
   printf '%s\n' "$UNIT_DIFF" | sed 's/^/     /'
 fi
@@ -318,7 +319,7 @@ R "ls -1d $DEST/.bak-deploy-* | sort | head -n -$KEEP | xargs -r rm -rf"
 rsync -a --checksum --files-from="$LIST" ./ "$RT:$DEST/"
 say "   已傳送"
 if [ -n "$UNIT_DIFF" ]; then
-  R "set -e; sudo cp $UNIT $UNIT.bak-$(date +%Y%m%d-%H%M%S); \
+  R "set -e; if [ -f $UNIT ]; then sudo cp $UNIT $UNIT.bak-$(date +%Y%m%d-%H%M%S); fi; \
      sudo install -m 0644 $DEST/systemd/uav-agent.service $UNIT; sudo systemctl daemon-reload"
   say "   unit 已更新並 daemon-reload（舊的留在 $UNIT.bak-*）"
 fi
