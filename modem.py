@@ -90,6 +90,8 @@ class ModemSampler(threading.Thread):
         self.hold_fn = hold_fn
         self.held = 0
         self._held_said = None
+        #: 還沒註冊、不知道 drone_id 而沒送的即時樣本數
+        self.live_unowned = 0
         #: **地面站確認「我收到你的遙測了」時呼叫**（issues/047 項次 6）。
         #: 這條每秒一次的通道是機上唯一能問到「我送的東西有沒有到」的地方
         #: ——順路帶回來，不必另開一個請求。
@@ -453,7 +455,19 @@ class ModemSampler(threading.Thread):
                 # 送失敗不重試——下一筆本來就會取代它（backend 註解明載此意圖）
                 if s and t_start >= self._next_live:
                     self._next_live = t_start + self.live_interval
-                    self.post(s)
+                    # **即時樣本一定要說是誰的**（2026-10-19）。原本只有記錄通道帶
+                    # drone_id，即時通道沒帶——地面站收到沒帶的就算給「主機」，
+                    # 於是第二台機（drone E）的訊號整天被畫在 drone C 身上、兩顆
+                    # dongle 的值輪流蓋，而地面站回的「上行確認」也是 drone C 的
+                    # 遙測年齡。還沒註冊（不知道自己是誰）就先不送
+                    if self.drone_id_fn:
+                        did = self.drone_id_fn()
+                        if did:
+                            self.post({**s, "drone_id": did})
+                        else:
+                            self.live_unowned += 1
+                    else:
+                        self.post(s)
                 # 記錄通道：批次、可重送。**與即時通道分開**——即時送失敗
                 # 就算了（下一秒有新的），記錄送失敗要留著
                 now = time.monotonic()
@@ -485,6 +499,7 @@ class ModemSampler(threading.Thread):
                 # 因為飛控身分不符而沒有量的拍數（076）。與 on_ground 分開：
                 # 一個是「量了但不記」，一個是「根本沒量」
                 "held": self.held, "held_why": self._held_said,
+                "live_unowned": self.live_unowned,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
                 # 實際用量（不是容量）。null＝讀不到，不是 0
