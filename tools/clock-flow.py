@@ -18,6 +18,10 @@ import time
 import types
 from pathlib import Path
 
+def tlogs(dirp):
+    """錄檔本身（不含 076 的身分標記 `.meta.json`）。"""
+    return [f for f in os.listdir(dirp) if f.endswith(".tlog")]
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 for name in ("serial",):
@@ -74,13 +78,13 @@ with tempfile.TemporaryDirectory() as d:
     frames = [b"\xfd\x01aaaa", b"\xfd\x02bb", b"\xfd\x03c"]
     for f in frames:
         r.feed(f, False)
-    ck("對時前不開檔", not os.listdir(d), os.listdir(d))
+    ck("對時前不開檔", not tlogs(d), tlogs(d))
     ck("對時前的框架先壓著", len(r._pre) == 3, len(r._pre))
     synced[0] = True
     time.time = real
     r.feed(b"\xfd\x04dddd", False)
     r._close()
-    files = os.listdir(d)
+    files = tlogs(d)
     ck("對時後開了一個檔", len(files) == 1, files)
     data = (Path(d) / files[0]).read_bytes() if files else b""
     stamps, pos = [], 0

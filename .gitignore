@@ -6,3 +6,6 @@ state.json
 *.log
 # 換號後記下的這台飛控 sysid：每台機自己的狀態，不進版本控制
 .fc_sysid
+# 綁定的飛控板（issues/076）：每台機自己的狀態，不進版本控制
+.fc_binding.json
+.fc_binding.json.tmp

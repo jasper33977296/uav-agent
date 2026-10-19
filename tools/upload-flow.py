@@ -116,7 +116,7 @@ def gate():
 
 
 def make(rate=1 << 20, chunk=1 << 20, settle=0.0):
-    return uploader.Uploader(d, "127.0.0.1", PORT, lambda: "board-test",
+    return uploader.Uploader(d, "127.0.0.1", PORT, lambda name: ("board-test", None),
                              lambda: state["current"], gate,
                              rate_kbs=rate // 1024, chunk_kb=chunk // 1024,
                              settle_s=settle)

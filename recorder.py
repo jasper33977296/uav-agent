@@ -30,6 +30,7 @@ bit 1）就是為伴飛電腦設計的，但它推的是同一份高頻資料，
 3. **只在 armed 時錄**（可設）。待機時的資料量大而價值低，與飛控自己
    `LOG_DISARMED=0` 的選擇一致。
 """
+import json
 import logging
 import os
 import struct
@@ -38,6 +39,11 @@ import time
 import clock
 
 log = logging.getLogger(__name__)
+
+#: 每份錄檔旁邊的身分標記（uav-system issues/076 C）：`X.tlog` → `X.tlog.meta.json`。
+#: **歸屬看錄製當下，不看回傳當下**——回傳可能在好幾天之後、Pi 已經接到別的
+#: 飛控上，那時「現在的板號」說的是另一台飛機
+META_SUFFIX = ".meta.json"
 
 
 class Recorder:
@@ -79,6 +85,8 @@ class Recorder:
         self._pre: list = []
         self._pre_bytes = 0
         self._gave_up = False
+        #: 這一段飛控連線確認到的板號（`set_uid`）。None＝還沒確認
+        self.uid = None
 
     # ── 對外 ────────────────────────────────────────────────────
     def feed(self, raw: bytes, armed: bool) -> None:
@@ -130,7 +138,50 @@ class Recorder:
 
     def stats(self) -> dict:
         return {"file": self.name, "bytes": self.written,
-                "frames": self.frames, "dropped": self.dropped}
+                "frames": self.frames, "dropped": self.dropped,
+                "board_uid": self.uid}
+
+    def set_uid(self, uid) -> None:
+        """這一段連線的飛控是哪塊板子（代理確認到 AUTOPILOT_VERSION 時呼叫）。
+
+        正在寫的那一份是在這段連線裡開的（換段時 `new_session` 會關檔），
+        所以它的標記可以直接補上。"""
+        if uid == self.uid:
+            return
+        self.uid = uid
+        if self.f is not None:
+            self._write_meta()
+
+    def new_session(self) -> None:
+        """飛控連線換了一段（中斷後恢復）：關掉目前的錄檔，下一份重新標記。
+
+        **一個檔案只屬於一塊板子**：中斷前後可能是兩塊不同的飛控，寫進同一份
+        的話，回傳時說不出它是誰錄的。"""
+        try:
+            self._close()
+            if self._pre:
+                # 對時前壓著的框架屬於上一段連線，而它們要等對時後才會寫進
+                # **下一份**檔案——那份會標上新的板號。寧可丟掉也不要錯標
+                log.warning("飛控連線換段時還有 %d 個對時前的框架沒寫——屬於上一段"
+                            "連線，丟掉（寫進下一份會標錯板號）", len(self._pre))
+                self.dropped += len(self._pre)
+                self._pre, self._pre_bytes = [], 0
+        except Exception:
+            log.exception("錄製換段失敗（不影響轉發）")
+        self.uid = None
+
+    def read_meta(self, name: str):
+        """`name` 的身分標記；沒有標記（舊檔）回 None。"""
+        try:
+            with open(os.path.join(self.dir, name + META_SUFFIX)) as f:
+                m = json.load(f)
+            return m if isinstance(m, dict) else {}
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            # **讀不懂不等於沒有標記**：沒有標記的舊檔會被歸給唯一綁過的板子，
+            # 而讀不懂的標記可能寫的是另一塊——當成「錄製期間身分不明」
+            return {"board_uid": None}
 
     def flush(self) -> None:
         if self.f is not None:
@@ -178,6 +229,7 @@ class Recorder:
             self.name = f"{base}-{n}.tlog"
         self.f = open(os.path.join(self.dir, self.name), "ab", buffering=1 << 16)
         self.written = 0
+        self._write_meta()
         log.info("機上錄製開始：%s（換檔：落地時、寫滿 %.0f MB%s；保留 %d 份）",
                  self.name, self.max_bytes / 1e6,
                  f"、或待機滿 {self.rotate_s / 60:.0f} 分鐘"
@@ -189,6 +241,21 @@ class Recorder:
         # 「保留 20 份」從來沒有執行過——檔案一趟一份地無限累積，
         # **而部署查核表上寫著「約 10 GB 上限」。那句話當時是假的。**
         self._prune()
+
+    def _write_meta(self) -> None:
+        """寫標記。**失敗不拖垮錄製**——錄製是附加價值，轉發不是。
+
+        寫不進去的檔案會被當成沒有標記的舊檔：代理從沒換過飛控時歸給唯一綁過
+        的那塊（那時也只可能是它），換過的話就留在機上不傳。"""
+        try:
+            path = os.path.join(self.dir, self.name + META_SUFFIX)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"board_uid": self.uid,
+                           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
+            os.replace(tmp, path)
+        except Exception:
+            log.exception("錄檔身分標記寫不進去：%s", self.name)
 
     def _close(self) -> None:
         if self.f is None:
@@ -238,6 +305,10 @@ class Recorder:
                         except Exception:
                             log.exception("通報遺失失敗（不影響滾動）")
                 os.remove(path)
+                try:
+                    os.remove(path + META_SUFFIX)
+                except FileNotFoundError:
+                    pass
                 log.info("機上錄製滾動：刪除 %s", old)
         except Exception:
             log.exception("錄製滾動失敗（不影響轉發）")

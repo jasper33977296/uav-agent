@@ -81,8 +81,15 @@ class ModemSampler(threading.Thread):
 
     def __init__(self, port, gs_host, gs_port, get_position, interval=1.0,
                  drone_id_fn=None, airborne_fn=None, live_interval=1.0,
-                 on_uplink_ok=None, net_iface="usb0"):
+                 on_uplink_ok=None, net_iface="usb0", hold_fn=None):
         super().__init__(name="modem-sampler")
+        #: **現在不該替任何一台機量**（issues/076）：回傳理由字串就整拍跳過
+        #: ——不取樣、不送即時、不送記錄通道。這個 Pi 接到的飛控不是它綁的
+        #: 那塊時，量到的訊號屬於眼前這台飛機，而 `drone_id_fn` 給的是綁定的
+        #: 那台：送出去就是把一台機的訊號記到另一台名下。None＝沒接＝舊行為
+        self.hold_fn = hold_fn
+        self.held = 0
+        self._held_said = None
         #: **地面站確認「我收到你的遙測了」時呼叫**（issues/047 項次 6）。
         #: 這條每秒一次的通道是機上唯一能問到「我送的東西有沒有到」的地方
         #: ——順路帶回來，不必另開一個請求。
@@ -429,6 +436,17 @@ class ModemSampler(threading.Thread):
         while True:
             t_start = time.monotonic()
             try:
+                why = self.hold_fn() if self.hold_fn else None
+                if why != self._held_said:
+                    self._held_said = why
+                    if why:
+                        log.warning("訊號採樣暫停：%s", why)
+                    else:
+                        log.info("訊號採樣恢復")
+                if why:
+                    self.held += 1
+                    time.sleep(self.interval)
+                    continue
                 s = self.sample()
                 self._ticks.append(t_start)
                 # **即時通道節流**：畫面每秒一筆就夠，取樣可以更密。
@@ -464,6 +482,9 @@ class ModemSampler(threading.Thread):
                 # 「記下來了」——這整個 bug 就是活在那兩者之間
                 "stored": self.stored, "buffered": len(self.buf),
                 "dropped": self.dropped, "on_ground": self.on_ground,
+                # 因為飛控身分不符而沒有量的拍數（076）。與 on_ground 分開：
+                # 一個是「量了但不記」，一個是「根本沒量」
+                "held": self.held, "held_why": self._held_said,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
                 # 實際用量（不是容量）。null＝讀不到，不是 0

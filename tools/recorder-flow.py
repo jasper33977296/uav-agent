@@ -22,6 +22,10 @@ import struct
 import sys
 import tempfile
 
+def tlogs(dirp):
+    """錄檔本身（不含 076 的身分標記 `.meta.json`）。"""
+    return [f for f in os.listdir(dirp) if f.endswith(".tlog")]
+
 sys.path.insert(0, "/home/k200/uav-agent")
 
 import recorder  # noqa: E402
@@ -42,13 +46,13 @@ print("── 1. 未 armed 不錄（預設）───────────�
 r = recorder.Recorder(d, armed_only=True)
 for _ in range(5):
     r.feed(FRAME, armed=False)
-chk("待機時一個框架都沒寫", r.frames == 0 and not os.listdir(d))
+chk("待機時一個框架都沒寫", r.frames == 0 and not tlogs(d))
 
 print("\n── 2. armed 之後開始錄，格式與地面站那份相同 ───────────")
 for _ in range(3):
     r.feed(FRAME, armed=True)
 r.flush()
-files = os.listdir(d)
+files = tlogs(d)
 chk("開了一個檔", len(files) == 1, files)
 blob = open(os.path.join(d, files[0]), "rb").read()
 chk("三個框架都寫進去了", r.frames == 3)
@@ -68,8 +72,8 @@ r2 = recorder.Recorder(d2, max_mb=0, keep=3)      # 上限 0 ＝ 每個框架都
 seen = set()
 for i in range(8):
     r2.feed(FRAME, armed=True)
-    seen |= set(os.listdir(d2))
-left = sorted(os.listdir(d2))
+    seen |= set(tlogs(d2))
+left = sorted(tlogs(d2))
 chk("**真的換了多份檔**（同一秒內換檔要換名字，否則會 append 回原檔）",
     len(seen) >= 4, sorted(seen))
 chk("**保留數有上限**（卡滿了會讓整台機出問題）", len(left) <= 3, left)

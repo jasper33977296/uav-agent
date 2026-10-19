@@ -77,6 +77,7 @@ from collections import defaultdict
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as apm
 
+import binding
 import clock
 import guard
 import holders
@@ -92,7 +93,7 @@ from outbox import Outbox
 
 log = logging.getLogger("uav-agent")
 
-AGENT_VERSION = "0.20.0"         # 0.20.0：L2 自主重綁（我送得到、他回不來）
+AGENT_VERSION = "0.21.0"         # 0.21.0：一個代理只綁一塊飛控板（uav-system issues/076）
 
 #: 部署腳本（`deploy.sh`，uav-system issues/069）留下的「這是哪一版」。
 #: **版本號不夠**：0.20.0 之後改過好幾次都沒動版本號，只有 commit 對得上 repo。
@@ -632,6 +633,15 @@ class Monitor:
 class Agent:
     #: 測試替身不跑 __init__；真的值在 __init__ 裡設
     fc_sysid = 1
+    #: 076。`binding is None`（只會發生在測試替身）＝沒有綁定機制＝舊行為
+    binding = None
+    binding_state = "verifying"
+    binding_why = "還沒問到飛控板身分"
+    fc_session_uid = None
+    fc_untrusted_drop = 0
+    last_fc_rx = 0.0
+    caps_req_at = 0.0
+    mismatch_said = None
 
     def __init__(self, a):
         self.a = a
@@ -657,6 +667,23 @@ class Agent:
         self.quiet_since = 0.0        # 這一輪讓路是什麼時候開始的（報表用）
         self.quiet_blocked = 0.0      # 上次因為 armed 而拒絕讓路的時間
         self.caps_requested = False
+        self.caps_req_at = 0.0        # 上次問板子身分（單調），確認中重問用
+        #: 這個代理綁的是哪塊飛控板（issues/076）。**持久的決定**，不是
+        #: 「這個行程第一次問到什麼」——後者在 Pi 不重開、直接換接飛控時，
+        #: 會繼續拿舊板號替新板子說話
+        self.binding = binding.Binding(binding.BINDING_FILE)
+        #: 這一段飛控連線確認過的板號。**每段連線重新確認**：開機、訊息中斷後
+        #: 恢復都算新的一段——換飛控一定會經過其中一種（新飛控要開機）
+        self.fc_session_uid = None
+        #: verifying（這段連線還沒確認）／ok（與綁定相符）／
+        #: mismatch（不是綁定的那塊）／no_uid（飛控回答了但報不出板號）
+        self.binding_state = "verifying"
+        self.binding_why = "還沒問到飛控板身分"
+        self.last_fc_rx = 0.0         # 最後一次收到綁定 sysid 的訊息（單調）
+        #: 已經為哪塊不符的板子喊過（上地面站的那一則）。**跨連線段記著**：
+        #: 不符的那塊飛控重開一次就再喊一次，只會把真正的變化埋掉
+        self.mismatch_said = None
+        self.fc_untrusted_drop = 0    # 身分未確認／不符而沒有轉發的封包（兩個方向合計）
         # 飛控 GCS failsafe 的開機自檢（uav-system 039，2026-09-01 裁定「開」）。
         # **一次就好，不週期重讀**——參數不會自己變，會變是因為有人去改，
         # 那種情況下重啟一次代理不算苛求。這正是地面站拔掉 SYSID_MYGCS 探測
@@ -676,6 +703,7 @@ class Agent:
         self.assigned_sysid = None
         self.fc_sysid = _load_fc_sysid(getattr(self.a, "fc_sysid", 1))
         self.foreign = {}             # 別台機的 sysid → 收到幾則（不轉發、不採信）
+        self._foreign_hb_said = set()   # 綁定飛控失聯時說過的外來號碼（076）
         self.sysid_action = None
         self.reassigning = None
         self.reassign_tried = False
@@ -864,6 +892,7 @@ class Agent:
         if tgt is None or self.caps_requested:
             return
         self.caps_requested = True
+        self.caps_req_at = time.monotonic()
         try:
             # 送三次：57600 上單包丟失是真實風險，而這是**一次性**請求，
             # 丟了就再也不會問（不像串流有下一輪）。重複請求無副作用。
@@ -1215,7 +1244,11 @@ class Agent:
                 on_uplink_ok=self.mark_uplink_ok,
                 # **上下行實際用量**（2026-09-23 使用者裁定：量用量不量容量、
                 # 只記總量不區分）。讀這個介面的收發位元組計數器做差分
-                net_iface=self.a.net_iface)
+                net_iface=self.a.net_iface,
+                # 076：這個 Pi 接的飛控不是綁定那塊時，量到的訊號屬於眼前那台
+                # 飛機，而 drone_id_fn 給的是綁定那台——不量
+                hold_fn=lambda: None if self._fc_trusted() else
+                f"飛控身分未確認或不符（{self.binding_why}）")
             self.modem.start()
         # **斷線期間的資料就在這台 Pi 上，只是送不出去。** 緩衝起來，
         # 鏈路恢復後補傳（uav-system 的 C 層）
@@ -1227,7 +1260,8 @@ class Agent:
         if self.a.upload:
             self.uploader = uploader.Uploader(
                 self.a.record_dir, self.a.gs, self.a.backend_port,
-                lambda: self.mon.state.get("board_uid"),
+                # **每份檔案各自的歸屬**，不是「現在的板號」（076 C）
+                self._record_owner,
                 lambda: self.recorder.name if self.recorder else None,
                 self._upload_gate,
                 rate_kbs=self.a.upload_kbps, chunk_kb=self.a.upload_chunk_kb,
@@ -1242,7 +1276,8 @@ class Agent:
             self.uploader.start()
         self.backfill = Backfill(
             self.a.gs, self.a.backend_port,
-            lambda: self.mon.state.get("board_uid"),
+            # 身分不符或未確認時是 None＝不取樣（眼前的資料不是這台機的）
+            self._speak_uid,
             lambda: self.mon.state,
             # **補傳看的是「我的資料有沒有到」，不是「我聽不聽得到地面站」**
             # （issues/047 項次 6，2026-09-08 實測）。還沒被確認過（None）
@@ -1274,6 +1309,18 @@ class Agent:
         它從哪裡來（2026-09-14 就是靠機上錄製認出 sysid 3 是另一台機）。"""
         src = msg.get_srcSystem()
         n = self.foreign[src] = self.foreign.get(src, 0) + 1
+        said = self.__dict__.setdefault("_foreign_hb_said", set())
+        if (msg.get_type() == "HEARTBEAT" and self.fc_link_ok is False
+                and src not in said):
+            # **綁定的飛控不見了，序列埠上卻有別的號碼在跳心跳**——最像的解釋
+            # 是飛控被換了（076）。不轉發、不採信的規則不變，但這一句要上地面站：
+            # 只留在機上 log 的話，畫面上只看得到「失聯」
+            said.add(src)
+            text = (f"綁定的飛控（sysid {self.fc_sysid}）失聯中，序列埠上卻出現 "
+                    f"sysid {src} 的心跳——若換了飛控，請在機上跑 fc-rebind.py "
+                    "走更換流程（必要時加 --fc-sysid）")
+            log.error(text)
+            self.outbox.note("fc_binding", text, "warning", time.monotonic())
         if n == 1:
             log.warning("收到 sysid %d 的封包，但這個代理只綁 sysid %d 的飛控——"
                         "不轉發、不採信。多半是飛控把其他 MAVLink 埠聽到的別台機"
@@ -1308,33 +1355,7 @@ class Agent:
                 self._reopen_serial(now, "讀取失敗")
                 return
             for msg in (self.fc_parser.parse_buffer(data) or []) if data else []:
-                if msg.get_type() == "BAD_DATA":
-                    continue
-                if msg.get_srcSystem() not in self._accept_sysids():
-                    self._foreign(msg)
-                    continue
-                self.fc_msgs += 1
-                if self.quiet_until:      # 讓路期間把型別記下來（診斷用）
-                    t = msg.get_type()
-                    self.quiet_types[t] = self.quiet_types.get(t, 0) + 1
-                if msg.get_type() == "PARAM_VALUE":
-                    # **是誰的答案要分得出來。** 代理自己開機時也讀參數
-                    # （FS_GCS_*／BATT_*），那些 PARAM_VALUE 與地面站要的
-                    # 長得一樣——不印出參數名，就會把代理的答案當成地面站的
-                    pid = msg.param_id
-                    pid = pid.decode() if isinstance(pid, bytes) else pid
-                    log.info("飛控回 PARAM_VALUE：%s = %g（第 %s/%s 筆）",
-                             pid.strip("\x00"), msg.param_value,
-                             msg.param_index, msg.param_count)
-                buf = msg.get_msgbuf()
-                self.telem.send(buf)          # 唯讀通道
-                self.cmd.send(buf)            # 指令通道也要看得到狀態與 ACK
-                self.mon.feed(msg)
-                # **餵在 mon.feed 之後**：armed 要用這一拍更新過的值，
-                # 否則解鎖的第一批框架會被判成「還沒 armed」而漏錄
-                self.recorder.feed(buf, bool(self.mon.state.get("armed")))
-                if msg.get_type() != "HEARTBEAT":
-                    self.last_telem_rx = now
+                self._from_fc(msg, now)
 
         # ── 地面站 → 飛控 ──────────────────────────────────
         for link in (self.telem, self.cmd):
@@ -1345,6 +1366,7 @@ class Agent:
         # 看到飛控（心跳帶出 sysid）就問一次板子身分。放在這裡而不是
         # request_streams()——理由見 request_board_id 的說明。
         self.param_quiet_end(now)
+        self._verify_retry(now)
         self.request_board_id()
         self.request_fs_gcs(now)
         self._check_fs_gcs(now)
@@ -1379,6 +1401,50 @@ class Agent:
             self.last_report = now
             self.report()
 
+    def _from_fc(self, msg, now):
+        """飛控來的一則訊息（已驗過 CRC）。從 `tick` 抽出來，測試才餵得進去。"""
+        if msg.get_type() == "BAD_DATA":
+            return
+        if msg.get_srcSystem() not in self._accept_sysids():
+            self._foreign(msg)
+            return
+        self.fc_msgs += 1
+        if self.quiet_until:      # 讓路期間把型別記下來（診斷用）
+            t = msg.get_type()
+            self.quiet_types[t] = self.quiet_types.get(t, 0) + 1
+        if msg.get_type() == "PARAM_VALUE":
+            # **是誰的答案要分得出來。** 代理自己開機時也讀參數
+            # （FS_GCS_*／BATT_*），那些 PARAM_VALUE 與地面站要的
+            # 長得一樣——不印出參數名，就會把代理的答案當成地面站的
+            pid = msg.param_id
+            pid = pid.decode() if isinstance(pid, bytes) else pid
+            log.info("飛控回 PARAM_VALUE：%s = %g（第 %s/%s 筆）",
+                     pid.strip("\x00"), msg.param_value,
+                     msg.param_index, msg.param_count)
+        buf = msg.get_msgbuf()
+        # **先看這段連線是不是新的一段**（076）：換飛控一定會經過
+        # 一段沒有訊息的空窗（新飛控要開機），空窗之後的第一則就要
+        # 當成「還不知道是誰」，而不是延續上一段的身分
+        self._note_fc_rx(now)
+        self.mon.feed(msg)
+        if msg.get_type() == "AUTOPILOT_VERSION":
+            self._on_board_identity(now)
+        # **轉發排在 mon.feed 之後**：要用這一拍更新過的 armed 與身分
+        # 判斷能不能轉。確認身分的那一則 AUTOPILOT_VERSION 因此也會
+        # 轉上去（地面站自己也要從它讀板號），而揭露「不是這塊」的那一則
+        # 不會——它的板號不該出現在綁定那台機的記錄裡
+        if self._fc_trusted():
+            self.telem.send(buf)          # 唯讀通道
+            self.cmd.send(buf)            # 指令通道也要看得到狀態與 ACK
+        else:
+            self.fc_untrusted_drop += 1
+        # **餵在 mon.feed 之後**：armed 要用這一拍更新過的值，
+        # 否則解鎖的第一批框架會被判成「還沒 armed」而漏錄。
+        # **身分不符時照錄**：錄的是事實，檔案會標上實際的板號
+        self.recorder.feed(buf, bool(self.mon.state.get("armed")))
+        if msg.get_type() != "HEARTBEAT":
+            self.last_telem_rx = now
+
     def to_fc(self, fd, data):
         """地面站來的封包 → 飛控。
 
@@ -1386,6 +1452,11 @@ class Agent:
         擋掉壞封包不讓它進飛控的解析器；解不出來時才整包原封送（寧可送出去讓
         飛控自己判斷，也不要自作主張丟掉可能合法的指令）。
         """
+        if not self._fc_trusted():
+            # **指揮的是綁定那台機，而序列埠上的不是它（或還沒確認是它）。**
+            # 地面站以為自己在跟那台說話——送進去就是把 A 的指令交給 B（076）
+            self.fc_untrusted_drop += 1
+            return
         try:
             msgs = self.gs_parser.parse_buffer(data) or []
         except Exception:
@@ -1465,6 +1536,164 @@ class Agent:
         except OSError as e:
             log.warning("寫入飛控失敗：%s", e)
 
+    # ── 一個代理只綁一塊飛控板（issues/076）────────────────────────
+    #: 多久沒有任何訊息就算「新的一段連線」。飛控心跳 1 Hz、遙測 4 Hz，
+    #: 參數讓路期間心跳照送——正常運作下最長的空白不到一秒。而換飛控要拔線、
+    #: 接線、等新飛控開機，那一定是好幾秒
+    FC_SESSION_GAP_S = 3.0
+    #: 確認中多久沒回答就重問。原本是「一個行程問一次」，而那次請求在 57600
+    #: 上丟掉的話，這段連線就永遠確認不了——**確認不了＝鎖著**，所以要重問
+    VERIFY_RETRY_S = 5.0
+
+    def _fc_trusted(self) -> bool:
+        """序列埠上的飛控現在可不可以被當成「綁定的那台」來轉發與指揮。
+
+        * **armed 一律可以。** 板子不會在天上被換掉；而把一台在天上的機的
+          遙測與指揮切掉，比認錯更危險（drone-admission-protocol §5 同一條）。
+          身分不符時仍然大聲說，只是不切
+        * **還沒有綁定**（第一次、或走完更換流程等新板子）：沒有東西要保護，
+          照舊行為放行——第一次確認到的板號就會成為綁定
+        * **其餘只有確認相符才可以**：確認中、不符、報不出板號都不行
+        """
+        if self.mon.state.get("armed"):
+            return True
+        if self.binding is None or self.binding.board_uid is None:
+            return True
+        return self.binding_state == "ok"
+
+    def _speak_uid(self):
+        """可以拿來替這台機說話的板號（註冊、補傳）。不可以就是 None。
+
+        **一律是綁定的板號，不是眼前讀到的**：兩者只在相符時才會被用到，
+        而不符時這裡回 None——不會有「讀到什麼就報什麼」的空間。
+        """
+        if self.binding is None:
+            return self.mon.state.get("board_uid")      # 測試替身：舊行為
+        uid = self.binding.board_uid
+        if uid is None or uid == "<unreadable>" or not self._fc_trusted():
+            return None
+        return uid if self.binding_state == "ok" else None
+
+    def _binding_wire(self):
+        return {"state": self.binding_state, "why": self.binding_why,
+                "observed": self.fc_session_uid,
+                # **鎖住了沒**與 state 是兩件事：armed 時不符也不鎖（在天上切斷
+                # 比認錯更危險）。地面站據此決定要不要把這台機擋在入列之外
+                "locked": not self._fc_trusted(),
+                **(self.binding.wire() if self.binding is not None else {})}
+
+    def _set_binding(self, state, why):
+        if (state, why) == (self.binding_state, self.binding_why):
+            return
+        log.info("飛控身分：%s → %s（%s）", self.binding_state, state, why)
+        self.binding_state, self.binding_why = state, why
+
+    def _note_fc_rx(self, now):
+        """每收到一則綁定 sysid 的訊息呼叫一次：偵測「新的一段連線」。"""
+        last, self.last_fc_rx = self.last_fc_rx, now
+        if not last or now - last < self.FC_SESSION_GAP_S:
+            return
+        gap = now - last
+        if self.mon.state.get("armed"):
+            # 最後看到它是 armed：**不可能是換了一塊板子**（要換得先落地上鎖、
+            # 斷電）。重問一次板號當作確認，但不切段——切段會把一趟飛行的
+            # 錄製切成兩份，而那是回放與兩層比對的前提
+            log.warning("飛控 %.0f 秒沒有訊息（最後已知 armed）——重新確認板號，"
+                        "不切段", gap)
+            self.caps_requested = False
+            return
+        self.fc_session_uid = None
+        self.mon.state["board_uid"] = None
+        self.caps_requested = False
+        self._set_binding("verifying", f"飛控 {gap:.0f} 秒沒有訊息，重新確認是不是"
+                                       "同一塊飛控板")
+        if self.recorder:
+            # 新的一段連線開新的錄檔：**一個檔案只屬於一塊板子**，回傳時才
+            # 說得出它是誰錄的
+            self.recorder.new_session()
+
+    def _verify_retry(self, now):
+        if (self.binding_state == "verifying" and self.caps_requested
+                and now - self.caps_req_at > self.VERIFY_RETRY_S):
+            self.caps_requested = False        # request_board_id 會再問一次
+
+    def _on_board_identity(self, now):
+        """飛控回答了 AUTOPILOT_VERSION：拿它對綁定。"""
+        uid = self.mon.state.get("board_uid")
+        b = self.binding
+        if not uid:
+            self._set_binding("no_uid", "飛控回答了，但報不出板號（uid2 與 uid 都是 0）"
+                                        "——無法確認是哪塊板子")
+            return
+        self.fc_session_uid = uid
+        if self.recorder:
+            self.recorder.set_uid(uid)
+        if b.board_uid is None:
+            rel = b.released
+            try:
+                how = b.bind(uid)
+            except Exception as e:
+                how = "rebind" if rel else "first"
+                log.error("⚠ 綁定寫不進 %s（%s）——這個行程照樣守著 %s，"
+                          "但**代理重開之後會忘記**", b.path, e, uid)
+            if how == "first":
+                text = (f"已綁定飛控板 {uid}（這個代理第一次確認到飛控身分）。"
+                        "之後換飛控要在機上走更換流程（fc-rebind.py）")
+                level = "info"
+            else:
+                text = (f"更換流程完成：飛控板 {rel['from']} → {uid}"
+                        f"（原因：{rel['reason']}；{rel['at']} 由人工解除）")
+                level = "warning"
+            log.warning(text)
+            self.outbox.note("fc_binding", text, level, now)
+            self._set_binding("ok", "與綁定相符")
+            return
+        if uid == b.board_uid:
+            if self.mismatch_said:
+                text = (f"綁定的飛控板 {uid} 回來了（先前接的是 {self.mismatch_said}）"
+                        "——恢復轉發、指令與訊號採樣")
+                log.warning(text)
+                self.outbox.note("fc_binding", text, "warning", now)
+                self.mismatch_said = None
+            self._set_binding("ok", "與綁定相符")
+            return
+        self._set_binding("mismatch", f"綁定 {b.board_uid}、實際 {uid}")
+        armed = self.mon.state.get("armed")
+        if self.mismatch_said == uid and not armed:
+            return                              # 同一塊、已經喊過，不要重複喊
+        self.mismatch_said = uid
+        text = (f"⚠ 序列埠上的飛控不是這個代理綁定的那塊：綁定 {b.board_uid}、"
+                f"實際 {uid}。"
+                + ("**它是 armed 狀態**——不切斷（在天上切斷比認錯更危險），"
+                   "請立刻查明" if armed else
+                   "已停止轉發遙測、不收指令、不量訊號、不替它回傳錄檔。"
+                   "若確實換了飛控，請在機上跑 fc-rebind.py 走更換流程"))
+        log.error(text)
+        self.outbox.note("fc_binding", text, "critical", now)
+
+    def _record_owner(self, name):
+        """這份機上錄檔要以哪個板號回傳 → (uid, None) 或 (None, 為什麼不傳)。
+
+        **歸屬看錄製當下，不看回傳當下**（076 C）：舊板子在更換之前錄、還沒
+        傳完的檔案，換完之後仍然是舊板子那台飛機的紀錄。
+        """
+        b = self.binding
+        meta = self.recorder.read_meta(name) if self.recorder else None
+        if meta is None:
+            # 綁定機制之前錄的舊檔，沒有身分標記。**這個代理從來沒換過飛控**
+            # 的話，那時接的就是唯一綁過的那塊；換過的話分不出來
+            if b.board_uid and b.board_uid != "<unreadable>" \
+                    and not (b.blob.get("history") or []):
+                return b.board_uid, None
+            return None, ("沒有身分標記的舊錄檔，而這個代理換過飛控——"
+                          "分不出是哪一塊錄的，留在機上給人處理")
+        uid = meta.get("board_uid")
+        if not uid:
+            return None, "錄製期間沒有確認到飛控身分"
+        if not b.ever_bound(uid):
+            return None, f"錄的是沒有綁定過的板子 {uid}（身分不符期間）——不替它回傳"
+        return uid, None
+
     def say_hello(self):
         """向地面站自報身分——**註冊是它的副作用**（uav-system issues/038）。
 
@@ -1480,22 +1709,31 @@ class Agent:
         """
         if self.hello_sent:
             return
-        uid = self.mon.state.get("board_uid")
-        if not uid:
-            return                          # 還沒問到板子身分，下一拍再說
+        # **報的一律是綁定的板號**（076）。相符時與讀到的是同一個；不符時
+        # 仍然要上線——地面站要知道「這台機的代理接到了別的飛控、鎖住了」，
+        # 而能說這句話的只有綁定那台機的代理。但**眼前那塊飛控的任何事實都
+        # 不帶**（廠牌、韌體、機型、號碼）：那些屬於另一台飛機
+        foreign = (self.binding_state == "mismatch"
+                   and not self.mon.state.get("armed"))
+        uid = (self.binding.board_uid if foreign and self.binding is not None
+               else self._speak_uid())
+        if not uid or uid == "<unreadable>":
+            return                          # 還沒確認到板子身分，下一拍再說
+        ms = {} if foreign else self.mon.state
         body = {
             "board_uid": uid,
             "agent_uid": agent_uid(),
-            "autopilot": {3: "ardupilot", 12: "px4"}.get(
-                self.mon.state.get("autopilot_raw")),
-            "fw": self.mon.state.get("fw"),
-            "vehicle_type": self.mon.state.get("vehicle_type"),
+            "autopilot": {3: "ardupilot", 12: "px4"}.get(ms.get("autopilot_raw")),
+            "fw": ms.get("fw"),
+            "vehicle_type": ms.get("vehicle_type"),
+            # 綁定的現況（076）。地面站據此在不符時不配號、判 quarantined
+            "fc_binding": self._binding_wire(),
             "agent_version": AGENT_VERSION,
             "deployed": _deployed().get("commit"),
             # **它現在用的號碼**（uav-system issues/040 A1）。地面站據此判斷
             # 「它跑錯號碼了沒」——不送的話那頭只能配一個號給我們，
             # 分不出「本來就用對了」與「不知道它用什麼」
-            "sysid": self.mon.state.get("sysid"),
+            "sysid": ms.get("sysid"),
         }
         try:
             req = urllib.request.Request(
@@ -1547,6 +1785,10 @@ class Agent:
             return self._watch_reassign(now)
         if (self.sysid_action != "change" or self.reassign_tried
                 or not self.a.sysid_auto_apply):
+            return
+        if self.binding is not None and self.binding_state != "ok":
+            # **只對確認過是綁定那塊的飛控換號**（076）：配號是發給那塊板子的，
+            # 寫到別塊板子上會讓它頂著別人的號碼出現
             return
         want, have = self.assigned_sysid, self.mon.state.get("sysid")
         if want is None or have is None or want == have:
@@ -1652,7 +1894,8 @@ class Agent:
              # 是 UnknownDriver 的空表，那是誠實的「不知道」
              "driver": {**normalize.driver_info(),
                         "limits": normalize.driver_limits(
-                            self.mon.state.get("autopilot_raw"))}},
+                            None if self.binding_state == "mismatch"
+                            else self.mon.state.get("autopilot_raw"))}},
             on_intent=self.on_intent, on_decision=self.on_decision,
             on_progress=self.on_progress, outbox=self.outbox)
         self.intent.start()
@@ -1670,6 +1913,10 @@ class Agent:
         ok, why = guard.check(state, action, self.mon.state.get("rc_link"))
         base = {"intent_id": msg.get("intent_id"), "action": action,
                 "state": state, "executor": guard.executor(action or "")}
+        if not self._fc_trusted():
+            why = f"序列埠上的飛控身分未確認或與綁定不符（{self.binding_why}）"
+            log.warning("擋下意圖 %s：%s", action, why)
+            return {**base, "event": "guard_refused", "reason": why}
         if not ok:
             log.warning("守門擋下意圖 %s（狀態 %s）：%s", action, state, why)
             return {**base, "event": "guard_refused", "reason": why}
@@ -1872,8 +2119,20 @@ class Agent:
         報上去另一套」。"""
         if self.intent is None:
             return
+        if not self._fc_trusted():
+            # **眼前這塊飛控的狀態不屬於這台機**（076）：只送綁定的現況與
+            # 代理自己這一側的事實。狀態送 None＝不知道，不是「在地上」
+            self.intent.publish({
+                "state": None, "sysid": None, "fc_binding": self._binding_wire(),
+                "fc_link": self._fc_link_wire(), "clock_synced": clock.synced(),
+                "reassigning": None, "rc_link": None, "mode_owner": None,
+                "record_upload": self.uploader.state() if self.uploader else None,
+                "derived": None})
+            return
         s = self.mon.state
         self.intent.publish({
+            # 綁定的現況（076）。放頂層，理由同 rc_link（鏡像讀頂層）
+            "fc_binding": self._binding_wire(),
             "state": self.flight_state(),
             "sysid": s.get("sysid"),
             "intent_id": (self.seq or {}).get("intent_id"),
@@ -2617,6 +2876,10 @@ class Agent:
             # **橋的兩端各一格。** 以前只有 gs 那端有欄位，飛控那端要自己去
             # 看 `fc_heartbeat_age_s` 是大是小——而沒有人會去看（issues/050）
             "fc_link_ok": self.fc_link_ok,
+            # 這個代理綁的是哪塊飛控板、眼前這塊對不對得上（076）。
+            # `fc-rebind.py` 讀 state.json 的這一格
+            "fc_binding": self._binding_wire(),
+            "fc_untrusted_drop": self.fc_untrusted_drop,
             "gs_link_ok": self.gs_link_ok,
             "uplink_ok": self.uplink_ok,
             # 序列埠被外部改掉幾次。**不是 0 就該有人去問為什麼**

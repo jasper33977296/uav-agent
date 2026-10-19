@@ -28,8 +28,11 @@
 2. **落地後靜置 `settle_s` 秒。** 剛落地時人還在飛機旁邊、可能馬上再起飛；
    板凳測試時的 arm/disarm 連續切換也不該每次都戳一輪上傳。
 3. **地面站鏈路是通的**（`gs_link_ok`）。斷線時重試只是把時間花在必敗的事上。
-4. **拿得到 board_uid。** 沒有身分就沒有歸屬，地面站也不該替一個不認得的
-   東西開目錄（issues/038／040 同一條規則）。
+4. **這份檔案說得出是哪塊板子錄的。** 沒有身分就沒有歸屬，地面站也不該替
+   一個不認得的東西開目錄（issues/038／040 同一條規則）。**歸屬看錄製當下**
+   （錄檔旁的 `.meta.json`，issues/076 C）：回傳可能在好幾天之後，那時 Pi
+   可能已經接到別的飛控上，「現在的板號」說的是另一台飛機。這一道是逐檔的，
+   說不出歸屬的那份留在機上，不擋其他檔案。
 
 **檢查在每一塊之前做**，所以停手的延遲上限就是「送一塊要多久」——
 預設塊大小與限速相同（256 KB／256 KB/s），也就是**最遲一秒後停手**。
@@ -69,12 +72,13 @@ HTTP_TIMEOUT_S = 60.0
 class Uploader(threading.Thread):
     """把關好的機上錄製檔在地面時送回地面站。"""
 
-    def __init__(self, directory, gs, port, board_uid_fn, current_fn, gate_fn,
+    def __init__(self, directory, gs, port, owner_fn, current_fn, gate_fn,
                  rate_kbs=256, chunk_kb=256, settle_s=20.0, retry_s=30.0):
         super().__init__(daemon=True)
         self.dir = directory
         self.base = f"http://{gs}:{port}/api/onboard-captures"
-        self.board_uid_fn = board_uid_fn
+        #: 檔名 → (板號, None) 或 (None, 為什麼不傳)。**逐檔**，見模組說明第 4 道
+        self.owner_fn = owner_fn
         self.current_fn = current_fn        # 正在寫的那一份（不碰）
         self.gate_fn = gate_fn              # () → (可以傳嗎, 為什麼不行)
         self.rate = max(1, rate_kbs) * 1024.0
@@ -98,6 +102,9 @@ class Uploader(threading.Thread):
         #: 正是傳不動的時候
         self.backlog = 0
         self.backlog_files: list[str] = []
+        #: 說不出歸屬、因此留在機上的檔案 → 理由。**要看得見**：它們也是
+        #: 「還沒回傳」，但原因不是鏈路，而是不知道該記在誰名下
+        self.unowned: dict[str, str] = {}
         #: 滾動刪掉時還沒回傳成功的檔案，等著報給地面站。**要報，因為那是
         #: 永久的損失**：機上的滾動優先於保住紀錄（卡滿了會讓整台機出問題），
         #: 但沒有人聽見的話，我們事後會以為那一趟的紀錄還在機上。
@@ -128,7 +135,10 @@ class Uploader(threading.Thread):
         而事件流是留痕的地方。這裡只排隊，送在 `_pass()`（要鏈路通）。
         """
         self.abandoned += 1
-        self._lost.append({"name": name, "bytes": size, "at": time.time()})
+        # **歸屬在刪掉之前問**：標記檔跟著錄檔一起被滾動刪掉
+        uid, _ = self.owner_fn(name)
+        self._lost.append({"name": name, "bytes": size, "at": time.time(),
+                           "board_uid": uid})
         self._save()
         log.warning("⚠ %s 已被滾動刪除且**從未回傳成功**——已排隊通報地面站", name)
 
@@ -143,6 +153,8 @@ class Uploader(threading.Thread):
         """
         return {"pending": self.backlog,
                 "pending_files": self.backlog_files[:20],
+                "unowned": len(self.unowned),
+                "unowned_files": dict(list(self.unowned.items())[:5]),
                 "blocked": self._blocked_since,
                 "current": self.current,
                 "progress": (round(self.progress, 3)
@@ -177,7 +189,8 @@ class Uploader(threading.Thread):
         return out
 
     def stats(self) -> dict:
-        return {"pending": self.backlog, "files": self.files,
+        return {"pending": self.backlog, "unowned": len(self.unowned),
+                "files": self.files,
                 "bytes": self.bytes, "failed": self.failed,
                 "abandoned": self.abandoned, "current": self.current,
                 "progress": (round(self.progress, 3)
@@ -208,10 +221,17 @@ class Uploader(threading.Thread):
         if time.monotonic() < self._next_try:
             return
         for name in self.pending():
+            uid, no = self.owner_fn(name)
+            if uid is None:
+                if self.unowned.get(name) != no:
+                    log.warning("錄檔 %s 不回傳：%s", name, no)
+                self.unowned[name] = no
+                continue
+            self.unowned.pop(name, None)
             ok, why = self._gate()
             if not ok:
                 return                      # 中途起飛：停在這裡，下次接續
-            if not self._send(name):
+            if not self._send(name, uid):
                 self.failed += 1
                 self._next_try = time.monotonic() + self.retry_s
                 return
@@ -225,7 +245,15 @@ class Uploader(threading.Thread):
         """
         while self._lost:
             it = self._lost[0]
-            body = json.dumps({"board_uid": self.board_uid_fn(),
+            if not it.get("board_uid"):
+                # 說不出是誰的檔案，也就沒有一台機可以記這筆損失。**機上 log
+                # 已經說過了**；丟掉這一則，不要讓它擋住後面那些報得出去的
+                log.warning("遺失通報 %s 沒有歸屬（%s 之前的舊格式或身分不明）"
+                            "——只留在機上 log", it["name"], it.get("at"))
+                self._lost.pop(0)
+                self._save()
+                continue
+            body = json.dumps({"board_uid": it["board_uid"],
                                "name": it["name"], "bytes": it["bytes"],
                                "at": it["at"]}).encode()
             req = urllib.request.Request(
@@ -253,20 +281,17 @@ class Uploader(threading.Thread):
     def _gate(self):
         """可以傳嗎。**理由要說得出來**——不然「沒在傳」與「傳不動」同形。"""
         why = None
-        if not self.board_uid_fn():
-            why = "還沒拿到 board_uid"
+        ok, reason = self.gate_fn()
+        if not ok:
+            why = reason
+            self._ground_since = None
         else:
-            ok, reason = self.gate_fn()
-            if not ok:
-                why = reason
-                self._ground_since = None
-            else:
-                now = time.monotonic()
-                if self._ground_since is None:
-                    self._ground_since = now
-                left = self.settle_s - (now - self._ground_since)
-                if left > 0:
-                    why = f"落地靜置中（還有 {left:.0f}s）"
+            now = time.monotonic()
+            if self._ground_since is None:
+                self._ground_since = now
+            left = self.settle_s - (now - self._ground_since)
+            if left > 0:
+                why = f"落地靜置中（還有 {left:.0f}s）"
         if why != self._blocked_since:
             if why:
                 log.info("錄製回傳暫停：%s", why)
@@ -276,7 +301,7 @@ class Uploader(threading.Thread):
         return why is None, why
 
     # ── 單一檔案 ────────────────────────────────────────────────
-    def _send(self, name) -> bool:
+    def _send(self, name, uid) -> bool:
         path = os.path.join(self.dir, name)
         try:
             size = os.path.getsize(path)
@@ -286,7 +311,7 @@ class Uploader(threading.Thread):
             return True                     # 不是鏈路的錯，不要因此退避
 
         try:
-            r = self._offer(name, size, sha)
+            r = self._offer(uid, name, size, sha)
         except Exception as e:
             log.warning("宣告 %s 失敗：%s", name, e)
             return False
@@ -311,7 +336,7 @@ class Uploader(threading.Thread):
                 blk = f.read(self.chunk)
                 t0 = time.monotonic()
                 try:
-                    res = self._chunk(stored, off, blk)
+                    res = self._chunk(uid, stored, off, blk)
                 except _Restart:
                     log.warning("地面站要求 %s 從頭重傳", name)
                     return False
@@ -344,8 +369,8 @@ class Uploader(threading.Thread):
             self._stop.wait(want - elapsed)
 
     # ── HTTP ────────────────────────────────────────────────────
-    def _offer(self, name, size, sha) -> dict:
-        body = json.dumps({"board_uid": self.board_uid_fn(), "name": name,
+    def _offer(self, uid, name, size, sha) -> dict:
+        body = json.dumps({"board_uid": uid, "name": name,
                            "bytes": size, "sha256": sha}).encode()
         req = urllib.request.Request(
             self.base + "/offer", data=body, method="POST",
@@ -353,8 +378,8 @@ class Uploader(threading.Thread):
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
             return json.loads(r.read() or b"{}")
 
-    def _chunk(self, stored, offset, blk) -> dict:
-        q = urllib.parse.urlencode({"board_uid": self.board_uid_fn(),
+    def _chunk(self, uid, stored, offset, blk) -> dict:
+        q = urllib.parse.urlencode({"board_uid": uid,
                                     "name": stored, "offset": offset})
         req = urllib.request.Request(
             f"{self.base}/chunk?{q}", data=blk, method="PUT",

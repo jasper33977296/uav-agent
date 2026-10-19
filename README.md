@@ -209,10 +209,42 @@ sudo systemctl enable uav-agent    # 確認無誤後才開機自啟
 ```
 
 **不要再手動 scp。** 腳本只傳 git 追蹤的檔、不刪機上任何東西、不碰 `state.json`／
-`.fc_sysid`／venv；代理在跑時要 `state.json` 新鮮且未解鎖才重啟（不知道就中止）；
+`.fc_sysid`／`.fc_binding.json`／venv；代理在跑時要 `state.json` 新鮮且未解鎖才重啟（不知道就中止）；
 unit 有差只裝 unit（`config.txt` 仍是 `install-service.sh` 的事）；`requirements.txt`
 有變要 `--pip`。部署後機上的 `DEPLOYED` 記著 commit，代理開機時 log 出來、狀態列帶
 `deployed`——**「機上跑的是哪一版」從此有答案**。驗收失敗不自動回滾，保留現場。
+
+## 一個代理只綁一塊飛控板（uav-system issues/076）
+
+代理第一次從飛控問到板號（`AUTOPILOT_VERSION.uid2`）就**綁定**，寫進
+`.fc_binding.json`（每台機自己的狀態，不進 git、部署不碰）。之後每一段飛控連線
+都要重新確認——開機、或訊息中斷 3 秒以上恢復（換飛控一定會經過這一格：新飛控要開機）：
+
+| 確認結果 | 轉發遙測 | 收地面站指令／意圖 | 註冊、補傳、訊號採樣 |
+|---|---|---|---|
+| 相符（`ok`） | ✅ | ✅ | ✅ |
+| 確認中／報不出板號 | ❌ | ❌ | ❌ |
+| **不符**（`mismatch`） | ❌ | ❌ | ❌，只以綁定的板號上線說「我鎖住了」，地面站判 `quarantined` |
+| **armed 時任何結果** | ✅ | ✅ | 不符照樣大聲說（critical），**但不切**——在天上切斷比認錯更危險 |
+
+機上錄檔照錄，每份旁邊有 `X.tlog.meta.json` 標著**錄製當下**的板號；回傳用那個板號，
+不是「現在的」。說不出歸屬的檔案（不符期間錄的、換過飛控之後的無標記舊檔）留在機上不傳，
+`record_upload.unowned` 會列出來。
+
+### 換飛控：更換流程
+
+在機上、飛機旁邊、已上鎖時跑：
+
+```bash
+python3 fc-rebind.py                                        # 看現況，不改任何東西
+python3 fc-rebind.py --release --reason "原飛控 IMU 故障，換上備品"
+python3 fc-rebind.py --release --reason "…" --fc-sysid 3   # 新飛控的號碼不是 FC_SYSID 時
+```
+
+它只**解除**綁定（原因與時間進 `history`）、刪掉配給舊板子的 `.fc_sysid`、重啟代理；
+新板號由代理自己從飛控問出來並綁上，地面站會收到「更換流程完成：舊 → 新」。
+**不讓人打新板號**（機器問得到的事讓人打只會打錯），**也不做成地面站按鈕**
+（判斷「我剛剛換了飛控」的事實只在機旁的人身上）。
 
 ## 檔案
 
@@ -227,6 +259,8 @@ unit 有差只裝 unit（`config.txt` 仍是 `install-service.sh` 的事）；`r
 | `recorder.py` | 機上原始層錄製：飛控送出的每一個框架落盤（tlog） |
 | `uploader.py` | 那份錄製的自動回傳：**只在地面傳、一解鎖立刻停** |
 | `modem.py` | 5G 模組 AT 採樣（獨立執行緒，不擋主迴圈） |
+| `binding.py` | 飛控板綁定檔（`.fc_binding.json`）的讀寫（076） |
+| `fc-rebind.py` | **在機上跑**：飛控更換流程（解除綁定） |
 | `uav-test.py` | 一次性診斷：請求串流並把飛控說得出來的東西全部攤開 |
 | `tools/link-loss-table.py` | 失聯處置的判定表（含反向驗證） |
 | `tools/guard-table.py` | 守門全表 88 格 |
@@ -246,6 +280,7 @@ unit 有差只裝 unit（`config.txt` 仍是 `install-service.sh` 的事）；`r
 | `tools/backfill-live.py` | 補傳端到端：真代理 → 跑著的地面站 → 真入庫 |
 | `tools/recorder-flow.py` | 錄製器：armed 才錄、格式、滾動、失敗不拖垮轉發 |
 | `tools/upload-flow.py` | 回傳的**時機**：飛行中不傳、半路起飛就停、續傳、限速 |
+| `tools/fc-binding-flow.py` | 綁定：熱插拔換飛控、armed 不切、更換流程、錄檔歸屬 |
 | `tools/modem-probe.py` | 找 modem 的 AT 埠並試各種查詢指令 |
 | `deploy.sh` | **開發機上跑**：部署到 Pi（見〈部署〉） |
 | `systemd/uav-agent.service` | 服務定義（部署參數在這裡） |
