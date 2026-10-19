@@ -2,7 +2,7 @@
 # 把這個 repo 的代理部署到機上的 Pi（uav-system issues/069）。**在開發機上跑。**
 #
 #   ./deploy.sh              # 部署目前的 commit
-#   ./deploy.sh --host <addr># 指定哪台。**空機也是這一行**（見下）
+#   ./deploy.sh --env drone-e.env   # 空機：照填好的安裝資訊從頭裝（見下）
 #   ./deploy.sh --dry-run    # 只看：dongle、閘門判定、哪些檔會變、unit 有沒有差——不動機上
 #   ./deploy.sh --rollback   # 還原上一次部署前的備份並重啟
 #
@@ -10,8 +10,9 @@
 #   --host <addr>   指定 Pi（預設依序試 UAV_PI、地面站學到的、10.141.2.32、10.101.129.121）。
 #                   IPv6 本地位址也行：--host 'fe80::...%eno2'
 #   --dirty         工作目錄有未提交的改動也照部署（DEPLOYED 會標 dirty）
-#   UAV_PI_PASS=…   第一次連一台新機時用的密碼（裝好 SSH 金鑰之後就不再需要）。
-#                   不給的話 ssh-copy-id 會在終端機上問
+#   --env <檔>      這台機的安裝資訊（帳號、密碼、地面站、AT 埠、sysid）。**空機一定要給**，
+#                   而且每一欄都要填才會開始——缺哪一欄就說哪一欄、什麼都不做。
+#                   範本：drone.env.example；填好的 drone-*.env 不進 git
 #
 # **一鍵：空機與舊機同一行指令**（2026-10-19 使用者要求）。機上沒有 venv＝空機，
 # 會先做初次安裝：裝 SSH 金鑰與免密碼 sudo → 傳程式 → **在開發機下載相依套件
@@ -48,7 +49,7 @@ KEEP=5
 STATE_FRESH_S=30
 VERIFY_WAIT_S=45
 
-DRY=0; ROLLBACK=0; DIRTY_OK=0; PIP=0; HOST="${UAV_PI:-}"
+DRY=0; ROLLBACK=0; DIRTY_OK=0; PIP=0; HOST="${UAV_PI:-}"; ENVFILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
     --dirty) DIRTY_OK=1 ;;
     --pip) PIP=1 ;;     # 舊選項：現在相依有變一律自動裝，留著不報錯
     --host) HOST="$2"; shift ;;
+    --env) ENVFILE="$2"; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "不認得的選項：$1" >&2; exit 2 ;;
   esac
@@ -66,9 +68,30 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s ==\n' "$*"; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 
+# ── 0. 這台機的安裝資訊 ──────────────────────────────────────
+# **填好才開始**（使用者 2026-10-19）：機密與必要參數全部填齊之前什麼都不做——
+# 裝到一半才發現少一個值，機上會停在一個半套的狀態。欄位見 drone.env.example
+REQUIRED=(UAV_PI_HOST UAV_PI_USER UAV_PI_PASS GS_HOST MODEM_PORT FC_SYSID)
+#: 寫進機上 /etc/uav-agent.env 的那幾欄（蓋過 unit 的共用預設）
+MACHINE_KEYS=(GS_HOST MODEM_PORT FC_SYSID)
+cd "$HERE"
+if [ -n "$ENVFILE" ]; then
+  step "0. 安裝資訊（$ENVFILE）"
+  [ -f "$ENVFILE" ] || die "找不到 $ENVFILE——從 drone.env.example 複製一份填好"
+  case "$ENVFILE" in /*) ;; *) ENVFILE="./$ENVFILE" ;; esac
+  set -a; . "$ENVFILE"; set +a
+  MISSING=()
+  for k in "${REQUIRED[@]}"; do [ -n "${!k:-}" ] || MISSING+=("$k"); done
+  [ ${#MISSING[@]} = 0 ] || die "$ENVFILE 還沒填完：${MISSING[*]}——**什麼都還沒做**，填好再跑"
+  for k in "${REQUIRED[@]}"; do
+    case $k in *PASS*) say "   $k=（已填，${#UAV_PI_PASS} 字）" ;; *) say "   $k=${!k}" ;; esac
+  done
+  [ -n "$HOST" ] || HOST=$UAV_PI_HOST
+fi
+U="${UAV_PI_USER:-pi}"
+
 # ── 1. 前置 ──────────────────────────────────────────────────
 step "1. 前置"
-cd "$HERE"
 COMMIT=$(git rev-parse --short HEAD)
 DIRTY=false
 if ! git diff --quiet HEAD -- || [ -n "$(git ls-files --others --exclude-standard)" ]; then
@@ -102,54 +125,58 @@ for v in d.values():
 if [ -z "$HOST" ]; then
   LEARNED=$(learn_host || true)
   for h in $LEARNED 10.141.2.32 10.101.129.121; do
-    if ssh "${SSH_OPTS[@]}" "pi@$h" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" "$U@$h" true 2>/dev/null; then
       HOST=$h
       [ "$h" = "${LEARNED:-}" ] && say "   位址取自地面站學到的對端（peers.json）"
       break
     fi
   done
   [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
-elif ! ssh "${SSH_OPTS[@]}" "pi@$HOST" true 2>/dev/null; then
+elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null; then
   # **新機第一次連**：還沒有金鑰。裝一次，之後全程免密碼
   # 先分清楚是「要密碼」還是「根本連不到」——後者裝金鑰也沒用
-  WHY=$(ssh "${SSH_OPTS[@]}" "pi@$HOST" true 2>&1 || true)
+  WHY=$(ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>&1 || true)
   case "$WHY" in *"Permission denied"*) ;; *)
-    die "連不到 pi@$HOST（不是密碼的問題——位址、網路線、SSH 有沒有開）：$WHY" ;; esac
-  say "   pi@$HOST 還沒有這台開發機的金鑰——裝一次（ssh-copy-id）"
+    die "連不到 $U@$HOST（不是密碼的問題——位址、網路線、SSH 有沒有開）：$WHY" ;; esac
+  say "   $U@$HOST 還沒有這台開發機的金鑰——裝一次（ssh-copy-id）"
   [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
   if [ -n "${UAV_PI_PASS:-}" ]; then
     AP=$(mktemp); trap 'rm -f "$AP"' EXIT
     printf '#!/bin/sh\nprintf "%%s\\n" "$UAV_PI_PASS"\n' > "$AP"; chmod +x "$AP"
     UAV_PI_PASS="$UAV_PI_PASS" SSH_ASKPASS="$AP" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-      setsid ssh-copy-id -o StrictHostKeyChecking=accept-new "pi@$HOST" </dev/null >/dev/null 2>&1 \
-      || die "UAV_PI_PASS 登不進 pi@$HOST（帳號要是 pi：unit 以 pi 執行）"
+      setsid ssh-copy-id -o StrictHostKeyChecking=accept-new "$U@$HOST" </dev/null >/dev/null 2>&1 \
+      || die "UAV_PI_PASS 登不進 $U@$HOST——帳號或密碼不對"
   else
-    ssh-copy-id -o StrictHostKeyChecking=accept-new "pi@$HOST" \
-      || die "裝金鑰失敗。沒有終端機可以問密碼的話，用 UAV_PI_PASS=… ./deploy.sh --host $HOST"
+    ssh-copy-id -o StrictHostKeyChecking=accept-new "$U@$HOST" \
+      || die "裝金鑰失敗。沒有終端機可以問密碼的話，把密碼填進 --env 檔的 UAV_PI_PASS"
   fi
-  ssh "${SSH_OPTS[@]}" "pi@$HOST" true || die "金鑰裝了還是連不到 pi@$HOST"
+  ssh "${SSH_OPTS[@]}" "$U@$HOST" true || die "金鑰裝了還是連不到 $U@$HOST"
 fi
 say "   Pi：$HOST"
-R() { ssh "${SSH_OPTS[@]}" "pi@$HOST" "$@"; }
+R() { ssh "${SSH_OPTS[@]}" "$U@$HOST" "$@"; }
 # rsync 的目的地：IPv6 位址要加中括號
-case "$HOST" in *:*) RT="pi@[$HOST]" ;; *) RT="pi@$HOST" ;; esac
+case "$HOST" in *:*) RT="$U@[$HOST]" ;; *) RT="$U@$HOST" ;; esac
 
 # **免密碼 sudo**：重啟服務、裝 unit、改開機設定都要，而部署中途沒辦法問密碼。
 # Raspberry Pi Imager 建的第一個帳號通常已經有；沒有就用 UAV_PI_PASS 補一次
 if ! R "sudo -n true" 2>/dev/null; then
-  [ -n "${UAV_PI_PASS:-}" ] || die "pi 在 $HOST 上的 sudo 要密碼。用 UAV_PI_PASS=… 重跑，會設成免密碼"
-  printf '%s\n' "$UAV_PI_PASS" | R "sudo -S -p '' sh -c 'echo \"pi ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/010_pi-nopasswd && chmod 440 /etc/sudoers.d/010_pi-nopasswd'" \
+  [ -n "${UAV_PI_PASS:-}" ] || die "$U 在 $HOST 上的 sudo 要密碼。在 --env 檔填 UAV_PI_PASS，會設成免密碼"
+  printf '%s\n' "$UAV_PI_PASS" | R "sudo -S -p '' sh -c 'echo \"$U ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/010_uav-nopasswd && chmod 440 /etc/sudoers.d/010_uav-nopasswd'" \
     && R "sudo -n true" || die "設定免密碼 sudo 失敗"
-  say "   已設 pi 免密碼 sudo"
+  say "   已設 $U 免密碼 sudo"
 fi
 FRESH=0
 R "test -x $DEST/venv/bin/python" || FRESH=1
-[ "$FRESH" = 1 ] && say "   **空機**（沒有 $DEST/venv）→ 這次會先做初次安裝"
+if [ "$FRESH" = 1 ]; then
+  [ -n "$ENVFILE" ] || die "這是空機（沒有 $DEST/venv）。初次安裝要先填好安裝資訊：cp drone.env.example drone-<代號>.env，填完用 --env 跑"
+  say "   **空機**（沒有 $DEST/venv）→ 這次會先做初次安裝"
+fi
 
 # ── 1b. 5G dongle ────────────────────────────────────────────
 # 參數：repo unit 的預設值，被機上 /etc/uav-agent.env 蓋過（與 systemd 同一個規則）
 envval() {
   local k=$1 v
+  if [ -n "$ENVFILE" ] && [ -n "${!k:-}" ]; then printf '%s' "${!k}"; return; fi
   v=$(R "sed -n 's/^$k=//p' /etc/uav-agent.env 2>/dev/null | tail -1" || true)
   [ -n "$v" ] || v=$(sed -n "s/^Environment=$k=//p" systemd/uav-agent.service)
   printf '%s' "$v"
@@ -259,7 +286,7 @@ if [ "$FRESH" = 1 ]; then
   step "6a. 初次安裝"
   R "command -v rsync >/dev/null" || R "sudo apt-get install -y -q rsync" \
     || die "機上沒有 rsync，也裝不起來（沒網路）"
-  R "sudo install -d -o pi -g pi $DEST"
+  R "sudo install -d -o $U -g $U $DEST"
   rsync -a --files-from="$LIST" ./ "$RT:$DEST/"
   say "   程式已傳到 $DEST"
   push_wheels
@@ -299,7 +326,14 @@ fi
 # 每次都跑：它可以重跑、已經對的就跳過，於是每台機的系統設定都收斂到 repo 這一版
 # ——第一台機上那兩項手動修的設定，就是因為不在任何會重跑的地方才會漏
 step "7. 系統設定（install-service.sh）"
-SVC_OUT=$(R "sudo $DEST/install-service.sh") || { printf '%s\n' "$SVC_OUT" | sed 's/^/   /'; die "install-service.sh 失敗"; }
+if [ -n "$ENVFILE" ]; then
+  # 這台機的參數寫進 /etc/uav-agent.env：只改這幾行，檔裡其他人加的設定不動
+  for k in "${MACHINE_KEYS[@]}"; do
+    R "sudo touch /etc/uav-agent.env && sudo sed -i '/^$k=/d' /etc/uav-agent.env && echo '$k=${!k}' | sudo tee -a /etc/uav-agent.env >/dev/null"
+  done
+  say "   /etc/uav-agent.env：${MACHINE_KEYS[*]} 照 $ENVFILE 寫入"
+fi
+SVC_OUT=$(R "sudo AGENT_USER=$U $DEST/install-service.sh") || { printf '%s\n' "$SVC_OUT" | sed 's/^/   /'; die "install-service.sh 失敗"; }
 printf '%s\n' "$SVC_OUT" | grep -v '^REBOOT_NEEDED$' | sed 's/^/   /'
 REBOOT=0; printf '%s\n' "$SVC_OUT" | grep -qx REBOOT_NEEDED && REBOOT=1
 BY="$(git config user.name 2>/dev/null || whoami)@$(hostname)"
@@ -384,7 +418,7 @@ elif [ "$RC" = 3 ]; then
 fi
 
 if [ "$FAIL" = 0 ]; then
-  say ""; say "✓ 部署完成：$COMMIT$([ "$DIRTY" = true ] && echo '（dirty）') → pi@$HOST:$DEST$([ "$FRESH" = 1 ] && echo '（初次安裝）')"
+  say ""; say "✓ 部署完成：$COMMIT$([ "$DIRTY" = true ] && echo '（dirty）') → $U@$HOST:$DEST$([ "$FRESH" = 1 ] && echo '（初次安裝）')"
 else
   say ""; say "✗ 驗收沒過。**沒有自動回滾**（保留現場）。要回到上一版：./deploy.sh --rollback"
   exit 1

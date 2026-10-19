@@ -14,6 +14,9 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CFG=/boot/firmware/config.txt
 REBOOT=0
+#: 代理以哪個帳號執行。unit 預設 pi；不是 pi 的機（例如 Ubuntu 上的 k200）用 drop-in 改
+AGENT_USER=${AGENT_USER:-pi}
+id "$AGENT_USER" >/dev/null 2>&1 || { echo "沒有 $AGENT_USER 這個帳號"; exit 1; }
 
 cfg_line() {   # cfg_line <整行>：config.txt 沒有這行就加在檔尾的 [all] 段
   local line="$1"
@@ -54,7 +57,7 @@ fi
 
 echo
 echo "== 3. 目錄與每台機自己的設定 =="
-install -d -o pi -g pi /opt/uav-record
+install -d -o "$AGENT_USER" -g "$AGENT_USER" /opt/uav-record
 echo "   /opt/uav-record（錄製 spool）"
 # **每台機不一樣的參數放這裡，不要改 unit**：unit 是 repo 裡所有機共用的一份，
 # deploy.sh 每次都會把它裝回 repo 的版本——在 unit 裡改的單機設定下次部署就沒了。
@@ -82,8 +85,59 @@ else
   systemctl daemon-reload
   echo "   已安裝 /etc/systemd/system/uav-agent.service"
 fi
+# 帳號不是 pi：用 drop-in 改 User=，**不改 unit 本身**（unit 是所有機共用、每次部署會裝回）
+DROP=/etc/systemd/system/uav-agent.service.d/10-user.conf
+if [ "$AGENT_USER" = pi ]; then
+  [ -f "$DROP" ] && rm -f "$DROP" && systemctl daemon-reload && echo "   執行帳號回到 pi"
+else
+  WANT_U=$'[Service]\nUser='"$AGENT_USER"
+  if [ "$(cat "$DROP" 2>/dev/null)" != "$WANT_U" ]; then
+    mkdir -p "$(dirname "$DROP")"; printf '%s\n' "$WANT_U" > "$DROP"; systemctl daemon-reload
+  fi
+  echo "   執行帳號：$AGENT_USER（$DROP）"
+fi
+chown -R "$AGENT_USER:$AGENT_USER" "$HERE" 2>/dev/null || true
 systemctl enable --quiet uav-agent
 echo "   開機自啟：$(systemctl is-enabled uav-agent)"
+
+echo
+echo "== 4b. 5G dongle 的網路與 AT 埠 =="
+# **ModemManager 會搶 AT 埠**：代理直接對 AT 埠取樣，ModemManager 也會去探測、
+# 送它自己的指令——兩邊互相吃掉回應。Fibocom FM160 自己撥號（GTRNDIS），不需要它
+if systemctl is-enabled --quiet ModemManager 2>/dev/null || systemctl is-active --quiet ModemManager 2>/dev/null; then
+  systemctl disable --now ModemManager >/dev/null 2>&1 || true
+  echo "   ModemManager：已停用（會搶 AT 埠）"
+else
+  echo "   ModemManager：沒有在跑"
+fi
+# **netplan＋networkd 的系統（Ubuntu）不會自己管 dongle 的網卡**：沒有設定檔對到它，
+# 網卡就一直是 off、沒有 IP（2026-10-19 第二台機：dongle 已撥上網、分到 IP，
+# Pi 卻從沒把網卡打開）。NetworkManager 的系統（Raspberry Pi OS）會自動 DHCP，不必做。
+# **用驅動比對，不寫死網卡名**：名字是 enx＋MAC，而這顆 dongle 每次重新列舉 MAC 都不一樣
+NP=/etc/netplan/60-5g-dongle.yaml
+if ! systemctl is-active --quiet NetworkManager && command -v netplan >/dev/null; then
+  if [ -f "$NP" ]; then
+    echo "   netplan：$NP 已存在"
+  else
+    cat > "$NP" <<'EOF'
+# 5G dongle（Fibocom FM160，cdc_ether）。用驅動比對，不寫死網卡名（enx＋MAC，MAC 每次列舉都變）
+network:
+  version: 2
+  ethernets:
+    dongle5g:
+      match:
+        driver: cdc_ether
+      dhcp4: true
+      dhcp4-overrides:
+        route-metric: 700
+EOF
+    chmod 600 "$NP"
+    netplan apply 2>/dev/null || true
+    echo "   netplan：已建 $NP 並套用"
+  fi
+else
+  echo "   網路由 NetworkManager 管：dongle 網卡會自動 DHCP"
+fi
 
 echo
 echo "== 5. 時間跟地面站對齊 =="

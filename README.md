@@ -189,25 +189,33 @@ RC 狀態讀 `SYS_STATUS` 的 `MAV_SYS_STATUS_SENSOR_RC_RECEIVER` present／heal
 **空機與已裝好的機是同一行指令**（2026-10-19）：
 
 ```bash
-./deploy.sh --host <Pi 位址> --dry-run     # 先看（不動機上）
-UAV_PI_PASS=<密碼> ./deploy.sh --host <Pi 位址>   # 空機第一次；之後不必給密碼
+cp drone.env.example drone-e.env           # 空機：先把安裝資訊填好（帳密、地面站、AT 埠、sysid）
+./deploy.sh --env drone-e.env --dry-run    # 先看（不動機上）
+./deploy.sh --env drone-e.env              # 從頭裝。之後也可以一直用這行更新
 ./deploy.sh                                # 已裝好的機（位址先問地面站）
 ./deploy.sh --rollback                     # 還原上一次部署前的備份
 ```
 
+**每一欄都填好才會開始**：`--env` 檔缺哪一欄就說哪一欄，連線都還沒連。空機沒給 `--env`
+也一樣不開始——裝到一半才發現少一個值，機上會停在半套的狀態。填好的 `drone-*.env`
+含密碼，已 gitignore。
+
 順序固定，任何一步沒過就停：
 
-1. 連線：沒有金鑰就用 `UAV_PI_PASS` 裝一次（或在終端機上問）；`pi` 的 sudo 要密碼就設成免密碼。
-   **帳號要是 `pi`**（unit 以 `pi` 執行）
+1. 連線：沒有金鑰就用 `--env` 檔的密碼裝一次；sudo 要密碼就設成免密碼。
+   帳號不必是 `pi`：不是的話 `install-service.sh` 用 drop-in 改服務的 `User=`
 2. **5G dongle**（`tools/dongle-check.py`）：USB 在、網卡有 IPv4、**從 5G 那張** ping 得到地面站、
    AT 埠量得到訊號。**沒過就不部署**——這台機的用途就是經 5G 跟地面站講話、同時量 5G
 3. 解鎖閘門：代理在跑時 `state.json` 要新鮮且未解鎖（不知道就中止）
 4. 空機：建 `/opt/uav-agent`、**在開發機下載相依套件推上去**（機上不必有網路）、建 venv
 5. 傳 git 追蹤的檔（不刪機上任何東西；不碰 `state.json`／`.fc_sysid`／`.fc_binding.json`／venv），
    相依有變就照第 4 步的方式裝
-6. `install-service.sh`（**每次都跑，可重跑**）：UART overlay、USB 供電上限、日誌持久化、
-   unit、開機自啟、對時。改到 `config.txt` 就重開機並等它回來
-7. 重啟、逐檔比 md5、驗收：commit 對、獨佔飛控序列埠、意圖通道、**代理量得到 5G**（硬條件）。
+6. `--env` 檔的 `GS_HOST`／`MODEM_PORT`／`FC_SYSID` 寫進機上 `/etc/uav-agent.env`
+7. `install-service.sh`（**每次都跑，可重跑**）：UART overlay、USB 供電上限、日誌持久化、
+   unit 與執行帳號、開機自啟、**停用 ModemManager**（會搶 AT 埠）、**netplan 系統替 dongle
+   網卡建 DHCP 設定**（Ubuntu 不會自己管它；用驅動比對，因為網卡名隨 MAC 每次列舉都變）、
+   對時。改到 `config.txt` 就重開機並等它回來
+8. 重啟、逐檔比 md5、驗收：commit 對、獨佔飛控序列埠、意圖通道、**代理量得到 5G**（硬條件）。
    飛控那格可以是「…」（桌上裝機時常常還沒接飛控）
 
 **每台機不同的參數放機上 `/etc/uav-agent.env`**（例如 `MODEM_PORT=/dev/ttyUSB2`），不要改 unit——
