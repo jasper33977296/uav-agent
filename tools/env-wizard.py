@@ -11,6 +11,7 @@
   全部確認之前，機上什麼都沒動
 
     python3 tools/env-wizard.py drone-e.env      # 檔案不存在就新建
+    python3 tools/env-wizard.py --local machine.env   # 在 Pi 上跑：直接量這台自己
 
 結束碼：0＝檔案已填齊且人確認了；1＝人取消或填不齊。
 """
@@ -260,10 +261,25 @@ def unit_default(k):
     return m.group(1) if m else None
 
 
+def gs_answers(ip):
+    """這個位址上真的有地面站嗎（問 backend 的 /healthz）"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{ip}:38000/healthz", timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def main():
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--local"]
+    local = "--local" in sys.argv[1:]
+    if len(args) != 1:
         print(__doc__); return 1
-    path = sys.argv[1]
+    path = args[0]
+    global FIELDS
+    if local:   # 本機模式：不必連線，帳密不用問
+        FIELDS = [f for f in FIELDS if not f[0].startswith("UAV_PI_")]
     vals, lines = load(path)
     print(f"\n== 安裝資訊：{path}{'' if lines else '（新檔，照 drone.env.example）'} ==")
     if all(vals.get(k) for k, _ in FIELDS):
@@ -273,6 +289,11 @@ def main():
             return 0
         if a != "e":
             return 1
+
+    if local:
+        print("\n③ 量這台機（只讀，不改任何東西）…")
+        r = subprocess.run(["python3", "-"], input=PROBE, capture_output=True, text=True, timeout=60)
+        return finish(path, vals, lines, r, local=True)
 
     # 1. Pi 在哪
     print("\n① Pi 的位址（找相連網段上的樹莓派…）")
@@ -294,16 +315,26 @@ def main():
     # 3. 連上去看（只讀）
     print("\n③ 到機上找 dongle 與飛控（只讀，不改任何東西）…")
     r = ssh(vals["UAV_PI_USER"], vals["UAV_PI_HOST"], vals["UAV_PI_PASS"], "python3 -", PROBE, 60)
+    return finish(path, vals, lines, r, local=False)
+
+
+def finish(path, vals, lines, r, local):
     try:
         p = json.loads(r.stdout.strip().splitlines()[-1])
     except Exception:
         print(f"     ✗ 機上檢查失敗：{r.stderr.strip()[-200:]}"); p = {}
 
-    # 地面站位址：dongle 拿到的網段上，這台自己的位址
+    # 地面站位址：從地面站跑時＝dongle 網段上這台自己的位址；在 Pi 上跑時
+    # 量不到「地面站是誰」，只能拿候選去問它是不是真的地面站
     gs_c = []
-    for nic, cidr in (p.get("nics") or {}).items():
-        if cidr and (ip := local_ip_in(cidr)):
-            gs_c.append((ip, f"這台在 dongle 網段（{nic} {cidr}）上的位址"))
+    if not local:
+        for nic, cidr in (p.get("nics") or {}).items():
+            if cidr and (ip := local_ip_in(cidr)):
+                gs_c.append((ip, f"這台在 dongle 網段（{nic} {cidr}）上的位址"))
+    else:
+        for ip in dict.fromkeys(filter(None, [vals.get("GS_HOST"), unit_default("GS_HOST")])):
+            gs_c.append((ip, "地面站服務有回應" if gs_answers(ip) else "⚠ 問不到地面站服務（位址不對、或 5G 還沒通）"))
+        gs_c.sort(key=lambda c: c[1].startswith("⚠"))
     if not gs_c and p.get("dongle"):
         print("     ⚠ dongle 網卡還沒有 IP（Ubuntu 要靠安裝時補的 netplan）——地面站位址用預設值，請確認")
     if (d := unit_default("GS_HOST")) and d not in [c[0] for c in gs_c]:

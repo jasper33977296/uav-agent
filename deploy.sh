@@ -68,10 +68,24 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s ==\n' "$*"; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 
+# ── 本機模式 ─────────────────────────────────────────────────
+# **在 Pi 上 git pull 下來直接跑**（使用者 2026-10-19）：沒給 --host、而且這台就是
+# 樹莓派 → 裝到自己身上，不走 SSH。裝好之後**刪掉 pull 下來的這個資料夾**
+# （程式只留在 /opt/uav-agent；資料夾裡的 drone-*.env 含密碼，一起刪）。
+# 相依套件在機上自己下載，所以這個模式機上要能上網；不能的話從地面站跑
+LOCAL=0
+if [ -z "$HOST" ] && grep -qa "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
+  LOCAL=1
+  HOST=localhost
+  [ -n "$ENVFILE" ] || ENVFILE=machine.env
+fi
+
 # ── 0. 這台機的安裝資訊 ──────────────────────────────────────
 # **填好才開始**（使用者 2026-10-19）：機密與必要參數全部填齊之前什麼都不做——
 # 裝到一半才發現少一個值，機上會停在一個半套的狀態。欄位見 drone.env.example
 REQUIRED=(UAV_PI_HOST UAV_PI_USER UAV_PI_PASS GS_HOST MODEM_PORT FC_SYSID FC_BAUD)
+# 本機模式不必連線：帳號就是正在跑的人，密碼只在 sudo 要密碼時才問
+[ "$LOCAL" = 1 ] && REQUIRED=(GS_HOST MODEM_PORT FC_SYSID FC_BAUD)
 #: 寫進機上 /etc/uav-agent.env 的那幾欄（蓋過 unit 的共用預設）
 MACHINE_KEYS=(GS_HOST MODEM_PORT FC_SYSID FC_BAUD)
 cd "$HERE"
@@ -81,7 +95,8 @@ if [ -n "$ENVFILE" ]; then
   # 找得到的（Pi 在哪、地面站、AT 埠、飛控 sysid）先找好給人確認。找的時候只讀，
   # 人確認之前機上什麼都沒動。沒有終端機（自動化）就照檔案，缺欄位一樣停
   if [ -t 0 ]; then
-    python3 tools/env-wizard.py "$ENVFILE" || die "安裝資訊沒有確認——**什麼都還沒做**"
+    python3 tools/env-wizard.py $([ "$LOCAL" = 1 ] && echo --local) "$ENVFILE" \
+      || die "安裝資訊沒有確認——**什麼都還沒做**"
   fi
   [ -f "$ENVFILE" ] || die "找不到 $ENVFILE——在終端機上跑會有精靈帶著填，或從 drone.env.example 複製一份填好"
   case "$ENVFILE" in /*) ;; *) ENVFILE="./$ENVFILE" ;; esac
@@ -95,6 +110,7 @@ if [ -n "$ENVFILE" ]; then
   [ -n "$HOST" ] || HOST=$UAV_PI_HOST
 fi
 U="${UAV_PI_USER:-pi}"
+[ "$LOCAL" = 1 ] && U=$(id -un)
 
 # ── 1. 前置 ──────────────────────────────────────────────────
 step "1. 前置"
@@ -128,7 +144,9 @@ for v in d.values():
         print(ip); break" 2>/dev/null
 }
 
-if [ -z "$HOST" ]; then
+if [ "$LOCAL" = 1 ]; then
+  say "   **本機模式**：裝到這台自己（$(hostname)，帳號 $U）"
+elif [ -z "$HOST" ]; then
   LEARNED=$(learn_host || true)
   for h in $LEARNED 10.141.2.32 10.101.129.121; do
     if ssh "${SSH_OPTS[@]}" "$U@$h" true 2>/dev/null; then
@@ -159,15 +177,24 @@ elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null; then
   ssh "${SSH_OPTS[@]}" "$U@$HOST" true || die "金鑰裝了還是連不到 $U@$HOST"
 fi
 say "   Pi：$HOST"
-R() { ssh "${SSH_OPTS[@]}" "$U@$HOST" "$@"; }
-# rsync 的目的地：IPv6 位址要加中括號
-case "$HOST" in *:*) RT="$U@[$HOST]" ;; *) RT="$U@$HOST" ;; esac
+if [ "$LOCAL" = 1 ]; then
+  R() { bash -c "$*"; }
+  DSTP=$DEST
+else
+  R() { ssh "${SSH_OPTS[@]}" "$U@$HOST" "$@"; }
+  # rsync 的目的地：IPv6 位址要加中括號
+  case "$HOST" in *:*) DSTP="$U@[$HOST]:$DEST" ;; *) DSTP="$U@$HOST:$DEST" ;; esac
+fi
 
 # **免密碼 sudo**：重啟服務、裝 unit、改開機設定都要，而部署中途沒辦法問密碼。
 # Raspberry Pi Imager 建的第一個帳號通常已經有；沒有就用 UAV_PI_PASS 補一次
-if ! R "sudo -n true" 2>/dev/null; then
+if [ "$LOCAL" = 1 ] && ! sudo -n true 2>/dev/null && [ -t 0 ] && [ -z "${UAV_PI_PASS:-}" ]; then
+  # 本機、有終端機：直接讓 sudo 問一次密碼
+  sudo -v -p "   sudo 密碼（設定免密碼 sudo 用，只問這一次）：" && UAV_PI_PASS=__cached__
+fi
+if ! R "sudo -n true" 2>/dev/null || [ "${UAV_PI_PASS:-}" = __cached__ ]; then
   [ -n "${UAV_PI_PASS:-}" ] || die "$U 在 $HOST 上的 sudo 要密碼。在 --env 檔填 UAV_PI_PASS，會設成免密碼"
-  printf '%s\n' "$UAV_PI_PASS" | R "sudo -S -p '' sh -c 'echo \"$U ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/010_uav-nopasswd && chmod 440 /etc/sudoers.d/010_uav-nopasswd'" \
+  { [ "$UAV_PI_PASS" = __cached__ ] && echo || printf '%s\n' "$UAV_PI_PASS"; } | R "sudo -S -p '' sh -c 'echo \"$U ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/010_uav-nopasswd && chmod 440 /etc/sudoers.d/010_uav-nopasswd'" \
     && R "sudo -n true" || die "設定免密碼 sudo 失敗"
   say "   已設 $U 免密碼 sudo"
 fi
@@ -243,7 +270,7 @@ git ls-files > "$LIST"
 N=$(wc -l < "$LIST")
 say "   git 追蹤的 $N 個檔（不刪機上任何東西；不碰 state.json／.fc_sysid／venv）"
 if [ "$FRESH" = 1 ]; then CHANGES="（空機：全部 $N 個檔）"; else
-CHANGES=$(rsync -ani --checksum --files-from="$LIST" ./ "$RT:$DEST/" | grep -E '^[<>c]' || true); fi
+CHANGES=$(rsync -ani --checksum --files-from="$LIST" ./ "$DSTP/" | grep -E '^[<>c]' || true); fi
 if [ -z "$CHANGES" ]; then say "   沒有檔案不同"; else printf '%s\n' "$CHANGES" | sed 's/^/   /'; fi
 
 # ── 4. unit ──────────────────────────────────────────────────
@@ -278,6 +305,12 @@ push_wheels() {
   pyv=$(R "python3 -c 'import sys;print(\"%d.%d\" % sys.version_info[:2])'")
   arch=$(R "uname -m")
   [ "$arch" = aarch64 ] || die "機上是 $arch，這裡只準備了 aarch64 的套件"
+  if [ "$LOCAL" = 1 ]; then
+    R "mkdir -p $DEST/.wheels && python3 -m pip download -q --dest $DEST/.wheels --only-binary=:all: -r requirements.txt pip" \
+      || die "在機上下載相依套件失敗（這個模式機上要能上網）。改從地面站跑：./deploy.sh --env <檔> --host <這台的位址>"
+    say "   相依套件（Python $pyv／$arch）已在機上下載"
+    return
+  fi
   cache="${XDG_CACHE_HOME:-$HOME/.cache}/uav-agent-wheels/py$pyv"
   mkdir -p "$cache"
   python3 -m pip download -q --dest "$cache" --only-binary=:all: \
@@ -285,7 +318,7 @@ push_wheels() {
     --platform manylinux_2_28_aarch64 --platform any --python-version "$pyv" \
     -r requirements.txt pip \
     || die "下載相依套件失敗（開發機要能上網，或 $cache 裡已經有）"
-  rsync -a --delete "$cache"/ "$RT:$DEST/.wheels/"
+  rsync -a --delete "$cache"/ "$DSTP/.wheels/"
   say "   相依套件（Python $pyv／$arch）已推上去：$(ls "$cache" | wc -l) 個 wheel"
 }
 
@@ -294,7 +327,7 @@ if [ "$FRESH" = 1 ]; then
   R "command -v rsync >/dev/null" || R "sudo apt-get install -y -q rsync" \
     || die "機上沒有 rsync，也裝不起來（沒網路）"
   R "sudo install -d -o $U -g $U $DEST"
-  rsync -a --files-from="$LIST" ./ "$RT:$DEST/"
+  rsync -a --files-from="$LIST" ./ "$DSTP/"
   say "   程式已傳到 $DEST"
   push_wheels
   # Debian 把 venv 的 ensurepip 拆成另一個套件；沒裝的話用推上去的 pip wheel 自己補
@@ -316,7 +349,7 @@ R "set -e; mkdir -p '$BAK'; cd '$DEST'; \
    [ -f DEPLOYED ] && cp DEPLOYED '$BAK/DEPLOYED.prev' || true" < "$LIST"
 say "   備份：$BAK（機上原本的 $OLD）"
 R "ls -1d $DEST/.bak-deploy-* | sort | head -n -$KEEP | xargs -r rm -rf"
-rsync -a --checksum --files-from="$LIST" ./ "$RT:$DEST/"
+rsync -a --checksum --files-from="$LIST" ./ "$DSTP/"
 say "   已傳送"
 if [ -n "$UNIT_DIFF" ]; then
   R "set -e; if [ -f $UNIT ]; then sudo cp $UNIT $UNIT.bak-$(date +%Y%m%d-%H%M%S); fi; \
@@ -425,7 +458,23 @@ elif [ "$RC" = 3 ]; then
 fi
 
 if [ "$FAIL" = 0 ]; then
+  # 相依套件只在安裝時用，裝進 venv 之後就是暫存
+  R "rm -rf $DEST/.wheels"
   say ""; say "✓ 部署完成：$COMMIT$([ "$DIRTY" = true ] && echo '（dirty）') → $U@$HOST:$DEST$([ "$FRESH" = 1 ] && echo '（初次安裝）')"
+  if [ "$LOCAL" = 1 ]; then
+    # **裝好了就刪掉 pull 下來的資料夾**（使用者 2026-10-19）：程式只該有一份，在
+    # /opt/uav-agent。留著的話之後有人改了這份、以為改到的是在跑的那份；而且裡面的
+    # drone-*.env 含密碼。只刪「確定是 uav-agent 的 git clone、而且不是安裝目的地」的
+    SRC=$(cd "$HERE" && pwd -P)
+    if [ "$SRC" != "$(cd "$DEST" && pwd -P)" ] && [ "$SRC" != / ] && [ "$SRC" != "$(cd ~ && pwd -P)" ] \
+       && [ -d "$SRC/.git" ] && [ -f "$SRC/agent.py" ] && [ -f "$SRC/deploy.sh" ]; then
+      cd /
+      rm -rf "$SRC"
+      say "   已刪除安裝來源 $SRC（程式只留在 $DEST；之後更新：在別處重新 pull 再跑，或從地面站跑）"
+    else
+      say "   安裝來源 $SRC 看起來不是一份單純的 clone，沒有刪——請自己確認"
+    fi
+  fi
 else
   say ""; say "✗ 驗收沒過。**沒有自動回滾**（保留現場）。要回到上一版：./deploy.sh --rollback"
   exit 1
