@@ -1368,8 +1368,12 @@ class Agent:
         self.param_quiet_end(now)
         self._verify_retry(now)
         self.request_board_id()
-        self.request_fs_gcs(now)
-        self._check_fs_gcs(now)
+        # **飛控參數自檢讀的是眼前那塊飛控**（076，2026-10-19 實機測試抓到）：
+        # 不符時照做，「FS_GCS_ENABLE=0」這種別塊板子的事實就會以綁定那台的
+        # 身分上地面站。確認是綁定那塊之後才問、才說
+        if self.binding is None or self.binding_state == "ok":
+            self.request_fs_gcs(now)
+            self._check_fs_gcs(now)
         self.request_streams_once()
         self.say_hello()
         self._maybe_reassign(now)

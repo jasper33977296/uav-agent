@@ -330,6 +330,29 @@ chk("狀態只送綁定現況，不送 B 的飛行狀態",
     pub and pub[-1]["state"] is None and pub[-1]["derived"] is None
     and pub[-1]["fc_binding"]["state"] == "mismatch")
 
+# ── 9b. 不符時不做飛控參數自檢 ──────────────────────────────────
+print("── 9b. 不符時不替綁定那台說眼前飛控的參數")
+asked = []
+g4.request_fs_gcs = lambda now: asked.append("req")
+g4._check_fs_gcs = lambda now: asked.append("chk")
+for k in ("param_quiet_end", "request_board_id", "request_streams_once", "say_hello",
+          "_maybe_reassign", "_track_mode_owner", "_expire_seq", "_publish_state",
+          "_check_fc_link", "_maybe_reopen_serial", "_check_gs_link",
+          "_check_port_tamper", "_check_port_holders"):
+    setattr(g4, k, lambda *a, **kw: None)
+g4.fd, g4.serial = None, None
+g4.telem = types.SimpleNamespace(sock=None, recv=lambda: [])
+g4.cmd = types.SimpleNamespace(sock=None, recv=lambda: [])
+A.select.select = lambda r, w, x, t: ([], [], [])
+g4.mon.last_hb = 0.0
+g4.last_stream_req = g4.last_report = 1e18
+g4.a.report_interval = 1e9
+g4.tick()
+chk("不符時沒有問、也沒有說飛控的 failsafe 設定", asked == [], asked)
+g4.binding_state = "ok"
+g4.tick()
+chk("相符時照常自檢", asked == ["req", "chk"], asked)
+
 # ── 10. 重問 ───────────────────────────────────────────────────
 print("── 10. 確認中沒有回答 → 重問")
 g5 = new_agent(BF4, RD)
