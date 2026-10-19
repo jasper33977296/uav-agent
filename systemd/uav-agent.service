@@ -58,6 +58,10 @@ EnvironmentFile=-/etc/uav-agent.env
 # **啟動前先對時**（uav-system 070，2026-09-22 使用者裁定）。`+`＝這一步以 root 跑
 # （要重啟 timesyncd），代理本身仍是 pi。已對過就立刻過；沒對過最多等 60 秒，
 # **逾時照樣啟動**——沒有橋比時間錯更糟。TimeoutStartSec 要比那 60 秒寬
+# **代理在跑時完全佔用它的序列埠**（使用者 2026-10-19）：先把開著飛控埠／AT 埠的
+# 別人封鎖並停掉，停機時再解除封鎖。見 claim-ports.sh
+ExecStartPre=+/opt/uav-agent/systemd/claim-ports.sh claim
+ExecStopPost=+/opt/uav-agent/systemd/claim-ports.sh release
 ExecStartPre=+/opt/uav-agent/systemd/wait-time-sync.sh
 TimeoutStartSec=120
 ExecStart=/opt/uav-agent/venv/bin/python /opt/uav-agent/agent.py
