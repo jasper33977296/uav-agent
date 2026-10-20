@@ -35,6 +35,10 @@ class FakeOutbox:
 class Args: gs = "10.141.2.22"
 
 
+A.Agent.gs_link_ok = None
+A.Agent.uplink_ok = None
+
+
 ag = A.Agent.__new__(A.Agent)
 ag.a, ag.telem, ag.cmd, ag.intent, ag.outbox = Args(), FakeLink(), FakeLink(), FakeIntent(), FakeOutbox()
 seq = []
@@ -83,6 +87,35 @@ print("── 代理沒有意圖通道（還沒註冊）時不出錯")
 ag.intent = None
 step({"nic": "enxddd", "ip": "10.141.2.40", "prefix": 24, "gw": "10.141.2.30"})
 check(ag.telem.rebinds == 3, "照樣重綁")
+
+print("── 有 IP、但地面站兩個方向都不通 → 30 秒後重新要 IP（每分鐘最多一次）")
+calls = []
+class R: stdout, stderr = "NetworkManager：usb0 重新連線", ""
+A.subprocess.run = lambda cmd, **k: (calls.append(cmd) or R())
+ag.intent = FakeIntent()
+same = {"nic": "usb0", "ip": "192.168.187.22", "prefix": 24, "gw": "192.168.187.1"}
+step(same)                                  # IP 變了：重連流程，計時歸零
+ag.gs_link_ok, ag.uplink_ok = False, False
+for _ in range(20):                         # 22 秒：還沒到 30 秒
+    step(same)
+check(not calls, "不通 22 秒：還不動手")
+for _ in range(10):
+    step(same)
+check(len(calls) == 1 and calls[0][:2] == ["sudo", "-n"] and calls[0][-1] == "usb0",
+      "不通超過 30 秒：sudo -n dongle-renew.sh usb0 一次")
+check(ag.outbox.notes[-1][0] == "net" and "重新跟 dongle 要 IP" in ag.outbox.notes[-1][2], "發 net notice")
+for _ in range(40):
+    step(same)
+check(len(calls) == 1, "一分鐘內不再重新要")
+for _ in range(15):
+    step(same)
+check(len(calls) == 2, "滿一分鐘還不通：再要一次")
+ag.uplink_ok = True                          # 單向通：是回程對映的事，不重新要 IP
+n = len(calls)
+for _ in range(80):
+    step(same)
+check(len(calls) == n, "只有一個方向不通：不動 IP（那是重綁的事）")
+check(ag._net_dead_since is None, "通了就把計時歸零")
 
 print("全部通過" if not fails else f"{fails} 項沒過")
 sys.exit(1 if fails else 0)

@@ -65,6 +65,7 @@ import fcntl
 import json
 import logging
 import os
+import subprocess
 import select
 import socket
 import termios
@@ -647,6 +648,9 @@ class Agent:
     net_route_err = None
     _net_t = 0.0
     _net_last = None        # 最後一次有 IP 的樣子（斷線期間 net 是空的，訊息要說得出「之前是什麼」）
+    _net_dead_since = None  # dongle 有 IP、但地面站兩個方向都不通，從什麼時候開始
+    _net_renew_t = 0.0
+    net_renews = 0
     last_fc_rx = 0.0
     caps_req_at = 0.0
     mismatch_said = None
@@ -2511,7 +2515,9 @@ class Agent:
         prev = self.net
         if (cur or {}).get("nic") == (prev or {}).get("nic") and (cur or {}).get("ip") == (prev or {}).get("ip"):
             self.net = cur
+            self._maybe_renew(cur, now)
             return
+        self._net_dead_since = None
         self.net = cur
         first = prev is None and self.net_changes == 0
         if cur and cur.get("ip"):
@@ -2543,6 +2549,42 @@ class Agent:
         self.outbox.note("net", f"5G 重新連上：{was} → {now_s}"
                          + ("" if not self.net_route_err else f"（路由沒補上：{self.net_route_err}）"),
                          "info" if not self.net_route_err else "warning", now)
+
+    #: dongle 有 IP、但地面站兩個方向都不通多久之後，叫網卡重新跟 dongle 要一次 IP
+    NET_RENEW_AFTER_S = 30.0
+    NET_RENEW_EVERY_S = 60.0
+
+    def _maybe_renew(self, cur, now):
+        """**有 IP 卻到不了地面站 → 重新要一次 IP**（2026-10-20 對調 dongle）。
+
+        drone C（NetworkManager）換上另一顆 dongle 後拿到 dongle 自己的內部位址
+        192.168.187.22，而 NetworkManager 一直留著那個租約不再重要——6 分鐘不通，
+        路由補得再對也沒用（那個位址上 dongle 不轉送）。同一顆在 networkd 上 14 秒就
+        拿到電信 IP。不管成因是哪一種，「有 IP、兩個方向都不通」就是要重新要的訊號。
+        只認兩個方向**都**不通：單向（gs_link_ok 或 uplink_ok 有一個是 True）是回程
+        位址對映的事，那條路由 `_check_gs_link` 的重綁處理"""
+        if not cur or not cur.get("ip") or self.gs_link_ok or self.uplink_ok:
+            self._net_dead_since = None
+            return
+        if self._net_dead_since is None:
+            self._net_dead_since = now
+            return
+        if (now - self._net_dead_since < self.NET_RENEW_AFTER_S
+                or now - self._net_renew_t < self.NET_RENEW_EVERY_S):
+            return
+        self._net_renew_t = now
+        self.net_renews += 1
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "systemd", "dongle-renew.sh")
+        try:
+            r = subprocess.run(["sudo", "-n", script, cur["nic"]], capture_output=True,
+                               text=True, timeout=20)
+            out = (r.stdout or r.stderr).strip()
+        except Exception as e:
+            out = f"失敗：{e}"
+        log.warning("dongle %s 有 IP %s 但地面站 %.0f 秒兩個方向都不通——重新要 IP：%s",
+                    cur["nic"], cur["ip"], now - self._net_dead_since, out)
+        self.outbox.note("net", f"5G 有 IP（{cur['ip']}）但 {now - self._net_dead_since:.0f} 秒"
+                         f"到不了地面站——重新跟 dongle 要 IP（{out}）", "warning", now)
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
@@ -2964,7 +3006,7 @@ class Agent:
             # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
             "foreign_sysids": {str(k): v for k, v in self.foreign.items()},
             # 5G dongle 現在是哪張網卡、哪個 IP（每次重新列舉都可能不同）
-            "net": {**(self.net or {}), "changes": self.net_changes,
+            "net": {**(self.net or {}), "changes": self.net_changes, "renews": self.net_renews,
                     "gs_route": self.net_route, "gs_route_err": self.net_route_err},
             "udp": {"telem": self.telem.port, "cmd": self.cmd.port,
                     "rebinds": self.telem.rebinds},
