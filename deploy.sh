@@ -186,6 +186,29 @@ except Exception:
 print(' '.join(sorted({v.get('ip') for v in d.values() if v.get('ip')})))" 2>/dev/null
 }
 
+# ── 連線前先認機器 ───────────────────────────────────────────
+# **先確認這個位址上是誰，再記它的主機金鑰**（2026-10-20）。原本直接用
+# HostKeyAlias 連 env 檔寫的位址——對調 dongle 後那裡是另一台，accept-new 就把
+# **另一台的金鑰記在這台的名字下**，之後連到真的這台反而被拒。所以先用不核也不記
+# 金鑰的連線讀 machine-id；對不上就去地面站學到的每個位址找
+if [ -n "${UAV_PI_MACHINE_ID:-}" ] && [ "$LOCAL" = 0 ] && [ -n "$HOST" ]; then
+  mid_at() { ssh "${PROBE_OPTS[@]}" "$U@$1" "cat /etc/machine-id" 2>/dev/null || true; }
+  if [ "$(mid_at "$HOST")" != "$UAV_PI_MACHINE_ID" ]; then
+    FOUND=""
+    for h in $(learn_host_all || true); do
+      [ "$h" = "$HOST" ] && continue
+      if [ "$(mid_at "$h")" = "$UAV_PI_MACHINE_ID" ]; then FOUND=$h; break; fi
+    done
+    if [ -n "$FOUND" ]; then
+      say "   ⚠ $HOST 上不是 $ENVFILE 那台；在 $FOUND 找到了（machine-id 相符，dongle 換過？）→ 改用，並寫回 $ENVFILE"
+      sed -i "s|^UAV_PI_HOST=.*|UAV_PI_HOST=$FOUND|" "$ENVFILE"
+      HOST=$FOUND
+    else
+      say "   （$HOST 上還認不出是不是 $ENVFILE 那台——可能還沒裝金鑰；連上後會再核對一次）"
+    fi
+  fi
+fi
+
 if [ "$LOCAL" = 1 ]; then
   say "   **本機模式**：裝到這台自己（$(hostname)，帳號 $U）"
 elif [ -z "$HOST" ]; then
@@ -198,15 +221,6 @@ elif [ -z "$HOST" ]; then
     fi
   done
   [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
-elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null && [ -n "${UAV_PI_MACHINE_ID:-}" ] \
-     && FOUND=$(for h in $(learn_host_all || true); do
-                  [ "$(ssh "${PROBE_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null)" = "$UAV_PI_MACHINE_ID" ] \
-                    && { echo "$h"; break; }; done) && [ -n "$FOUND" ]; then
-  # 登不進 env 檔寫的位址，但認得這台的 machine-id：多半是位址換了（dongle 對調）。
-  # **先去別的位址找它，不要在錯的機器上裝金鑰**
-  say "   ⚠ $U@$HOST 登不進去，但在 $FOUND 找到了 $ENVFILE 那台（machine-id 相符）——改用，並寫回 $ENVFILE"
-  sed -i "s|^UAV_PI_HOST=.*|UAV_PI_HOST=$FOUND|" "$ENVFILE"
-  HOST=$FOUND
 elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null; then
   # **新機第一次連**：還沒有金鑰。裝一次，之後全程免密碼
   # 先分清楚是「要密碼」還是「根本連不到」——後者裝金鑰也沒用
