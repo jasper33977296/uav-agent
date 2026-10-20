@@ -148,6 +148,15 @@ fi
 say "   commit $COMMIT$([ "$DIRTY" = true ] && echo '（dirty）')"
 
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+# **主機金鑰跟著機器記，不跟著 IP 記**（2026-10-20 對調 dongle）：IP 跟著 dongle 走，
+# 對調後 known_hosts 裡「.29 的金鑰」是另一台的——SSH 正確地拒絕連線，部署跟著卡住。
+# 知道這台的 machine-id 時，用它當金鑰的名字；換到哪個 IP 都對得上，換一台機器就對不上
+[ -n "${UAV_PI_MACHINE_ID:-}" ] && SSH_OPTS+=(-o "HostKeyAlias=uav-$UAV_PI_MACHINE_ID")
+# 「到各位址找這台」只讀 machine-id：那時還不知道每個位址上是誰，不能拿任何一把已知金鑰去核
+PROBE_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+# rsync 底下也是 ssh：要用同一組選項，不然它會照 IP 去核舊金鑰
+export RSYNC_RSH="ssh ${SSH_OPTS[*]}"
 
 # 機上位址**先問地面站**（2026-10-01）。指令服務會從實際收到的封包學對端位址
 # 並寫進 peers.json——那是「這台機現在在哪」的事實源，而寫死的清單不是。
@@ -191,7 +200,7 @@ elif [ -z "$HOST" ]; then
   [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
 elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null && [ -n "${UAV_PI_MACHINE_ID:-}" ] \
      && FOUND=$(for h in $(learn_host_all || true); do
-                  [ "$(ssh "${SSH_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null)" = "$UAV_PI_MACHINE_ID" ] \
+                  [ "$(ssh "${PROBE_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null)" = "$UAV_PI_MACHINE_ID" ] \
                     && { echo "$h"; break; }; done) && [ -n "$FOUND" ]; then
   # 登不進 env 檔寫的位址，但認得這台的 machine-id：多半是位址換了（dongle 對調）。
   # **先去別的位址找它，不要在錯的機器上裝金鑰**
@@ -253,7 +262,7 @@ if [ -n "${UAV_PI_MACHINE_ID:-}" ] && [ "$LOCAL" = 0 ]; then
     FOUND=""
     for h in $(learn_host_all || true); do
       [ "$h" = "$HOST" ] && continue
-      m=$(ssh "${SSH_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null || true)
+      m=$(ssh "${PROBE_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null || true)
       if [ "$m" = "$UAV_PI_MACHINE_ID" ]; then FOUND=$h; break; fi
     done
     [ -n "$FOUND" ] || die "找不到 machine-id $UAV_PI_MACHINE_ID 的機——$HOST 上的是 $other，不是 $ENVFILE 那台。**什麼都沒做**"

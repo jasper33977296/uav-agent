@@ -50,6 +50,9 @@ MAX = 500
 THROTTLED = {"gs_link", "net"}
 WINDOW_S = 600.0
 BURST = 4
+#: 個別類別的額度。一次換 dongle 就有斷線、回來、重新要 IP、再回來 5 則左右
+#: （2026-10-20 實測第 5 則「重新連上 → 電信 IP」——最重要的那則——被併掉）
+BURST_BY_KIND = {"net": 8}
 
 LEVELS = ("info", "warning", "critical")
 
@@ -80,7 +83,7 @@ class Outbox:
             self._flush_windows(now)
             if kind in THROTTLED:
                 w = self._win.setdefault(kind, [now, 0, 0])
-                if w[1] >= self.burst:
+                if w[1] >= BURST_BY_KIND.get(kind, self.burst):
                     w[2] += 1
                     self.throttled += 1
                     return
