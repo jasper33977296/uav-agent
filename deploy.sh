@@ -166,6 +166,17 @@ for v in d.values():
         print(ip); break" 2>/dev/null
 }
 
+# 地面站學到的**所有**對端位址（找「這台機現在在哪」用）
+learn_host_all() {
+  docker exec uav-command cat /state/peers.json 2>/dev/null \
+    | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin).get('peers') or {}
+except Exception:
+    raise SystemExit
+print(' '.join(sorted({v.get('ip') for v in d.values() if v.get('ip')})))" 2>/dev/null
+}
+
 if [ "$LOCAL" = 1 ]; then
   say "   **本機模式**：裝到這台自己（$(hostname)，帳號 $U）"
 elif [ -z "$HOST" ]; then
@@ -178,6 +189,15 @@ elif [ -z "$HOST" ]; then
     fi
   done
   [ -n "$HOST" ] || die "連不到 Pi。試過：${LEARNED:+$LEARNED（地面站學到的）、}10.141.2.32、10.101.129.121。用 --host <位址> 指定"
+elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null && [ -n "${UAV_PI_MACHINE_ID:-}" ] \
+     && FOUND=$(for h in $(learn_host_all || true); do
+                  [ "$(ssh "${SSH_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null)" = "$UAV_PI_MACHINE_ID" ] \
+                    && { echo "$h"; break; }; done) && [ -n "$FOUND" ]; then
+  # 登不進 env 檔寫的位址，但認得這台的 machine-id：多半是位址換了（dongle 對調）。
+  # **先去別的位址找它，不要在錯的機器上裝金鑰**
+  say "   ⚠ $U@$HOST 登不進去，但在 $FOUND 找到了 $ENVFILE 那台（machine-id 相符）——改用，並寫回 $ENVFILE"
+  sed -i "s|^UAV_PI_HOST=.*|UAV_PI_HOST=$FOUND|" "$ENVFILE"
+  HOST=$FOUND
 elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null; then
   # **新機第一次連**：還沒有金鑰。裝一次，之後全程免密碼
   # 先分清楚是「要密碼」還是「根本連不到」——後者裝金鑰也沒用
@@ -220,6 +240,38 @@ if ! R "sudo -n true" 2>/dev/null || [ "${UAV_PI_PASS:-}" = __cached__ ]; then
     && R "sudo -n true" || die "設定免密碼 sudo 失敗"
   say "   已設 $U 免密碼 sudo"
 fi
+# ── 1a. 這個位址上的是不是這台機 ─────────────────────────────
+# **位址會換、機器不會**（2026-10-20：使用者要對調兩台的 dongle——IP 跟著 dongle 走，
+# 對調之後 drone-e.env 寫的位址上是 drone C）。env 檔記著機器本身的 /etc/machine-id；
+# 對不上就去地面站學到的每個對端位址找這台現在在哪，找到就改用、並寫回 env 檔，
+# 找不到就停——**把 A 機的設定裝到 B 機上**比什麼都不做更糟
+if [ -n "${UAV_PI_MACHINE_ID:-}" ] && [ "$LOCAL" = 0 ]; then
+  MID=$(R "cat /etc/machine-id" 2>/dev/null || true)
+  if [ "$MID" != "$UAV_PI_MACHINE_ID" ]; then
+    other=$(R "hostname" 2>/dev/null || echo "?")
+    say "   ⚠ $HOST 上現在是另一台機（hostname $other）——去地面站學到的位址找 $ENVFILE 那台"
+    FOUND=""
+    for h in $(learn_host_all || true); do
+      [ "$h" = "$HOST" ] && continue
+      m=$(ssh "${SSH_OPTS[@]}" "$U@$h" "cat /etc/machine-id" 2>/dev/null || true)
+      if [ "$m" = "$UAV_PI_MACHINE_ID" ]; then FOUND=$h; break; fi
+    done
+    [ -n "$FOUND" ] || die "找不到 machine-id $UAV_PI_MACHINE_ID 的機——$HOST 上的是 $other，不是 $ENVFILE 那台。**什麼都沒做**"
+    say "   ✓ 找到了：它現在在 $FOUND（dongle 換過？）→ 改用這個位址，並寫回 $ENVFILE"
+    sed -i "s|^UAV_PI_HOST=.*|UAV_PI_HOST=$FOUND|" "$ENVFILE"
+    HOST=$FOUND
+    case "$HOST" in *:*) DSTP="$U@[$HOST]:$DEST" ;; *) DSTP="$U@$HOST:$DEST" ;; esac
+  else
+    say "   ✓ 這個位址上確實是 $ENVFILE 那台（machine-id 相符）"
+  fi
+elif [ -n "$ENVFILE" ] && [ "$LOCAL" = 0 ]; then
+  MID=$(R "cat /etc/machine-id" 2>/dev/null || true)
+  if [ -n "$MID" ]; then
+    printf '\n# 機器本身的身分（部署時核對；位址會換、它不會）\nUAV_PI_MACHINE_ID=%s\n' "$MID" >> "$ENVFILE"
+    say "   記下這台的 machine-id 到 $ENVFILE（之後位址換了也認得出來）"
+  fi
+fi
+
 FRESH=0
 R "test -x $DEST/venv/bin/python" || FRESH=1
 if [ "$FRESH" = 1 ]; then
