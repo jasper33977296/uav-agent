@@ -18,11 +18,36 @@ SYNC_FLAG = "/run/systemd/timesync/synchronized"
 CLOCK_SANE_EPOCH = 1_600_000_000
 
 
+_kernel_cache = (0.0, None)
+
+
+def _kernel_synced():
+    """問核心時鐘有沒有被校正過（adjtimex）。**跟用哪一支對時程式無關**——chrony、
+    ntpd、timesyncd 都會清掉核心的「未同步」狀態。問不到回 None。結果快取 5 秒"""
+    global _kernel_cache
+    now = time.monotonic()
+    if now - _kernel_cache[0] < 5:
+        return _kernel_cache[1]
+    try:
+        import ctypes
+        buf = ctypes.create_string_buffer(256)      # struct timex；modes=0＝只讀
+        state = ctypes.CDLL(None, use_errno=True).adjtimex(buf)
+        res = None if state < 0 else state != 5      # 5＝TIME_ERROR：時鐘未同步
+    except Exception:
+        res = None
+    _kernel_cache = (now, res)
+    return res
+
+
 def synced() -> bool:
     """牆鐘可不可信。**有 timesyncd 就只認它的旗標**：換電池重開時牆鐘是
-    「上次存下的時間」，不是 1970，光看年份分不出它還沒對過。"""
+    「上次存下的時間」，不是 1970，光看年份分不出它還沒對過。
+    沒有 timesyncd（chrony 等）→ 問核心；問不到才退回看年份"""
     if os.path.isdir(os.path.dirname(SYNC_FLAG)):
         return os.path.exists(SYNC_FLAG)
+    k = _kernel_synced()
+    if k is not None:
+        return k
     return time.time() >= CLOCK_SANE_EPOCH
 
 

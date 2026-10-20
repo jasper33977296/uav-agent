@@ -376,6 +376,41 @@ fi
 SVC_OUT=$(R "sudo AGENT_USER=$U $DEST/install-service.sh") || { printf '%s\n' "$SVC_OUT" | sed 's/^/   /'; die "install-service.sh 失敗"; }
 printf '%s\n' "$SVC_OUT" | grep -v '^REBOOT_NEEDED$' | sed 's/^/   /'
 REBOOT=0; printf '%s\n' "$SVC_OUT" | grep -qx REBOOT_NEEDED && REBOOT=1
+
+# ── 7b. 飛控參數基準（tools/fc-setup.py）──────────────────────
+# 使用者 2026-10-20：MAVLink 版本、鮑率等預設參數配置要在部署裡。代理要先停（它握著
+# 飛控埠），而且要先把別人從飛控埠上趕走——代理一停，像 sdr-fc-telemetry 那種服務會
+# 自己回來搶（10-20 在 drone E 上實測：讀到一半 multiple access on port）
+step "7b. 飛控參數基準"
+FCP=${FC_PARAMS:-check}
+FCDEV=$(envval FC_DEV); FCBAUD=$(envval FC_BAUD)
+FCARGS="--dev ${FCDEV:-/dev/ttyAMA0} --baud ${FCBAUD:-57600}"
+[ -n "${BATT_CELLS:-}" ] && FCARGS="$FCARGS --cells $BATT_CELLS"
+[ -n "${BATT_CAPACITY_MAH:-}" ] && FCARGS="$FCARGS --capacity $BATT_CAPACITY_MAH"
+R "sudo systemctl stop uav-agent; sudo env FC_DEV=${FCDEV:-/dev/ttyAMA0} MODEM_PORT= $DEST/systemd/claim-ports.sh claim" | sed 's/^/   /'
+fc_setup() { R "timeout 240 $DEST/venv/bin/python $DEST/tools/fc-setup.py $FCARGS $1"; }
+FCOUT=$(fc_setup "") || true
+printf '%s\n' "$FCOUT" | grep -v '^{' | sed 's/^/ /'
+FCJ=$(printf '%s\n' "$FCOUT" | grep '^{' | tail -1)
+FCTODO=$(python3 -c "import json,sys
+try: print(len(json.loads(sys.argv[1]).get('todo') or {}))
+except Exception: print(-1)" "$FCJ")
+if [ "$FCTODO" = -1 ]; then
+  say "   ⚠ 讀不到飛控參數（飛控沒接、沒電？）——基準沒有檢查，不是當成正確"
+elif [ "$FCTODO" -gt 0 ]; then
+  DO=0
+  if [ "$FCP" = apply ]; then DO=1
+  elif [ -t 0 ]; then
+    read -r -p "   要把這 $FCTODO 個寫進飛控嗎？（寫完讀回核對；序列埠設定會自動重開飛控）[y/N] " ans
+    [ "$ans" = y ] || [ "$ans" = Y ] && DO=1
+  fi
+  if [ "$DO" = 1 ]; then
+    FCOUT=$(fc_setup --apply) || { printf '%s\n' "$FCOUT" | sed 's/^/ /'; die "飛控參數寫入失敗（代理停著，修好再跑）"; }
+    printf '%s\n' "$FCOUT" | grep -E '✓|✗|重開' | sed 's/^/ /'
+  else
+    say "   **沒有寫**（FC_PARAMS=$FCP）。要寫：在 --env 檔設 FC_PARAMS=apply，或在終端機上跑時回 y"
+  fi
+fi
 BY="$(git config user.name 2>/dev/null || whoami)@$(hostname)"
 R "cat > $DEST/DEPLOYED" <<EOF
 {"commit": "$COMMIT", "dirty": $DIRTY, "at": "$(date -Is)", "by": "$BY", "files": $N}

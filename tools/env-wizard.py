@@ -383,6 +383,14 @@ def finish(path, vals, lines, r, local):
     print()
     vals["FC_SYSID"] = pick("飛控 sysid", fc_c, vals.get("FC_SYSID"))
 
+    # 只有人知道的機體資訊（可以不填：不填＝不碰，飛控那幾個門檻標「沒有檢查」）
+    print("\n④ 電池（只有你知道；Enter＝不填、不碰飛控的電池參數）")
+    vals["BATT_CELLS"] = ask("電池幾 S", vals.get("BATT_CELLS"))
+    vals["BATT_CAPACITY_MAH"] = ask("電池容量 mAh", vals.get("BATT_CAPACITY_MAH"))
+    print("\n⑤ 飛控基準參數（MAVLink2、GCS 失聯後備、電池門檻）")
+    print("     apply＝部署時寫進飛控並讀回核對；check＝只檢查、列出差異")
+    v = ask("FC_PARAMS", vals.get("FC_PARAMS") or "check")
+    vals["FC_PARAMS"] = v if v in ("apply", "check") else "check"
     missing = [k for k, _ in FIELDS if not vals.get(k)]
     if missing:
         print(f"\n   還有沒填的：{' '.join(missing)}——取消"); return 1
@@ -397,7 +405,9 @@ def finish(path, vals, lines, r, local):
 
 def show(vals):
     print()
-    for k, label in FIELDS:
+    for k, label in FIELDS + [("BATT_CELLS", "電池串數（空＝不碰）"),
+                              ("BATT_CAPACITY_MAH", "電池容量（空＝不碰）"),
+                              ("FC_PARAMS", "飛控基準參數 apply/check")]:
         v = vals.get(k, "")
         print(f"   {k:12} = {'*' * len(v) if 'PASS' in k else v}　（{label}）")
 

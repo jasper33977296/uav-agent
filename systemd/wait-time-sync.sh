@@ -12,6 +12,19 @@
 #     代理自己會在狀態列與 notice 標 clock_synced／at_unsynced
 set -u
 FLAG=${SYNC_FLAG:-/run/systemd/timesync/synchronized}   # SYNC_FLAG 只給測試用
+
+# **不是用 timesyncd 的機**（chrony：Fedora 系、部分映像）。不處理的話下面會去等一個
+# 永遠不會出現的旗標，每次啟動都白等 60 秒。chrony 的設定由 install-service.sh 寫
+if [ -z "${SYNC_FLAG:-}" ] && ! systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then
+  if command -v chronyc >/dev/null; then
+    echo "對時：這台用 chrony——最多等 60 秒"
+    if chronyc waitsync 30 0 0 2 >/dev/null 2>&1; then echo "對時：chrony 已同步"
+    else echo "對時：**chrony 60 秒內沒同步，照樣啟動代理**"; fi
+  else
+    echo "對時：⚠ 沒有 timesyncd 也沒有 chrony——機上時間沒人校正"
+  fi
+  exit 0
+fi
 WAIT=${SYNC_WAIT_S:-60}
 DROPIN=${SYNC_DROPIN:-/etc/systemd/timesyncd.conf.d/50-gs.conf}
 #: install-service.sh 早期另寫的一份（寫死安裝當下的 GS_HOST）
