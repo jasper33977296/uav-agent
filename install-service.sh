@@ -140,6 +140,19 @@ else
 fi
 
 echo
+echo "== 4c. 時鐘還沒對過就一直催 =="
+# wait-time-sync.sh 只在代理啟動時等 60 秒；之後 timesyncd 的退避可以拉到好幾分鐘。
+# 這個 timer 每 30 秒看一次，沒對過就重啟 timesyncd，對過了（旗標存在）就什麼都不做
+for u in uav-clock-kick.service uav-clock-kick.timer; do
+  if ! cmp -s "$HERE/systemd/$u" "/etc/systemd/system/$u"; then
+    install -m 0644 "$HERE/systemd/$u" "/etc/systemd/system/$u"; CHANGED_KICK=1
+  fi
+done
+[ -n "${CHANGED_KICK:-}" ] && systemctl daemon-reload
+systemctl enable --now --quiet uav-clock-kick.timer
+echo "   uav-clock-kick.timer：$(systemctl is-active uav-clock-kick.timer)"
+
+echo
 echo "== 5. 時間跟地面站對齊 =="
 # 機上資料（訊號、補傳、錄製、事件）的時間戳要跟地面站**同一個時鐘**，
 # 否則對不齊。只跟地面站對時、不退回網路上的伺服器：兩邊各自對到不同來源，

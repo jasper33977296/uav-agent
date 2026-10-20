@@ -1,0 +1,10 @@
+[Unit]
+Description=uav-agent：每 30 秒看一次時鐘對過沒有
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

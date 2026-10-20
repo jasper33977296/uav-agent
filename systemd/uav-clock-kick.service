@@ -1,0 +1,10 @@
+[Unit]
+Description=uav-agent：還沒對到時就催 timesyncd 再試（對過就什麼都不做）
+# 2026-10-20 drone E：開機時 5G 起得慢，timesyncd 前幾次都逾時、之後退避越拉越長；
+# wait-time-sync.sh 等 60 秒就放行代理，之後沒有人再催——時鐘錯了 14 小時半、
+# 停了 11 分鐘以上，代理因此丟掉 2416 個對時前的錄製框架。重啟 timesyncd 6 秒內就對上
+ConditionPathExists=!/run/systemd/timesync/synchronized
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart systemd-timesyncd
