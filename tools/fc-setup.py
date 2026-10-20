@@ -50,6 +50,19 @@ a = ap.parse_args()
 result = {"ok": False, "todo": {}, "applied": {}, "rebooted": False, "notes": []}
 
 
+def _crash(t, v, tb):
+    """**當掉也要交出 JSON**：deploy.sh 靠最後一行判斷結果，沒有那一行就分不出
+    「檢查過、沒問題」與「根本沒檢查」（2026-10-20 這樣讓部署安靜地停在一半）"""
+    import traceback
+    traceback.print_exception(t, v, tb, file=sys.stderr)
+    result["notes"].append(f"fc-setup 當掉：{t.__name__}: {v}")
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(1)
+
+
+sys.excepthook = _crash
+
+
 def out(code):
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(code)

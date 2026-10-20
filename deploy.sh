@@ -42,6 +42,28 @@
 # 回滾指令，由人決定。
 set -euo pipefail
 
+# ── 離場保險 ─────────────────────────────────────────────────
+# **代理是這支停的，就一定要由這支帶回來**（2026-10-20）。7b 要停代理才讀得到飛控參數；
+# 那一輪 fc-setup 沒印出 JSON，`grep` 找不到東西在 pipefail 下讓整支安靜地結束——
+# drone C 因此 15 分鐘沒有代理、地面站顯示未連接，而部署的輸出裡一個字都沒有。
+# 不管怎麼離開（die、set -e、Ctrl-C），停過的代理都要啟動回來，而且要說出來
+AGENT_STOPPED=0
+TMPS=()
+cleanup() {
+  local rc=$?
+  rm -f "${TMPS[@]}" 2>/dev/null || true
+  if [ "$AGENT_STOPPED" = 1 ]; then
+    printf '\n✗ 部署在代理停著的時候中斷（結束碼 %s）——**把代理啟動回來**\n' "$rc" >&2
+    if R "sudo systemctl start uav-agent" 2>/dev/null; then
+      printf '   代理：%s\n' "$(R "systemctl is-active uav-agent" 2>/dev/null)" >&2
+    else
+      printf '   ✗✗ 啟動不回來——**這台機現在沒有代理**，去機上 sudo systemctl start uav-agent\n' >&2
+    fi
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP     # 被中斷也要走 EXIT 那條（bash 被訊號殺掉時不一定會跑 EXIT trap）
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEST="${UAV_DEST:-/opt/uav-agent}"   # UAV_DEST 只給測試閘門用（指向一個假的目錄）
 UNIT=/etc/systemd/system/uav-agent.service
@@ -165,7 +187,7 @@ elif ! ssh "${SSH_OPTS[@]}" "$U@$HOST" true 2>/dev/null; then
   say "   $U@$HOST 還沒有這台開發機的金鑰——裝一次（ssh-copy-id）"
   [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
   if [ -n "${UAV_PI_PASS:-}" ]; then
-    AP=$(mktemp); trap 'rm -f "$AP"' EXIT
+    AP=$(mktemp); TMPS+=("$AP")
     printf '#!/bin/sh\nprintf "%%s\\n" "$UAV_PI_PASS"\n' > "$AP"; chmod +x "$AP"
     UAV_PI_PASS="$UAV_PI_PASS" SSH_ASKPASS="$AP" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
       setsid ssh-copy-id -o StrictHostKeyChecking=accept-new "$U@$HOST" </dev/null >/dev/null 2>&1 \
@@ -265,7 +287,7 @@ fi
 
 # ── 3. 要傳哪些檔 ─────────────────────────────────────────────
 step "3. 檔案"
-LIST=$(mktemp); trap 'rm -f "$LIST"' EXIT
+LIST=$(mktemp); TMPS+=("$LIST")
 git ls-files > "$LIST"
 N=$(wc -l < "$LIST")
 say "   git 追蹤的 $N 個檔（不刪機上任何東西；不碰 state.json／.fc_sysid／venv）"
@@ -387,11 +409,13 @@ FCDEV=$(envval FC_DEV); FCBAUD=$(envval FC_BAUD)
 FCARGS="--dev ${FCDEV:-/dev/ttyAMA0} --baud ${FCBAUD:-57600}"
 [ -n "${BATT_CELLS:-}" ] && FCARGS="$FCARGS --cells $BATT_CELLS"
 [ -n "${BATT_CAPACITY_MAH:-}" ] && FCARGS="$FCARGS --capacity $BATT_CAPACITY_MAH"
-R "sudo systemctl stop uav-agent; sudo env FC_DEV=${FCDEV:-/dev/ttyAMA0} MODEM_PORT= $DEST/systemd/claim-ports.sh claim" | sed 's/^/   /'
+AGENT_STOPPED=1
+R "sudo systemctl stop uav-agent; sudo env FC_DEV=${FCDEV:-/dev/ttyAMA0} MODEM_PORT= $DEST/systemd/claim-ports.sh claim" | sed 's/^/   /' || true
 fc_setup() { R "timeout 240 $DEST/venv/bin/python $DEST/tools/fc-setup.py $FCARGS $1"; }
 FCOUT=$(fc_setup "") || true
-printf '%s\n' "$FCOUT" | grep -v '^{' | sed 's/^/ /'
-FCJ=$(printf '%s\n' "$FCOUT" | grep '^{' | tail -1)
+printf '%s\n' "$FCOUT" | { grep -v '^{' || true; } | sed 's/^/ /'
+# fc-setup 中途出錯就不會有 JSON——那是「沒有檢查」，不是讓整支腳本靜靜結束的理由
+FCJ=$(printf '%s\n' "$FCOUT" | { grep '^{' || true; } | tail -1)
 FCTODO=$(python3 -c "import json,sys
 try: print(len(json.loads(sys.argv[1]).get('todo') or {}))
 except Exception: print(-1)" "$FCJ")
@@ -406,7 +430,7 @@ elif [ "$FCTODO" -gt 0 ]; then
   fi
   if [ "$DO" = 1 ]; then
     FCOUT=$(fc_setup --apply) || { printf '%s\n' "$FCOUT" | sed 's/^/ /'; die "飛控參數寫入失敗（代理停著，修好再跑）"; }
-    printf '%s\n' "$FCOUT" | grep -E '✓|✗|重開' | sed 's/^/ /'
+    printf '%s\n' "$FCOUT" | { grep -E '✓|✗|重開' || true; } | sed 's/^/ /'
   else
     say "   **沒有寫**（FC_PARAMS=$FCP）。要寫：在 --env 檔設 FC_PARAMS=apply，或在終端機上跑時回 y"
   fi
@@ -425,6 +449,7 @@ if [ "$REBOOT" = 1 ]; then
   # 停在上次關機那一刻、對時後才跳，拿重開前的時間去 --since 會漏
   say "   開機設定有改 → 重開機（解鎖閘門已經過了）"
   R "sudo systemctl reboot" || true
+  AGENT_STOPPED=0          # 開機自啟會把它帶起來
   sleep 15
   for i in $(seq 1 30); do R true 2>/dev/null && break; sleep 5; done
   R true || die "重開機後 150 秒還連不回 $HOST——去機旁看一下"
@@ -433,6 +458,7 @@ if [ "$REBOOT" = 1 ]; then
   VERIFY_WAIT_S=150      # 開機要等對時（最多 60 秒）、5G 註冊
 else
   R "sudo systemctl restart uav-agent"
+  AGENT_STOPPED=0
   [ "$FRESH" = 1 ] && VERIFY_WAIT_S=120
 fi
 FAIL=0
