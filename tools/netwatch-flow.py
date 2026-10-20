@@ -40,6 +40,7 @@ A.Agent.uplink_ok = None
 
 
 ag = A.Agent.__new__(A.Agent)
+ag.modem = None
 ag.a, ag.telem, ag.cmd, ag.intent, ag.outbox = Args(), FakeLink(), FakeLink(), FakeIntent(), FakeOutbox()
 seq = []
 routes = []
@@ -116,6 +117,23 @@ for _ in range(80):
     step(same)
 check(len(calls) == n, "只有一個方向不通：不動 IP（那是重綁的事）")
 check(ag._net_dead_since is None, "通了就把計時歸零")
+
+print("── dongle 說的電信 IP 跟網卡上的不一樣 → 5 秒就重新要（不等 30 秒）")
+class FakeModem: wan_ip = "10.141.2.29"
+ag.modem = FakeModem()
+calls.clear(); ag._net_renew_t = 0.0
+step({"nic": "usb0", "ip": "192.168.187.42", "prefix": 24, "gw": "192.168.187.1"})
+ag.uplink_ok = ag.gs_link_ok = False
+for _ in range(6):
+    step({"nic": "usb0", "ip": "192.168.187.42", "prefix": 24, "gw": "192.168.187.1"})
+check(len(calls) == 1, "不通約 6 秒、而且 IP 對不上電信 IP：已經重新要")
+check("電信 IP 是 10.141.2.29" in ag.outbox.notes[-1][2], "notice 說出為什麼（電信 IP 對不上）")
+ag.modem.wan_ip = "10.141.2.29"
+calls.clear(); ag._net_renew_t = 0.0
+step({"nic": "usb0", "ip": "10.141.2.29", "prefix": 24, "gw": "10.141.2.30"})
+for _ in range(6):
+    step({"nic": "usb0", "ip": "10.141.2.29", "prefix": 24, "gw": "10.141.2.30"})
+check(not calls, "IP 對得上電信 IP、只是不通：照舊等 30 秒（不是拿錯位址）")
 
 print("全部通過" if not fails else f"{fails} 項沒過")
 sys.exit(1 if fails else 0)

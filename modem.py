@@ -122,6 +122,11 @@ class ModemSampler(threading.Thread):
         self.last = {}
         self._rtt_ms = None
         self._last_ping = 0.0
+        #: dongle 自己說電信網給它的 IP（Fibocom `AT+GTRNDIS?`）。None＝不知道
+        #: （還沒問到、或不是 Fibocom）。代理拿它跟網卡上的 IP 比：不一樣＝網卡拿到的
+        #: 是 dongle 的內部位址（2026-10-20 對調 dongle 實測 192.168.187.x），不必乾等 30 秒
+        self.wan_ip = None
+        self._last_wan = 0.0
         # ── 上下行實際流量（uav-system issues/022 之後，2026-09-23 使用者裁定）──
         #
         # **量的是「現在傳了多少」，不是「能傳多少」。** 讀 5G 介面的收發位元組
@@ -300,6 +305,13 @@ class ModemSampler(threading.Thread):
             return None
 
         now = time.monotonic()
+        if now - self._last_wan >= 5.0:        # 電信 IP 不會常變，5 秒問一次就夠
+            self._last_wan = now
+            try:
+                m = re.search(r'\+GTRNDIS:\s*\d+,\d+,"([\d.]+)"', self._at("AT+GTRNDIS?", 0.4))
+                self.wan_ip = m.group(1) if m and m.group(1) != "0.0.0.0" else None
+            except Exception:
+                self.wan_ip = None
         if now - self._last_ping >= 5.0:       # RTT 不必每秒量
             self._last_ping = now
             self._rtt_ms = self._ping_rtt()
@@ -499,7 +511,7 @@ class ModemSampler(threading.Thread):
                 # 因為飛控身分不符而沒有量的拍數（076）。與 on_ground 分開：
                 # 一個是「量了但不記」，一個是「根本沒量」
                 "held": self.held, "held_why": self._held_said,
-                "live_unowned": self.live_unowned,
+                "live_unowned": self.live_unowned, "wan_ip": self.wan_ip,
                 "rsrp": self.last.get("rsrp"), "rsrq": self.last.get("rsrq"),
                 "sinr": self.last.get("sinr"), "rtt_ms": self.last.get("rtt_ms"),
                 # 實際用量（不是容量）。null＝讀不到，不是 0

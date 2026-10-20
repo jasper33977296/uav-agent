@@ -2552,6 +2552,8 @@ class Agent:
 
     #: dongle 有 IP、但地面站兩個方向都不通多久之後，叫網卡重新跟 dongle 要一次 IP
     NET_RENEW_AFTER_S = 30.0
+    #: 網卡上的 IP 跟 dongle 自己說的電信 IP 不一樣時——那是確定拿錯了，不必等那麼久
+    NET_RENEW_MISMATCH_S = 5.0
     NET_RENEW_EVERY_S = 60.0
 
     def _maybe_renew(self, cur, now):
@@ -2569,7 +2571,10 @@ class Agent:
         if self._net_dead_since is None:
             self._net_dead_since = now
             return
-        if (now - self._net_dead_since < self.NET_RENEW_AFTER_S
+        wan = getattr(self.modem, "wan_ip", None) if self.modem else None
+        mismatch = bool(wan) and wan != cur["ip"]
+        wait = self.NET_RENEW_MISMATCH_S if mismatch else self.NET_RENEW_AFTER_S
+        if (now - self._net_dead_since < wait
                 or now - self._net_renew_t < self.NET_RENEW_EVERY_S):
             return
         self._net_renew_t = now
@@ -2581,10 +2586,12 @@ class Agent:
             out = (r.stdout or r.stderr).strip()
         except Exception as e:
             out = f"失敗：{e}"
-        log.warning("dongle %s 有 IP %s 但地面站 %.0f 秒兩個方向都不通——重新要 IP：%s",
-                    cur["nic"], cur["ip"], now - self._net_dead_since, out)
-        self.outbox.note("net", f"5G 有 IP（{cur['ip']}）但 {now - self._net_dead_since:.0f} 秒"
-                         f"到不了地面站——重新跟 dongle 要 IP（{out}）", "warning", now)
+        why = (f"dongle 說電信 IP 是 {wan}，網卡上卻是 {cur['ip']}" if mismatch
+               else f"{now - self._net_dead_since:.0f} 秒到不了地面站")
+        log.warning("dongle %s 有 IP %s 但地面站兩個方向都不通（%s）——重新要 IP：%s",
+                    cur["nic"], cur["ip"], why, out)
+        self.outbox.note("net", f"5G 有 IP（{cur['ip']}）但{why}——重新跟 dongle 要 IP（{out}）",
+                         "warning", now)
 
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
