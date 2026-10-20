@@ -44,7 +44,10 @@ import clock
 MAX = 500
 
 #: 節流：`gs_link` 在 `WINDOW_S` 內前 `BURST` 則照送，其餘併成彙總
-THROTTLED = {"gs_link"}
+#: `net`（dongle 斷線／換 IP 重連，2026-10-20）自己一份額度：原本跟 gs_link 共用，
+#: 一次斷線時代理自己的「地面站失聯」「不介入」就把 4 則用完，最重要的那則
+#: 「5G 重新連上」被併進 10 分鐘後的彙總
+THROTTLED = {"gs_link", "net"}
 WINDOW_S = 600.0
 BURST = 4
 

@@ -2532,7 +2532,7 @@ class Agent:
         was = f"{last.get('nic') or '無'} {last.get('ip') or '沒有 IP'}"
         if not cur or not cur.get("ip"):
             log.warning("5G dongle 網卡不見了或沒有 IP（之前 %s）——等它回來", was)
-            self.outbox.note("gs_link", f"5G dongle 斷線（之前 {was}），等它回來", "warning", now)
+            self.outbox.note("net", f"5G dongle 斷線（之前 {was}），等它回來", "warning", now)
             return
         now_s = f"{cur['nic']} {cur['ip']}"
         log.warning("5G dongle 回來了：%s → %s——重綁 UDP、意圖通道立刻重連", was, now_s)
@@ -2540,7 +2540,7 @@ class Agent:
         self.cmd.rebind()
         if self.intent is not None:
             self.intent.kick(f"dongle 換成 {now_s}")
-        self.outbox.note("gs_link", f"5G 重新連上：{was} → {now_s}"
+        self.outbox.note("net", f"5G 重新連上：{was} → {now_s}"
                          + ("" if not self.net_route_err else f"（路由沒補上：{self.net_route_err}）"),
                          "info" if not self.net_route_err else "warning", now)
 
