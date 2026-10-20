@@ -79,6 +79,7 @@ from pymavlink.dialects.v20 import ardupilotmega as apm
 
 import binding
 import clock
+import netwatch
 import guard
 import holders
 import normalize
@@ -639,6 +640,13 @@ class Agent:
     binding_why = "還沒問到飛控板身分"
     fc_session_uid = None
     fc_untrusted_drop = 0
+    #: 5G dongle 的網卡與 IP（netwatch）。類別預設：測試替身不跑 __init__
+    net = None
+    net_changes = 0
+    net_route = None
+    net_route_err = None
+    _net_t = 0.0
+    _net_last = None        # 最後一次有 IP 的樣子（斷線期間 net 是空的，訊息要說得出「之前是什麼」）
     last_fc_rx = 0.0
     caps_req_at = 0.0
     mismatch_said = None
@@ -1383,6 +1391,7 @@ class Agent:
 
         self._check_fc_link(now)      # 橋的另一端——以前沒有人看
         self._maybe_reopen_serial(now)   # 說完之後，該動手的時候動手
+        self._watch_net(now)          # dongle 換了 IP／網卡 → 立刻重新連上地面站
         self._check_gs_link(now)
         self.outbox.tick(now)         # 節流窗口到期時，彙總那一則要送得出去
 
@@ -2482,6 +2491,59 @@ class Agent:
         """解鎖中失去飛控＝危急（代理連 RTL 都送不出去）；地上是警告。"""
         return "critical" if self.mon.state.get("armed") else "warning"
 
+    def _watch_net(self, now):
+        """每秒看一次 dongle 的網卡與 IP。**變了就主動重新連上地面站**（使用者 2026-10-20）。
+
+        斷線後 dongle 回來時網卡名字、MAC、IP 都可能不同（drone E 一天換三個名字）。
+        UDP 本身送得出去（sendto 每次重挑來源位址），但：
+          * 電信 NAT 的對映跟著舊的來源位址——換來源埠逼它重建，地面站從新封包重新學
+          * 意圖通道（TCP）掛在舊 IP 上不會自己報錯——立刻重連，不等 10 秒靜默＋退避
+          * 新 IP 不在地面站網段時會走錯網卡——補「到地面站走 dongle」的主機路由
+        """
+        if now - self._net_t < 1.0:
+            return
+        self._net_t = now
+        try:
+            cur = netwatch.dongle_net()
+        except Exception as e:                      # 看不到就是看不到，不准弄死主迴圈
+            log.warning("讀 dongle 網卡失敗：%s", e)
+            return
+        prev = self.net
+        if (cur or {}).get("nic") == (prev or {}).get("nic") and (cur or {}).get("ip") == (prev or {}).get("ip"):
+            self.net = cur
+            return
+        self.net = cur
+        first = prev is None and self.net_changes == 0
+        if cur and cur.get("ip"):
+            self.net_route, self.net_route_err = netwatch.ensure_gs_route(cur, self.a.gs)
+            if self.net_route_err:
+                log.warning("到地面站的路由沒補上：%s", self.net_route_err)
+        if first:
+            log.info("5G dongle：%s %s（閘道 %s）；到地面站：%s",
+                     (cur or {}).get("nic"), (cur or {}).get("ip"), (cur or {}).get("gw"),
+                     self.net_route or self.net_route_err)
+            if cur is None:
+                self.net = {}        # 記住「一開始就沒有」，之後出現才算變化
+            return
+        self.net_changes += 1
+        if prev and prev.get("ip"):
+            self._net_last = prev
+        last = self._net_last or {}
+        was = f"{last.get('nic') or '無'} {last.get('ip') or '沒有 IP'}"
+        if not cur or not cur.get("ip"):
+            log.warning("5G dongle 網卡不見了或沒有 IP（之前 %s）——等它回來", was)
+            self.outbox.note("gs_link", f"5G dongle 斷線（之前 {was}），等它回來", "warning", now)
+            return
+        now_s = f"{cur['nic']} {cur['ip']}"
+        log.warning("5G dongle 回來了：%s → %s——重綁 UDP、意圖通道立刻重連", was, now_s)
+        self.telem.rebind()
+        self.cmd.rebind()
+        if self.intent is not None:
+            self.intent.kick(f"dongle 換成 {now_s}")
+        self.outbox.note("gs_link", f"5G 重新連上：{was} → {now_s}"
+                         + ("" if not self.net_route_err else f"（路由沒補上：{self.net_route_err}）"),
+                         "info" if not self.net_route_err else "warning", now)
+
     def _check_gs_link(self, now):
         """地面失聯偵測與處置。
 
@@ -2901,6 +2963,9 @@ class Agent:
             # **埠號要在狀態裡**：診斷「地面站以為的埠」對不對得上「我實際
             # 綁的埠」時，這是唯一直接的證據，而以前只能 ssh 上去跑 ss
             "foreign_sysids": {str(k): v for k, v in self.foreign.items()},
+            # 5G dongle 現在是哪張網卡、哪個 IP（每次重新列舉都可能不同）
+            "net": {**(self.net or {}), "changes": self.net_changes,
+                    "gs_route": self.net_route, "gs_route_err": self.net_route_err},
             "udp": {"telem": self.telem.port, "cmd": self.cmd.port,
                     "rebinds": self.telem.rebinds},
             "state": self.flight_state(),

@@ -87,6 +87,16 @@ class IntentLink(threading.Thread):
         self.silent_drops = 0         # 其中「對面不回話」被我方主動掐掉的次數
         self.acked = 0                # 回給地面站的 intent 回執數（複裁 G）
         self._backoff = 1.0
+        #: 代理知道網路變了（dongle 換 IP）→ 掐掉現在這條、立刻重連，不等靜默逾時與退避
+        self._kick = threading.Event()
+        self._kick_why = None
+        self.kicks = 0
+
+    def kick(self, why: str) -> None:
+        self._kick_why = why
+        self._backoff = 1.0
+        self.kicks += 1
+        self._kick.set()
 
     def publish(self, snapshot: dict) -> None:
         with self._lock:
@@ -100,7 +110,7 @@ class IntentLink(threading.Thread):
         分開放就要兩邊對時間戳才看得出「那次遙測掉包時意圖通道在不在」。"""
         return {"up": self.connected, "sent": self.sent,
                 "drops": self.drops, "silent": self.silent_drops,
-                "rejected": self.rejected, "acked": self.acked,
+                "rejected": self.rejected, "acked": self.acked, "kicks": self.kicks,
                 "notice_ok": self._notice_ok}
 
     # ── 執行緒本體 ─────────────────────────────────────────────
@@ -112,8 +122,11 @@ class IntentLink(threading.Thread):
                 log.warning("意圖通道中斷（%s），%.0f 秒後重連", e, self._backoff)
             finally:
                 self.connected = False
-            self._stop.wait(self._backoff)
-            self._backoff = min(self._backoff * 2, 30.0)  # 上限 30s
+            # 退避期間被 kick（網路剛回來）就馬上試，不睡滿
+            if self._kick.wait(self._backoff):
+                self._kick.clear()
+            else:
+                self._backoff = min(self._backoff * 2, 30.0)  # 上限 30s
 
     def _session(self):
         ws = websocket.create_connection(self.url, timeout=10,
@@ -159,6 +172,9 @@ class IntentLink(threading.Thread):
                 # 靜默逾時：**送得出去不代表送得到**（見 SILENCE_S 的說明）。
                 # 對面每則 state 都會回 ack，所以「一直沒人回話」＝這條連線已經
                 # 沒有用了，主動掐掉重來比等 TCP 自己發現快幾十秒
+                if self._kick.is_set():
+                    self._kick.clear()
+                    raise ConnectionResetError(f"網路變了（{self._kick_why}）——重連")
                 if now - last_rx > self.silence:
                     self.silent_drops += 1
                     raise TimeoutError(

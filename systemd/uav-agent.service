@@ -16,7 +16,8 @@ SupplementaryGroups=dialout
 # **兩個都要**（2026-09-22 上機實測）：PTRACE 管「讀 fd 的連結」，但列出
 # /proc/<pid>/fd 這個目錄本身是一般的檔案權限，要 DAC_READ_SEARCH。只給 PTRACE 時
 # 158 個行程讀不到、root 開著的完全抓不到——單元測試接受「看不完整」，所以沒翻出來
-AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+# CAP_NET_ADMIN：dongle 換 IP 後補「到地面站走 dongle」的主機路由（netwatch，2026-10-20）
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_NET_ADMIN
 WorkingDirectory=/opt/uav-agent
 
 # ── 部署參數（改這裡，不要改程式碼）──────────────────────────
